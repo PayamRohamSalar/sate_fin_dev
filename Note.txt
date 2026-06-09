@@ -1,0 +1,10 @@
+cd /mnt/d/OneDrive/AI-Project/SATE_Fin_Dev
+ls /mnt/d/OneDrive/AI-Project/SATE_Fin_Dev
+
+
+python3 -m pip install -r requirements.txt
+
+python3 scripts/import_employers.py
+python3 scripts/example_1.py
+python3 scripts/process_budgets.py
+python3 scripts/import_deposits.py

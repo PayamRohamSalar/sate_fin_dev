@@ -1,0 +1,53 @@
+# Environment variables and secrets
+.env
+*.env
+.env.*
+
+# Excel and CSV data files - all subdirectories
+data/**/*.xlsx
+data/**/*.csv
+data/**/*.xls
+data/*.xlsx
+data/*.csv
+data/*.xls
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Conda/Virtual environments
+envs/
+sate_env/
+venv/
+ENV/
+env/
+
+# PostgreSQL data directory
+.pgdata/
+
+# Temporary files
+/tmp/
+*.tmp
+*.bak
+*.log
+
+# OS files
+Thumbs.db
+.Spotlight-V100
+.Trashes
