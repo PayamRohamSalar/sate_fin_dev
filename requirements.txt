@@ -3,3 +3,4 @@ openpyxl
 SQLAlchemy
 python-dotenv
 psycopg2-binary
+jdatetime

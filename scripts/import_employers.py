@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from sqlalchemy import text
 from core.database import Base, SessionLocal, engine
 from models.employer import Employer
 
@@ -95,7 +95,9 @@ def build_employer(row) -> Employer:
 
 
 def import_employers(file_path: Path = EXCEL_FILE_PATH) -> None:
-    Employer.__table__.drop(engine, checkfirst=True)
+    # Force drop the table and all its dependents
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS employers CASCADE"))
     Base.metadata.create_all(bind=engine)
 
     print(f"Reading Excel file: {file_path}")

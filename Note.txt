@@ -1,10 +1,24 @@
+# Enter to Directory in Ubuntu terminal
 cd /mnt/d/OneDrive/AI-Project/SATE_Fin_Dev
+cd /mnt/c/Users/pchin/OneDrive/AI-Project/SATE_Fin_Dev  #In laptop
+
 ls /mnt/d/OneDrive/AI-Project/SATE_Fin_Dev
+ls /mnt/c/Users/pchin/OneDrive/AI-Project/SATE_Fin_Dev
 
-
+# Install requirements
 python3 -m pip install -r requirements.txt
+pip install jdatetime
 
+# Importing Phase
 python3 scripts/import_employers.py
-python3 scripts/example_1.py
-python3 scripts/process_budgets.py
+# python3 scripts/process_budgets.py   # Not Necessary
 python3 scripts/import_deposits.py
+python3 scripts/import_universities.py
+python3 scripts/import_researchers.py
+python3 scripts/import_contracts.py
+python3 scripts/import_payments.py
+# Test Importing
+python scripts/generate_financial_report.py
+
+# Run on database
+python3 scripts/example_1.py

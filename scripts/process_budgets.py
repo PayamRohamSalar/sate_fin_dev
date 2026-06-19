@@ -1,138 +1,138 @@
-import os
 import re
-import sys
+import pandas as pd
 from pathlib import Path
 
-import pandas as pd
+# ==========================================
+# Configuration and Constants
+# ==========================================
+# Defining absolute paths using pathlib for Windows compatibility
+BASE_DIR = Path(r"C:\Users\pchin\OneDrive\AI-Project\SATE_Fin_Dev\data")
+INPUT_EXCEL_FILE = BASE_DIR / "Budget.xlsx"
+OUTPUT_EXCEL_FILE = BASE_DIR / "Budget_longformat.xlsx"
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ASSIGNED_SHEET_NAME = "Assigned_Budgets"
+DEPOSIT_SHEET_NAME = "Deposit_Budget"
+EMPLOYER_CODE_COL = "شماره طبقه بندی"
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXCEL_FILE_PATH = PROJECT_ROOT / "data" / "Budget.xlsx"
-PROCESSED_MANDATES_PATH = PROJECT_ROOT / "data" / "processed_mandates.csv"
-PROCESSED_RECEIPTS_PATH = PROJECT_ROOT / "data" / "processed_receipts.csv"
-
-EMPLOYER_CODE_COLUMN = "شماره طبقه بندی"
-ASSIGNED_SHEET = "Assigned_Budgets"
-DEPOSIT_SHEET = "Deposit_Budget"
-
-
-def normalize_code(value):
+def clean_employer_code(value: str) -> str:
+    """
+    Normalizes the employer code by stripping whitespaces and removing trailing '.0'.
+    Returns None if the value is invalid or empty.
+    """
     if pd.isna(value):
         return None
-    value = str(value).strip()
-    if not value:
+    val_str = str(value).strip()
+    if not val_str:
         return None
-    if value.endswith(".0"):
-        value = value[:-2]
-    return value
+    if val_str.endswith(".0"):
+        val_str = val_str[:-2]
+    return val_str
 
-
-def clean_amount(value):
+def clean_financial_amount(value: str) -> float:
+    """
+    Cleans financial amount strings (removes commas, handles empty strings) 
+    and converts them to float. Prevents calculation errors by returning 0.0 for blanks.
+    """
     if pd.isna(value):
-        return 0
+        return 0.0
     if isinstance(value, str):
         value = value.strip().replace(",", "")
         if not value:
-            return 0
+            return 0.0
     return pd.to_numeric(value, errors="coerce")
 
-
-def extract_year(column_name):
+def extract_fiscal_year(column_name: str) -> int:
+    """
+    Extracts the 4-digit fiscal year from a given column header.
+    Raises ValueError if no year is found, preventing silent data corruption.
+    """
     match = re.search(r"(\d{4})", str(column_name))
     if not match:
-        raise ValueError(f"Could not extract fiscal year from column: {column_name}")
+        raise ValueError(f"CRITICAL: Could not extract fiscal year from: {column_name}")
     return int(match.group(1))
 
+def process_budget_data() -> None:
+    """
+    Main ETL pipeline: Reads multi-sheet Excel safely, melts data to long format,
+    applies business logic, and exports to the exact target directory.
+    """
+    # 1. Validate Directory Existence
+    if not BASE_DIR.exists():
+        print(f"Error: The directory {BASE_DIR} does not exist.")
+        return
 
-def melt_budget_sheet(
-    df: pd.DataFrame,
-    value_name: str,
-    expected_prefix: str,
-) -> pd.DataFrame:
-    if EMPLOYER_CODE_COLUMN not in df.columns:
-        raise ValueError(f"Missing required column: {EMPLOYER_CODE_COLUMN}")
+    # 2. Read Excel File using ExcelFile for atomic loading and performance
+    print(f"Loading data from: {INPUT_EXCEL_FILE}")
+    try:
+        with pd.ExcelFile(INPUT_EXCEL_FILE) as xls:
+            df_assigned_wide = pd.read_excel(xls, sheet_name=ASSIGNED_SHEET_NAME)
+            df_deposit_wide = pd.read_excel(xls, sheet_name=DEPOSIT_SHEET_NAME)
+    except FileNotFoundError:
+        print(f"Error: The file {INPUT_EXCEL_FILE} was not found.")
+        return
+    except ValueError as e:
+        print(f"Error reading sheets: {e}")
+        return
 
-    value_columns = [
-        column
-        for column in df.columns
-        if column != EMPLOYER_CODE_COLUMN and str(column).strip().startswith(expected_prefix)
-    ]
-    if not value_columns:
-        raise ValueError(f"No budget columns found with prefix: {expected_prefix}")
-
-    melted = pd.melt(
-        df,
-        id_vars=[EMPLOYER_CODE_COLUMN],
-        value_vars=value_columns,
-        var_name="fiscal_year",
-        value_name=value_name,
+    # 3. Process Assigned Budgets (Mandates)
+    print("Processing Assigned Budgets...")
+    df_assigned_long = pd.melt(
+        df_assigned_wide,
+        id_vars=[EMPLOYER_CODE_COL],
+        var_name="Year_Raw",
+        value_name="Assigned_Amount"
     )
-    melted = melted.rename(columns={EMPLOYER_CODE_COLUMN: "employer_code"})
-    melted["employer_code"] = melted["employer_code"].apply(normalize_code)
-    melted["fiscal_year"] = melted["fiscal_year"].apply(extract_year)
-    melted[value_name] = melted[value_name].apply(clean_amount).fillna(0)
-    melted = melted.dropna(subset=["employer_code"])
-    return melted
+    df_assigned_long["Fiscal_Year"] = df_assigned_long["Year_Raw"].apply(extract_fiscal_year)
+    df_assigned_long[EMPLOYER_CODE_COL] = df_assigned_long[EMPLOYER_CODE_COL].apply(clean_employer_code)
+    #df_assigned_long["Assigned_Amount"] = df_assigned_long["Assigned_Amount"].apply(clean_financial_amount)
+    df_assigned_long["Assigned_Amount"] = df_assigned_long["Assigned_Amount"].apply(clean_financial_amount) * 1_000_000_000
+    
+    # Implementing Soft Delete mechanism for database mapping
+    df_assigned_long["Is_Deleted"] = False
+    df_assigned_long.drop(columns=["Year_Raw"], inplace=True)
 
+    # 4. Process Deposit Budgets
+    print("Processing Deposit Budgets...")
+    df_deposit_long = pd.melt(
+        df_deposit_wide,
+        id_vars=[EMPLOYER_CODE_COL],
+        var_name="Year_Raw",
+        value_name="Deposit_Amount"
+    )
+    df_deposit_long["Fiscal_Year"] = df_deposit_long["Year_Raw"].apply(extract_fiscal_year)
+    df_deposit_long[EMPLOYER_CODE_COL] = df_deposit_long[EMPLOYER_CODE_COL].apply(clean_employer_code)
+    df_deposit_long["Deposit_Amount"] = df_deposit_long["Deposit_Amount"].apply(clean_financial_amount)
+    
+    # Implementing Soft Delete mechanism
+    df_deposit_long["Is_Deleted"] = False
+    df_deposit_long.drop(columns=["Year_Raw"], inplace=True)
 
-def process_budgets(file_path: Path = EXCEL_FILE_PATH) -> None:
-    assigned_df = pd.read_excel(
-        file_path,
-        sheet_name=ASSIGNED_SHEET,
-        engine="openpyxl",
-        dtype={EMPLOYER_CODE_COLUMN: str},
-    )
-    deposit_df = pd.read_excel(
-        file_path,
-        sheet_name=DEPOSIT_SHEET,
-        engine="openpyxl",
-        dtype={EMPLOYER_CODE_COLUMN: str},
-    )
-
-    assigned_long = melt_budget_sheet(
-        assigned_df,
-        value_name="mandated_amount",
-        expected_prefix="سال",
-    )
-    deposit_long = melt_budget_sheet(
-        deposit_df,
-        value_name="deposited_amount",
-        expected_prefix="واریزی",
-    )
-
-    assigned_long["has_assigned_budget"] = True
-    merged = pd.merge(
-        assigned_long,
-        deposit_long,
-        on=["employer_code", "fiscal_year"],
+    # 5. Merge Data securely to prevent data loss (Outer Join)
+    print("Merging data...")
+    df_merged = pd.merge(
+        df_assigned_long,
+        df_deposit_long,
+        on=[EMPLOYER_CODE_COL, "Fiscal_Year"],
         how="outer",
+        suffixes=("_assigned", "_deposit")
     )
-    merged["mandated_amount"] = merged["mandated_amount"].fillna(0)
-    merged["deposited_amount"] = merged["deposited_amount"].fillna(0)
-    merged["has_assigned_budget"] = merged["has_assigned_budget"].fillna(False)
+    
+    # Resolving data nulls after outer merge to maintain mathematical accuracy
+    df_merged["Is_Deleted"] = False 
+    df_merged["Assigned_Amount"] = df_merged["Assigned_Amount"].fillna(0.0)
+    df_merged["Deposit_Amount"] = df_merged["Deposit_Amount"].fillna(0.0)
+    
+    # Clean up: Remove rows where there is absolutely no financial activity
+    df_merged = df_merged[(df_merged["Assigned_Amount"] > 0) | (df_merged["Deposit_Amount"] > 0)]
 
-    mandates = merged.loc[
-        merged["has_assigned_budget"],
-        ["employer_code", "fiscal_year", "mandated_amount"],
-    ].copy()
-    mandates = mandates.sort_values(["employer_code", "fiscal_year"])
-
-    receipts = merged.loc[
-        merged["deposited_amount"] > 0,
-        ["employer_code", "fiscal_year", "deposited_amount"],
-    ].copy()
-    receipts["deposit_date"] = receipts["fiscal_year"].astype(int).astype(str) + "-12-29"
-    receipts["description"] = "Historical Aggregated Deposit"
-    receipts = receipts.sort_values(["employer_code", "fiscal_year"])
-
-    mandates.to_csv(PROCESSED_MANDATES_PATH, index=False, encoding="utf-8-sig")
-    receipts.to_csv(PROCESSED_RECEIPTS_PATH, index=False, encoding="utf-8-sig")
-
-    print(f"Exported {len(mandates)} mandates to {PROCESSED_MANDATES_PATH}")
-    print(f"Exported {len(receipts)} receipts to {PROCESSED_RECEIPTS_PATH}")
-
+    # 6. Export to Excel in target directory
+    print(f"Exporting processed data to: {OUTPUT_EXCEL_FILE}")
+    with pd.ExcelWriter(OUTPUT_EXCEL_FILE, engine='xlsxwriter') as writer:
+        df_merged.to_excel(writer, sheet_name='Merged_Master_Data', index=False)
+        df_assigned_long.to_excel(writer, sheet_name='Assigned_LongFormat', index=False)
+        df_deposit_long.to_excel(writer, sheet_name='Deposit_LongFormat', index=False)
+    
+    print("Data processing complete. Data integrity maintained.")
 
 if __name__ == "__main__":
-    process_budgets()
+    process_budget_data()

@@ -1,0 +1,9 @@
+## Appending Rows
+
+INSERT INTO Contracts
+SELECT *
+FROM Contracts_New;
+
+INSERT INTO Researchers
+SELECT *
+FROM New_Researchers;
