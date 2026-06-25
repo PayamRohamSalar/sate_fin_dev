@@ -7,11 +7,12 @@ from models.employer import Employer
 from models.deposits import DepositReceipt
 from models.contract import Contract
 from models.payment import Payment
+from models.transfer import CreditTransfer
 
 def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -> float:
     """
     Calculates the real financial balance for a specific employer and funding year.
-    Formula: Sum of deposits (self + subsidiaries) - Sum of payments linked to employer's contracts for the specified funding_year.
+    Formula: total_deposits + transfers_in - transfers_out - total_payments
     """
     
     # 1. Calculate Total Deposits (Including subsidiaries)
@@ -42,8 +43,32 @@ def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -
 
     total_payments = payments_query or Decimal('0.0')
 
-    # 3. Calculate Real Balance
-    real_balance = total_deposits - total_payments
+    # 3. Calculate Transfers Out (funds sent from this employer or its subsidiaries)
+    transfers_out_query = db.query(func.sum(CreditTransfer.amount)).join(
+        Employer, CreditTransfer.source_employer_code == Employer.classification_code
+    ).filter(
+        or_(
+            Employer.classification_code == employer_code,
+            Employer.parent_code == employer_code
+        ),
+        CreditTransfer.fiscal_year == funding_year,
+        CreditTransfer.is_deleted == False,
+        Employer.is_deleted == False
+    ).scalar()
+    
+    transfers_out = transfers_out_query or Decimal('0.0')
+
+    # 4. Calculate Transfers In (funds received by this employer)
+    transfers_in_query = db.query(func.sum(CreditTransfer.amount)).filter(
+        CreditTransfer.destination_employer_code == employer_code,
+        CreditTransfer.fiscal_year == funding_year,
+        CreditTransfer.is_deleted == False
+    ).scalar()
+    
+    transfers_in = transfers_in_query or Decimal('0.0')
+
+    # 5. Calculate Real Balance
+    real_balance = total_deposits + transfers_in - transfers_out - total_payments
     
     return float(real_balance)
 

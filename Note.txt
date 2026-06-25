@@ -25,7 +25,6 @@ python generate_context.py
 # Run on database
 python3 scripts/example_1.py
 
-
 ## Phase 2: Backend development
 # Install requirements
 pip install fastapi uvicorn
@@ -38,6 +37,10 @@ uvicorn main:app --reload
 python -m uvicorn main:app --reload
 Then open browser: http://127.0.0.1:8000/docs
 
-# Run Server
-uvicorn main:app --reload
-http://127.0.0.1:8000/
+# Import import_credit_transfers
+python3 scripts/import_credit_transfers.py
+
+## Phase 3
+pip install streamlit
+python -m streamlit run dashboard/app.py
+

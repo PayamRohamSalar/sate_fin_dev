@@ -1,6 +1,6 @@
 """
 Financial Report Generator
-Calculates employer balances by comparing mandated budgets against actual payments.
+Calculates employer balances using: total_deposits - total_payments
 """
 
 import pandas as pd
@@ -20,7 +20,7 @@ def main():
     print("=" * 60)
     
     # Step 1: Extract data from database
-    print("\n[1/5] Extracting data from database...")
+    print("\n[1/6] Extracting data from database...")
     
     try:
         # Read tables into DataFrames
@@ -29,6 +29,9 @@ def main():
         
         df_mandates = pd.read_sql_table('annual_mandates', con=engine)
         print(f"   ✓ Loaded {len(df_mandates)} annual mandates")
+        
+        df_deposits = pd.read_sql_table('deposit_receipts', con=engine)
+        print(f"   ✓ Loaded {len(df_deposits)} deposit receipts")
         
         df_contracts = pd.read_sql_table('contracts', con=engine)
         print(f"   ✓ Loaded {len(df_contracts)} contracts")
@@ -40,8 +43,19 @@ def main():
         print(f"   ✗ Error reading tables: {e}")
         return
     
-    # Step 2: Aggregate payments by employer and funding year
-    print("\n[2/5] Aggregating payments by employer and funding year...")
+    # Step 2: Aggregate deposits by employer and fiscal year
+    print("\n[2/6] Aggregating deposits by employer and fiscal year...")
+    
+    # Group deposits by employer_code and fiscal_year, sum the deposit amounts
+    df_deposit_aggregates = df_deposits.groupby(
+        ['employer_code', 'fiscal_year']
+    )['deposit_amount'].sum().reset_index()
+    
+    df_deposit_aggregates.rename(columns={'deposit_amount': 'total_deposits'}, inplace=True)
+    print(f"   ✓ Aggregated deposits for {len(df_deposit_aggregates)} employer-year combinations")
+    
+    # Step 3: Aggregate payments by employer and funding year
+    print("\n[3/6] Aggregating payments by employer and funding year...")
     
     # Merge payments with contracts to get employer_code for each payment
     df_payments_with_employer = df_payments.merge(
@@ -59,31 +73,43 @@ def main():
     df_payment_aggregates.rename(columns={'amount': 'total_payments'}, inplace=True)
     print(f"   ✓ Aggregated payments for {len(df_payment_aggregates)} employer-year combinations")
     
-    # Step 3: Calculate balance
-    print("\n[3/5] Calculating financial balances...")
+    # Step 4: Calculate balance using deposits - payments
+    print("\n[4/6] Calculating financial balances...")
     
-    # Merge mandates with payment aggregates
+    # Start with mandates as base
     df_balance = df_mandates.merge(
+        df_deposit_aggregates,
+        on=['employer_code', 'fiscal_year'],
+        how='outer'
+    )
+    
+    # Merge with payment aggregates (join on employer_code and year)
+    df_balance = df_balance.merge(
         df_payment_aggregates,
         left_on=['employer_code', 'fiscal_year'],
         right_on=['employer_code', 'funding_year'],
         how='outer'
     )
     
-    # Fill NaN values with 0
-    df_balance['mandated_amount'] = df_balance['mandated_amount'].fillna(0)
-    df_balance['total_payments'] = df_balance['total_payments'].fillna(0)
-    
     # Use fiscal_year as the primary year column (coalesce with funding_year if needed)
     df_balance['year'] = df_balance['fiscal_year'].fillna(df_balance['funding_year']).astype(int)
     
-    # Calculate balance
-    df_balance['balance'] = df_balance['mandated_amount'] - df_balance['total_payments']
+    # Fill NaN values with 0 for all financial columns
+    df_balance['mandated_amount'] = df_balance['mandated_amount'].fillna(0)
+    df_balance['total_deposits'] = df_balance['total_deposits'].fillna(0)
+    df_balance['total_payments'] = df_balance['total_payments'].fillna(0)
+    
+    # Ensure employer_code is filled (from either side of the merge)
+    if 'employer_code_x' in df_balance.columns:
+        df_balance['employer_code'] = df_balance['employer_code_x'].fillna(df_balance['employer_code_y'])
+    
+    # Calculate the real balance: total_deposits - total_payments
+    df_balance['balance'] = df_balance['total_deposits'] - df_balance['total_payments']
     
     print(f"   ✓ Calculated balances for {len(df_balance)} records")
     
-    # Step 4: Format output with employer names
-    print("\n[4/5] Formatting final report with employer names...")
+    # Step 5: Format output with employer names
+    print("\n[5/6] Formatting final report with employer names...")
     
     # Merge with employers to get names
     df_final = df_balance.merge(
@@ -99,6 +125,7 @@ def main():
         'name',
         'year',
         'mandated_amount',
+        'total_deposits',
         'total_payments',
         'balance'
     ]]
@@ -108,8 +135,9 @@ def main():
         'نام مشمول',
         'سال مالی',
         'اعتبار تکلیفی (ریال)',
+        'مجموع واریزی (ریال)',
         'جمع پرداختی (ریال)',
-        'مانده (ریال)'
+        'مانده واقعی (ریال)'
     ]
     
     # Sort by employer code and year
@@ -117,8 +145,8 @@ def main():
     
     print(f"   ✓ Final report contains {len(df_final)} rows")
     
-    # Step 5: Export to Excel
-    print("\n[5/5] Exporting to Excel...")
+    # Step 6: Export to Excel
+    print("\n[6/6] Exporting to Excel...")
     
     # Ensure results directory exists
     results_dir = Path('results')
@@ -140,8 +168,9 @@ def main():
     print(f"Total employers: {df_final['کد مشمول'].nunique()}")
     print(f"Total fiscal years: {df_final['سال مالی'].nunique()}")
     print(f"Total mandated amount: {df_final['اعتبار تکلیفی (ریال)'].sum():,.0f} Rials")
+    print(f"Total deposited: {df_final['مجموع واریزی (ریال)'].sum():,.0f} Rials")
     print(f"Total payments: {df_final['جمع پرداختی (ریال)'].sum():,.0f} Rials")
-    print(f"Total remaining balance: {df_final['مانده (ریال)'].sum():,.0f} Rials")
+    print(f"Total real balance: {df_final['مانده واقعی (ریال)'].sum():,.0f} Rials")
     print("=" * 60)
     print("\n✓ Financial report generation completed successfully!")
 
