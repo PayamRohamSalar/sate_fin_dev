@@ -6,10 +6,18 @@ import jdatetime
 class BalanceResponse(BaseModel):
     """
     Response schema for employer balance inquiry.
+
+    Balance formula: (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
     """
     employer_code: str = Field(..., description="The employer's classification code")
     funding_year: int = Field(..., description="The funding year (fiscal year) for the balance calculation")
-    total_balance: float = Field(..., description="The calculated real balance (deposits - payments)")
+    total_balance: float = Field(
+        ...,
+        description=(
+            "The calculated real balance: "
+            "(Total Deposits + Transfers In) - (Total Payments + Transfers Out)"
+        ),
+    )
     inquiry_date_jalali: str = Field(..., description="Current date in Persian/Jalali calendar format")
 
     class Config:

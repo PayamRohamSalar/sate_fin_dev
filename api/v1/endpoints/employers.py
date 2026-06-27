@@ -20,9 +20,11 @@ def get_employer_balance(
 ):
     """
     Calculate and return the real financial balance for a specific employer and funding year.
-    
+
     The balance is calculated as:
-    - Total deposits (including subsidiaries) - Total payments linked to employer's contracts
+    (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
+
+    Deposits include subsidiary receipts for Mother employers.
     
     **Parameters:**
     - `employer_id`: The employer's classification code

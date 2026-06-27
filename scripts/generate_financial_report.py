@@ -1,179 +1,105 @@
 """
 Financial Report Generator
-Calculates employer balances using: total_deposits - total_payments
+Exports employer balances using the centralized macro engine in financial_engine.
 """
 
-import pandas as pd
 import os
-from pathlib import Path
-from sqlalchemy import create_engine
-
-# Import database engine
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from core.database import engine
+from pathlib import Path
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.database import SessionLocal
+from services.financial_engine import get_all_employers_financials
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_PATH = PROJECT_ROOT / "results" / "financial_report_summary.xlsx"
+
+PERSIAN_COLUMNS = [
+    "کد مشمول",
+    "نام مشمول",
+    "سال مالی",
+    "اعتبار تکلیفی (ریال)",
+    "مجموع واریزی (ریال)",
+    "هزینه کرد (ریال)",
+    "انتقال ورودی (ریال)",
+    "انتقال خروجی (ریال)",
+    "مانده واقعی (ریال)",
+]
+
+COLUMN_MAPPING = {
+    "employer_code": PERSIAN_COLUMNS[0],
+    "employer_name": PERSIAN_COLUMNS[1],
+    "year": PERSIAN_COLUMNS[2],
+    "mandated_amount": PERSIAN_COLUMNS[3],
+    "deposit_amount": PERSIAN_COLUMNS[4],
+    "payment_amount": PERSIAN_COLUMNS[5],
+    "transfer_in": PERSIAN_COLUMNS[6],
+    "transfer_out": PERSIAN_COLUMNS[7],
+    "balance": PERSIAN_COLUMNS[8],
+}
 
 
 def main():
     print("=" * 60)
     print("Financial Report Generator - Employer Balance Analysis")
     print("=" * 60)
-    
-    # Step 1: Extract data from database
-    print("\n[1/6] Extracting data from database...")
-    
+
+    db = SessionLocal()
     try:
-        # Read tables into DataFrames
-        df_employers = pd.read_sql_table('employers', con=engine)
-        print(f"   ✓ Loaded {len(df_employers)} employers")
-        
-        df_mandates = pd.read_sql_table('annual_mandates', con=engine)
-        print(f"   ✓ Loaded {len(df_mandates)} annual mandates")
-        
-        df_deposits = pd.read_sql_table('deposit_receipts', con=engine)
-        print(f"   ✓ Loaded {len(df_deposits)} deposit receipts")
-        
-        df_contracts = pd.read_sql_table('contracts', con=engine)
-        print(f"   ✓ Loaded {len(df_contracts)} contracts")
-        
-        df_payments = pd.read_sql_table('payments', con=engine)
-        print(f"   ✓ Loaded {len(df_payments)} payments")
-        
-    except Exception as e:
-        print(f"   ✗ Error reading tables: {e}")
-        return
-    
-    # Step 2: Aggregate deposits by employer and fiscal year
-    print("\n[2/6] Aggregating deposits by employer and fiscal year...")
-    
-    # Group deposits by employer_code and fiscal_year, sum the deposit amounts
-    df_deposit_aggregates = df_deposits.groupby(
-        ['employer_code', 'fiscal_year']
-    )['deposit_amount'].sum().reset_index()
-    
-    df_deposit_aggregates.rename(columns={'deposit_amount': 'total_deposits'}, inplace=True)
-    print(f"   ✓ Aggregated deposits for {len(df_deposit_aggregates)} employer-year combinations")
-    
-    # Step 3: Aggregate payments by employer and funding year
-    print("\n[3/6] Aggregating payments by employer and funding year...")
-    
-    # Merge payments with contracts to get employer_code for each payment
-    df_payments_with_employer = df_payments.merge(
-        df_contracts[['tracking_code', 'employer_code']],
-        left_on='contract_tracking_code',
-        right_on='tracking_code',
-        how='left'
-    )
-    
-    # Group by employer and funding year, sum the amounts
-    df_payment_aggregates = df_payments_with_employer.groupby(
-        ['employer_code', 'funding_year']
-    )['amount'].sum().reset_index()
-    
-    df_payment_aggregates.rename(columns={'amount': 'total_payments'}, inplace=True)
-    print(f"   ✓ Aggregated payments for {len(df_payment_aggregates)} employer-year combinations")
-    
-    # Step 4: Calculate balance using deposits - payments
-    print("\n[4/6] Calculating financial balances...")
-    
-    # Start with mandates as base
-    df_balance = df_mandates.merge(
-        df_deposit_aggregates,
-        on=['employer_code', 'fiscal_year'],
-        how='outer'
-    )
-    
-    # Merge with payment aggregates (join on employer_code and year)
-    df_balance = df_balance.merge(
-        df_payment_aggregates,
-        left_on=['employer_code', 'fiscal_year'],
-        right_on=['employer_code', 'funding_year'],
-        how='outer'
-    )
-    
-    # Use fiscal_year as the primary year column (coalesce with funding_year if needed)
-    df_balance['year'] = df_balance['fiscal_year'].fillna(df_balance['funding_year']).astype(int)
-    
-    # Fill NaN values with 0 for all financial columns
-    df_balance['mandated_amount'] = df_balance['mandated_amount'].fillna(0)
-    df_balance['total_deposits'] = df_balance['total_deposits'].fillna(0)
-    df_balance['total_payments'] = df_balance['total_payments'].fillna(0)
-    
-    # Ensure employer_code is filled (from either side of the merge)
-    if 'employer_code_x' in df_balance.columns:
-        df_balance['employer_code'] = df_balance['employer_code_x'].fillna(df_balance['employer_code_y'])
-    
-    # Calculate the real balance: total_deposits - total_payments
-    df_balance['balance'] = df_balance['total_deposits'] - df_balance['total_payments']
-    
-    print(f"   ✓ Calculated balances for {len(df_balance)} records")
-    
-    # Step 5: Format output with employer names
-    print("\n[5/6] Formatting final report with employer names...")
-    
-    # Merge with employers to get names
-    df_final = df_balance.merge(
-        df_employers[['classification_code', 'name']],
-        left_on='employer_code',
-        right_on='classification_code',
-        how='left'
-    )
-    
-    # Select and rename columns to Persian
-    df_final = df_final[[
-        'employer_code',
-        'name',
-        'year',
-        'mandated_amount',
-        'total_deposits',
-        'total_payments',
-        'balance'
-    ]]
-    
-    df_final.columns = [
-        'کد مشمول',
-        'نام مشمول',
-        'سال مالی',
-        'اعتبار تکلیفی (ریال)',
-        'مجموع واریزی (ریال)',
-        'جمع پرداختی (ریال)',
-        'مانده واقعی (ریال)'
-    ]
-    
-    # Sort by employer code and year
-    df_final = df_final.sort_values(['کد مشمول', 'سال مالی'])
-    
-    print(f"   ✓ Final report contains {len(df_final)} rows")
-    
-    # Step 6: Export to Excel
-    print("\n[6/6] Exporting to Excel...")
-    
-    # Ensure results directory exists
-    results_dir = Path('results')
-    results_dir.mkdir(exist_ok=True)
-    
-    output_path = results_dir / 'financial_report_summary.xlsx'
-    
-    try:
-        df_final.to_excel(output_path, index=False, engine='openpyxl')
-        print(f"   ✓ Exported to: {output_path}")
-    except Exception as e:
-        print(f"   ✗ Error exporting to Excel: {e}")
-        return
-    
-    # Summary statistics
-    print("\n" + "=" * 60)
-    print("REPORT SUMMARY")
-    print("=" * 60)
-    print(f"Total employers: {df_final['کد مشمول'].nunique()}")
-    print(f"Total fiscal years: {df_final['سال مالی'].nunique()}")
-    print(f"Total mandated amount: {df_final['اعتبار تکلیفی (ریال)'].sum():,.0f} Rials")
-    print(f"Total deposited: {df_final['مجموع واریزی (ریال)'].sum():,.0f} Rials")
-    print(f"Total payments: {df_final['جمع پرداختی (ریال)'].sum():,.0f} Rials")
-    print(f"Total real balance: {df_final['مانده واقعی (ریال)'].sum():,.0f} Rials")
-    print("=" * 60)
-    print("\n✓ Financial report generation completed successfully!")
+        print("\n[1/3] Calculating employer financials via macro engine...")
+        df = get_all_employers_financials(db)
+
+        if df.empty:
+            print("   No financial data found.")
+            return
+
+        print(f"   Loaded {df['employer_code'].nunique()} employers")
+        print(f"   Generated {len(df)} employer-year records")
+
+        print("\n[2/3] Formatting report columns...")
+        df_report = df.rename(columns=COLUMN_MAPPING)
+        df_report = df_report.sort_values([PERSIAN_COLUMNS[0], PERSIAN_COLUMNS[2]])
+
+        print("\n[3/3] Exporting to Excel...")
+        OUTPUT_PATH.parent.mkdir(exist_ok=True)
+        df_report.to_excel(OUTPUT_PATH, index=False, engine="openpyxl")
+        print(f"   Exported to: {OUTPUT_PATH}")
+
+        print("\n" + "=" * 60)
+        print("REPORT SUMMARY")
+        print("=" * 60)
+        print(f"Total employers:        {df_report[PERSIAN_COLUMNS[0]].nunique()}")
+        print(f"Total fiscal years:     {df_report[PERSIAN_COLUMNS[2]].nunique()}")
+        print(
+            f"Total mandated amount:  "
+            f"{df_report[PERSIAN_COLUMNS[3]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total deposited:        "
+            f"{df_report[PERSIAN_COLUMNS[4]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total payments:         "
+            f"{df_report[PERSIAN_COLUMNS[5]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total transfers in:     "
+            f"{df_report[PERSIAN_COLUMNS[6]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total transfers out:    "
+            f"{df_report[PERSIAN_COLUMNS[7]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total real balance:     "
+            f"{df_report[PERSIAN_COLUMNS[8]].sum():,.0f} Rials"
+        )
+        print("=" * 60)
+        print("\nFinancial report generation completed successfully!")
+    finally:
+        db.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

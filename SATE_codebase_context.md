@@ -40,32 +40,44 @@
             __init__.py
             endpoints/
                 employers.py
+                payments.py
                 __init__.py
     core/
         database.py
+    dashboard/
+        app.py
+        CHANGELOG.md
+        QUICKSTART.md
+        README.md
     data/
         Archive/
             Payments/
     Docs/
         Phase1_Complete.md
         Phase2_Start.md
+        Phase3_Dashboard_Complete.md
     models/
         contract.py
         deposits.py
         employer.py
         payment.py
         researchers.py
+        transfer.py
         university.py
     results/
     schemas/
         employer_schema.py
+        payment_schema.py
         __init__.py
     scripts/
         append_new_mandates.py
+        chart01_total_trend.py
         check_excel.py
+        create_transfer_table.py
         example_1.py
         generate_financial_report.py
         import_contracts.py
+        import_credit_transfers.py
         import_deposits.py
         import_employers.py
         import_payments.py
@@ -257,7 +269,7 @@ def test_financial_engine():
             print("Please ensure the database is populated with employer data.")
             return
         
-        print(f"\n✓ Found Employer: {employer.employer_name}")
+        print(f"\n✓ Found Employer: {employer.name}")
         print(f"  Classification Code: {employer.classification_code}")
         print(f"  Parent Code: {employer.parent_code or 'N/A (Top-level employer)'}")
         
@@ -310,17 +322,17 @@ if __name__ == "__main__":
 ------------------------------
 from fastapi import APIRouter
 
-from api.v1.endpoints import employers
+from api.v1.endpoints import employers, payments
 
 # Create the main API router for version 1
 api_router = APIRouter()
 
 # Include sub-routers for different endpoint groups
 api_router.include_router(employers.router)
+api_router.include_router(payments.router)
 
 # Future routers can be added here as the system grows:
 # api_router.include_router(contracts.router)
-# api_router.include_router(payments.router)
 # api_router.include_router(deposits.router)
 
 
@@ -397,6 +409,84 @@ def get_employer_balance(
     )
 
 
+## File: api\v1\endpoints\payments.py
+------------------------------
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from core.database import get_db
+from services.financial_engine import validate_payment_impact
+from schemas.payment_schema import PaymentValidationRequest, PaymentValidationResponse
+
+router = APIRouter(
+    prefix="/payments",
+    tags=["Payments"]
+)
+
+
+@router.post("/validate", response_model=PaymentValidationResponse)
+def validate_payment(
+    request: PaymentValidationRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Validate the impact of a payment on the employer's balance before registration.
+    
+    This endpoint implements FR-18, FR-19, FR-20:
+    - Finds the employer linked to the contract
+    - Calculates current and projected balance
+    - Warns if balance becomes negative (but does not block the operation)
+    
+    **Business Rule:** This endpoint returns HTTP 200 even if the balance becomes negative,
+    as the system is designed to warn but not prevent negative balances.
+    
+    **Parameters:**
+    - `contract_tracking_code`: The contract tracking code
+    - `amount`: The payment amount to validate
+    - `funding_year`: The funding year for the payment
+    
+    **Returns:**
+    - Current balance, new balance, and warning message if applicable
+    """
+    
+    try:
+        # Call the financial engine to validate payment impact
+        validation_result = validate_payment_impact(
+            db=db,
+            contract_code=request.contract_tracking_code,
+            payment_amount=request.amount,
+            funding_year=request.funding_year
+        )
+        
+        # Prepare warning message if balance becomes negative
+        warning_message = None
+        if validation_result["is_negative"]:
+            warning_message = "هشدار: ثبت این پرداخت باعث منفی شدن مانده حساب کارفرما خواهد شد"
+        
+        # Build and return response
+        return PaymentValidationResponse(
+            employer_code=validation_result["employer_code"],
+            current_balance=validation_result["current_balance"],
+            payment_amount=validation_result["payment_amount"],
+            new_balance=validation_result["new_balance"],
+            is_negative=validation_result["is_negative"],
+            warning_message=warning_message
+        )
+        
+    except ValueError as e:
+        # Contract not found or deleted
+        raise HTTPException(
+            status_code=404,
+            detail=str(e)
+        )
+    except Exception as e:
+        # Unexpected error during validation
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error validating payment: {str(e)}"
+        )
+
+
 ## File: api\v1\endpoints\__init__.py
 ------------------------------
 
@@ -428,6 +518,838 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+## File: dashboard\app.py
+------------------------------
+import streamlit as st
+import pandas as pd
+import io
+from sqlalchemy import func, case
+from sqlalchemy.orm import Session
+import sys
+import os
+import plotly.graph_objects as go
+
+# Add parent directory to path to import project modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.database import SessionLocal, engine
+from models.employer import Employer
+from models.deposits import AnnualMandate, DepositReceipt
+from models.payment import Payment
+from models.contract import Contract
+from models.transfer import CreditTransfer
+
+
+def to_persian_numbers(text):
+    """
+    Convert English digits to Persian digits and format numbers with thousand separators.
+    Handles strings, integers, floats, and already-formatted strings.
+    """
+    # Persian digit mapping
+    persian_digits = {
+        '0': '۰', '1': '۱', '2': '۲', '3': '۳', '4': '۴',
+        '5': '۵', '6': '۶', '7': '۷', '8': '۸', '9': '۹'
+    }
+    
+    # If it's a number, format it first with commas
+    if isinstance(text, (int, float)):
+        text = f"{int(text):,}"
+    else:
+        text = str(text)
+    
+    # Replace English digits with Persian
+    for eng, per in persian_digits.items():
+        text = text.replace(eng, per)
+    
+    return text
+
+
+def get_active_employers(db: Session):
+    """Fetch all active employers for dropdown."""
+    employers = db.query(Employer).filter(
+        Employer.status == 'Active',
+        Employer.is_deleted == False
+    ).order_by(Employer.name).all()
+    return employers
+
+
+def get_employer_financials(db: Session, employer_code: str):
+    """
+    Fetch and aggregate financial data for a specific employer across all years.
+    Returns a DataFrame with columns for each financial metric by year.
+    """
+    
+    # Get the employer details to check if it's a Mother entity
+    employer = db.query(Employer).filter(Employer.classification_code == employer_code).first()
+    if not employer:
+        return pd.DataFrame()
+    
+    # Determine which codes to include (main + subsidiaries for Mother entities)
+    if employer.employer_type == 'Mother':
+        codes_to_include = [employer_code]
+        subsidiaries = db.query(Employer.classification_code).filter(
+            Employer.parent_code == employer_code,
+            Employer.is_deleted == False
+        ).all()
+        codes_to_include.extend([s[0] for s in subsidiaries])
+    else:
+        codes_to_include = [employer_code]
+    
+    # 1. Get Annual Mandates
+    mandates_query = db.query(
+        AnnualMandate.fiscal_year.label('year'),
+        func.sum(AnnualMandate.mandated_amount).label('mandated_amount')
+    ).filter(
+        AnnualMandate.employer_code.in_(codes_to_include),
+        AnnualMandate.is_deleted == False
+    ).group_by(AnnualMandate.fiscal_year)
+    
+    df_mandates = pd.read_sql(mandates_query.statement, db.bind)
+    
+    # 2. Get Deposit Receipts
+    deposits_query = db.query(
+        DepositReceipt.fiscal_year.label('year'),
+        func.sum(DepositReceipt.deposit_amount).label('deposit_amount')
+    ).filter(
+        DepositReceipt.employer_code.in_(codes_to_include),
+        DepositReceipt.is_deleted == False
+    ).group_by(DepositReceipt.fiscal_year)
+    
+    df_deposits = pd.read_sql(deposits_query.statement, db.bind)
+    
+    # 3. Get Payments (via Contract relationship)
+    payments_query = db.query(
+        Payment.funding_year.label('year'),
+        func.sum(Payment.amount).label('payment_amount')
+    ).join(
+        Contract, Payment.contract_tracking_code == Contract.tracking_code
+    ).filter(
+        Contract.employer_code.in_(codes_to_include),
+        Payment.is_deleted == False,
+        Contract.is_deleted == False
+    ).group_by(Payment.funding_year)
+    
+    df_payments = pd.read_sql(payments_query.statement, db.bind)
+    
+    # 4. Get Transfers IN (where this employer is the destination)
+    transfers_in_query = db.query(
+        CreditTransfer.fiscal_year.label('year'),
+        func.sum(CreditTransfer.amount).label('transfer_in')
+    ).filter(
+        CreditTransfer.destination_employer_code.in_(codes_to_include),
+        CreditTransfer.is_deleted == False
+    ).group_by(CreditTransfer.fiscal_year)
+    
+    df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
+    
+    # 5. Get Transfers OUT (where this employer is the source)
+    transfers_out_query = db.query(
+        CreditTransfer.fiscal_year.label('year'),
+        func.sum(CreditTransfer.amount).label('transfer_out')
+    ).filter(
+        CreditTransfer.source_employer_code.in_(codes_to_include),
+        CreditTransfer.is_deleted == False
+    ).group_by(CreditTransfer.fiscal_year)
+    
+    df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
+    
+    # Merge all dataframes on year
+    dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
+    df_merged = dfs[0]
+    
+    for df in dfs[1:]:
+        df_merged = df_merged.merge(df, on='year', how='outer')
+    
+    # Fill NaN with 0
+    df_merged = df_merged.fillna(0)
+    
+    # Sort by year
+    df_merged = df_merged.sort_values('year')
+    
+    # Calculate balance: (Deposits + Transfers IN) - (Payments + Transfers OUT)
+    df_merged['balance'] = (
+        df_merged['deposit_amount'] + df_merged['transfer_in']
+    ) - (
+        df_merged['payment_amount'] + df_merged['transfer_out']
+    )
+    
+    return df_merged
+
+
+def get_all_employers_financials(db: Session):
+    """
+    Fetch and aggregate financial data for ALL employers across ALL years.
+    Returns a DataFrame with one row per (employer, year) combination.
+    """
+    
+    # Get all active employers
+    employers = db.query(Employer).filter(
+        Employer.status == 'Active',
+        Employer.is_deleted == False
+    ).all()
+    
+    all_data = []
+    
+    for employer in employers:
+        employer_code = employer.classification_code
+        employer_name = employer.name
+        
+        # Determine which codes to include (main + subsidiaries for Mother entities)
+        if employer.employer_type == 'Mother':
+            codes_to_include = [employer_code]
+            subsidiaries = db.query(Employer.classification_code).filter(
+                Employer.parent_code == employer_code,
+                Employer.is_deleted == False
+            ).all()
+            codes_to_include.extend([s[0] for s in subsidiaries])
+        else:
+            codes_to_include = [employer_code]
+        
+        # Get Annual Mandates
+        mandates_query = db.query(
+            AnnualMandate.fiscal_year.label('year'),
+            func.sum(AnnualMandate.mandated_amount).label('mandated_amount')
+        ).filter(
+            AnnualMandate.employer_code.in_(codes_to_include),
+            AnnualMandate.is_deleted == False
+        ).group_by(AnnualMandate.fiscal_year)
+        
+        df_mandates = pd.read_sql(mandates_query.statement, db.bind)
+        df_mandates = df_mandates.reindex(columns=['year', 'mandated_amount']).fillna(0.0)
+        
+        # Get Deposit Receipts
+        deposits_query = db.query(
+            DepositReceipt.fiscal_year.label('year'),
+            func.sum(DepositReceipt.deposit_amount).label('deposit_amount')
+        ).filter(
+            DepositReceipt.employer_code.in_(codes_to_include),
+            DepositReceipt.is_deleted == False
+        ).group_by(DepositReceipt.fiscal_year)
+        
+        df_deposits = pd.read_sql(deposits_query.statement, db.bind)
+        df_deposits = df_deposits.reindex(columns=['year', 'deposit_amount']).fillna(0.0)
+        
+        # Get Payments
+        payments_query = db.query(
+            Payment.funding_year.label('year'),
+            func.sum(Payment.amount).label('payment_amount')
+        ).join(
+            Contract, Payment.contract_tracking_code == Contract.tracking_code
+        ).filter(
+            Contract.employer_code.in_(codes_to_include),
+            Payment.is_deleted == False,
+            Contract.is_deleted == False
+        ).group_by(Payment.funding_year)
+        
+        df_payments = pd.read_sql(payments_query.statement, db.bind)
+        df_payments = df_payments.reindex(columns=['year', 'payment_amount']).fillna(0.0)
+        
+        # Get Transfers IN
+        transfers_in_query = db.query(
+            CreditTransfer.fiscal_year.label('year'),
+            func.sum(CreditTransfer.amount).label('transfer_in')
+        ).filter(
+            CreditTransfer.destination_employer_code.in_(codes_to_include),
+            CreditTransfer.is_deleted == False
+        ).group_by(CreditTransfer.fiscal_year)
+        
+        df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
+        df_transfers_in = df_transfers_in.reindex(columns=['year', 'transfer_in']).fillna(0.0)
+        
+        # Get Transfers OUT
+        transfers_out_query = db.query(
+            CreditTransfer.fiscal_year.label('year'),
+            func.sum(CreditTransfer.amount).label('transfer_out')
+        ).filter(
+            CreditTransfer.source_employer_code.in_(codes_to_include),
+            CreditTransfer.is_deleted == False
+        ).group_by(CreditTransfer.fiscal_year)
+        
+        df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
+        df_transfers_out = df_transfers_out.reindex(columns=['year', 'transfer_out']).fillna(0.0)
+        
+        # Merge all dataframes (each has explicit columns, so outer merge is safe)
+        dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
+        df_merged = dfs[0]
+        
+        for df in dfs[1:]:
+            df_merged = df_merged.merge(df, on='year', how='outer')
+        
+        # Fill NaN with 0 (infer_objects(copy=False) avoids FutureWarning on downcasting)
+        df_merged = df_merged.fillna(0).infer_objects(copy=False)
+        
+        # Add employer info
+        df_merged['employer_code'] = employer_code
+        df_merged['employer_name'] = employer_name
+        
+        # Safety check: ensure all required columns exist before calculating balance
+        required_cols = ['mandated_amount', 'deposit_amount', 'payment_amount', 'transfer_in', 'transfer_out']
+        for col in required_cols:
+            if col not in df_merged.columns:
+                df_merged[col] = 0.0
+        
+        # Calculate balance
+        df_merged['balance'] = (
+            df_merged['mandated_amount'] + df_merged['deposit_amount'] + df_merged['transfer_in']
+        ) - (
+            df_merged['payment_amount'] + df_merged['transfer_out']
+        )
+        
+        all_data.append(df_merged)
+    
+    # Concatenate all employers
+    if all_data:
+        df_all = pd.concat(all_data, ignore_index=True)
+        # Reorder columns
+        df_all = df_all[['employer_code', 'employer_name', 'year', 'mandated_amount', 
+                         'deposit_amount', 'payment_amount', 'transfer_in', 
+                         'transfer_out', 'balance']]
+        return df_all
+    else:
+        return pd.DataFrame()
+
+
+def format_number(value):
+    """Format numbers with comma separators and no decimals (kept for raw data)."""
+    try:
+        return f"{int(value):,}"
+    except (ValueError, TypeError):
+        return "0"
+
+
+def to_excel(df):
+    """
+    Write a DataFrame to a BytesIO buffer as an Excel file and return the bytes.
+    This uses the raw numeric DataFrame before Persian digit conversion.
+    """
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False, engine='openpyxl')
+    return buffer.getvalue()
+
+
+def main():
+    st.set_page_config(
+        page_title="\u062f\u0627\u0634\u0628\u0648\u0631\u062f \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0633\u0627\u062a\u0639",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Inject CSS for Persian font (Vazirmatn), RTL layout, centered title & table styling
+    st.markdown("""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+
+        html, body, [class*="css"], * {
+            font-family: 'Vazirmatn', sans-serif !important;
+            direction: rtl;
+            text-align: right;
+        }
+
+        h1, .stHeadingContainer {
+            text-align: center !important;
+            direction: rtl;
+        }
+
+        table, th, td, [data-testid="stTable"] {
+            font-family: 'Vazirmatn', sans-serif !important;
+            font-size: 16px !important;
+            text-align: center !important;
+            direction: rtl;
+        }
+
+        th {
+            background-color: #f0f2f6 !important;
+            border-bottom: 2px solid #4a4a4a !important;
+            font-weight: 700 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    st.title("\U0001f4ca \u062f\u0627\u0634\u0628\u0648\u0631\u062f \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0633\u0627\u062a\u0639 - \u062a\u0631\u0627\u0632\u0646\u0627\u0645\u0647 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646")
+    st.markdown("---")
+    
+    # Initialize database session
+    db = SessionLocal()
+    
+    try:
+        # Get active employers for dropdown
+        employers = get_active_employers(db)
+        
+        if not employers:
+            st.warning("\u0647\u06cc\u0686 \u0645\u0634\u0645\u0648\u0644\u06cc \u0641\u0639\u0627\u0644 \u062f\u0631 \u0633\u06cc\u0633\u062a\u0645 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
+            return
+        
+        # Create tabs
+        tab1, tab2 = st.tabs(['\u062a\u0631\u0627\u0632\u0646\u0627\u0645\u0647 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646', '\u0646\u0645\u0627\u06cc \u06a9\u0644\u0627\u0646 (Executive Summary)'])
+        
+        # ─── Tab 1: Employer-Specific View ───
+        with tab1:
+            # Create employer selection dropdown
+            employer_options = {emp.classification_code: f"{emp.name} ({emp.classification_code})" for emp in employers}
+
+            # Default to employer with classification_code '231500', fallback to 0
+            default_index = 0
+            employer_keys = list(employer_options.keys())
+            if '231500' in employer_keys:
+                default_index = employer_keys.index('231500')
+
+            selected_code = st.selectbox(
+                "\u0627\u0646\u062a\u062e\u0627\u0628 \u0645\u0634\u0645\u0648\u0644:",
+                options=employer_keys,
+                format_func=lambda x: employer_options[x],
+                index=default_index
+            )
+            
+            if selected_code:
+                # Get selected employer details
+                selected_employer = next(emp for emp in employers if emp.classification_code == selected_code)
+                
+                # Display employer info
+                st.subheader(f"\u0627\u0637\u0644\u0627\u0639\u0627\u062a \u0645\u0634\u0645\u0648\u0644: {selected_employer.name}")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.info(f"**\u06a9\u062f \u0637\u0628\u0642\u0647\u200c\u0628\u0646\u062f\u06cc:** {selected_employer.classification_code}")
+                with col2:
+                    st.info(f"**\u0627\u0633\u062a\u0627\u0646:** {selected_employer.province}")
+                with col3:
+                    st.info(f"**\u0633\u0627\u0632\u0645\u0627\u0646 \u0628\u0627\u0644\u0627\u062f\u0633\u062a:** {selected_employer.upper_organization}")
+                
+                st.markdown("---")
+                
+                # Fetch financial data
+                with st.spinner("\u062f\u0631 \u062d\u0627\u0644 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0627\u0637\u0644\u0627\u0639\u0627\u062a \u0645\u0627\u0644\u06cc..."):
+                    df = get_employer_financials(db, selected_code)
+                
+                if df.empty:
+                    st.warning("\u0647\u06cc\u0686 \u062f\u0627\u062f\u0647 \u0645\u0627\u0644\u06cc \u0628\u0631\u0627\u06cc \u0627\u06cc\u0646 \u0645\u0634\u0645\u0648\u0644 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
+                else:
+                    # Calculate totals for KPIs
+                    total_mandated = df['mandated_amount'].sum()
+                    total_deposits = df['deposit_amount'].sum()
+                    total_payments = df['payment_amount'].sum()
+                    total_transfer_in = df['transfer_in'].sum()
+                    total_transfer_out = df['transfer_out'].sum()
+                    total_balance = df['balance'].sum()
+                    
+                    # Display KPI metrics with Persian numbers
+                    st.subheader("\U0001f511 \u0634\u0627\u062e\u0635\u200c\u0647\u0627\u06cc \u06a9\u0644\u06cc\u062f\u06cc")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc (\u06a9\u0644)", to_persian_numbers(total_mandated))
+                        st.metric("\u0648\u0627\u0631\u06cc\u0632\u06cc (\u06a9\u0644)", to_persian_numbers(total_deposits))
+                    with col2:
+                        st.metric("\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f (\u06a9\u0644)", to_persian_numbers(total_payments))
+                        st.metric("\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc (\u06a9\u0644)", to_persian_numbers(total_transfer_in))
+                    with col3:
+                        st.metric("\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc (\u06a9\u0644)", to_persian_numbers(total_transfer_out))
+                        st.metric("\u0645\u0627\u0646\u062f\u0647 \u0646\u0647\u0627\u06cc\u06cc (\u06a9\u0644)", to_persian_numbers(total_balance))
+                    
+                    st.markdown("---")
+                    st.subheader("\U0001f4cb \u062c\u062f\u0648\u0644 \u062a\u0641\u0635\u06cc\u0644\u06cc \u0628\u0647 \u062a\u0641\u06a9\u06cc\u06a9 \u0633\u0627\u0644")
+                    
+                    # Prepare display DataFrame with Persian digits
+                    df_display = df.copy()
+                    df_display = df_display.rename(columns={
+                        'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
+                        'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
+                        'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
+                        'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
+                        'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
+                        'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
+                        'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
+                    })
+                    
+                    # Apply Persian numbers to all columns
+                    for col in ['\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc']:
+                        df_display[col] = df_display[col].apply(to_persian_numbers)
+                        
+                    for col in ['\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc', '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc', '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f', '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc', '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc', '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc']:
+                        df_display[col] = df_display[col].apply(to_persian_numbers)
+                    
+                    # Display the table (using st.table for proper CSS styling)
+                    st.table(df_display)
+                    
+                    # Excel download button (uses raw df with English digits for Excel compatibility)
+                    df_excel = df.copy()
+                    df_excel = df_excel.rename(columns={
+                        'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
+                        'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
+                        'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
+                        'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
+                        'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
+                        'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
+                        'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
+                    })
+                    
+                    st.download_button(
+                        label="\U0001f4e5 \u062f\u0627\u0646\u0644\u0648\u062f \u06af\u0632\u0627\u0631\u0634 \u0628\u0647 \u0635\u0648\u0631\u062a \u0627\u06a9\u0633\u0644",
+                        data=to_excel(df_excel),
+                        file_name=f"financial_report_{selected_code}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    
+                    # Additional analysis
+                    st.markdown("---")
+                    st.subheader("\U0001f4ca \u062a\u062d\u0644\u06cc\u0644 \u0648 \u0646\u0645\u0648\u062f\u0627\u0631")
+                    
+                    # Create a chart showing deposits vs payments over years with Persian font
+                    chart_data = df[['year', 'deposit_amount', 'payment_amount', 'balance']].copy()
+                    
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=chart_data['year'],
+                        y=chart_data['deposit_amount'],
+                        mode='lines+markers',
+                        name='\u0648\u0627\u0631\u06cc\u0632\u06cc',
+                        line=dict(color='green', width=2)
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=chart_data['year'],
+                        y=chart_data['payment_amount'],
+                        mode='lines+markers',
+                        name='\u0647\u0632\u06cc\u0646\u0647',
+                        line=dict(color='red', width=2)
+                    ))
+                    
+                    fig.add_trace(go.Scatter(
+                        x=chart_data['year'],
+                        y=chart_data['balance'],
+                        mode='lines+markers',
+                        name='\u0645\u0627\u0646\u062f\u0647',
+                        line=dict(color='blue', width=2)
+                    ))
+                    
+                    fig.update_layout(
+                        font=dict(family='Vazirmatn', size=14),
+                        xaxis_title='\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
+                        yaxis_title='\u0645\u0628\u0644\u063a (\u0631\u06cc\u0627\u0644)',
+                        hovermode='x unified',
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+        
+        # ─── Tab 2: Executive Summary (Macro View) ───
+        with tab2:
+            st.subheader("\U0001f3e2 \u0646\u0645\u0627\u06cc \u06a9\u0644\u0627\u0646 - \u062e\u0644\u0627\u0635\u0647 \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc")
+            
+            with st.spinner("\u062f\u0631 \u062d\u0627\u0644 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0627\u0637\u0644\u0627\u0639\u0627\u062a \u06a9\u0644\u0627\u0646..."):
+                df_all = get_all_employers_financials(db)
+            
+            if df_all.empty:
+                st.warning("\u0647\u06cc\u0686 \u062f\u0627\u062f\u0647 \u0645\u0627\u0644\u06cc \u062f\u0631 \u0633\u06cc\u0633\u062a\u0645 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
+            else:
+                # ── Global KPIs ──
+                grand_mandated = df_all['mandated_amount'].sum()
+                grand_deposits = df_all['deposit_amount'].sum()
+                grand_payments = df_all['payment_amount'].sum()
+                grand_balance = df_all['balance'].sum()
+                
+                st.markdown("### \U0001f511 \u0634\u0627\u062e\u0635\u200c\u0647\u0627\u06cc \u06a9\u0644\u06cc\u062f\u06cc \u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_mandated))
+                with col2:
+                    st.metric("\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_deposits))
+                with col3:
+                    st.metric("\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_payments))
+                with col4:
+                    st.metric("\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_balance))
+                
+                st.markdown("---")
+                
+                # ── Top 10 Employers by Deposit Amount ──
+                st.markdown("### \U0001f4ca \u06f1\u06f0 \u0645\u0634\u0645\u0648\u0644 \u0628\u0631\u062a\u0631 \u0628\u0631 \u0627\u0633\u0627\u0633 \u0645\u06cc\u0632\u0627\u0646 \u0648\u0627\u0631\u06cc\u0632\u06cc")
+                
+                top10 = df_all.groupby(
+                    ['employer_code', 'employer_name'], as_index=False
+                )['deposit_amount'].sum().nlargest(10, 'deposit_amount')
+                
+                fig_top10 = go.Figure(go.Bar(
+                    x=top10['deposit_amount'],
+                    y=top10['employer_name'],
+                    orientation='h',
+                    text=top10['deposit_amount'].apply(lambda v: to_persian_numbers(int(v))),
+                    textposition='auto',
+                    marker_color='#2196F3'
+                ))
+                
+                fig_top10.update_layout(
+                    font=dict(family='Vazirmatn', size=14),
+                    xaxis_title='\u0645\u0628\u0644\u063a \u0648\u0627\u0631\u06cc\u0632\u06cc (\u0631\u06cc\u0627\u0644)',
+                    yaxis_title='',
+                    yaxis=dict(autorange='reversed'),
+                    height=500,
+                    margin=dict(l=20, r=20, t=40, b=40)
+                )
+                
+                st.plotly_chart(fig_top10, use_container_width=True)
+                
+                st.markdown("---")
+                
+                # ── Global Excel Export ──
+                df_export = df_all.copy()
+                df_export = df_export.rename(columns={
+                    'employer_code': '\u06a9\u062f \u0645\u0634\u0645\u0648\u0644',
+                    'employer_name': '\u0646\u0627\u0645 \u0645\u0634\u0645\u0648\u0644',
+                    'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
+                    'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
+                    'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
+                    'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
+                    'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
+                    'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
+                    'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
+                })
+                
+                st.download_button(
+                    label="\U0001f4e5 \u062f\u0627\u0646\u0644\u0648\u062f \u06af\u0632\u0627\u0631\u0634 \u062c\u0627\u0645\u0639 \u06a9\u0644 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646 (\u0627\u06a9\u0633\u0644)",
+                    data=to_excel(df_export),
+                    file_name="financial_report_all_employers.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+## File: dashboard\CHANGELOG.md
+------------------------------
+# Dashboard Changelog
+
+## Version 1.1 - Excel Export Feature
+
+### Added
+- **Excel Download Button**: Users can now export the annual financial breakdown table to Excel
+- **`to_excel()` helper function**: Converts DataFrame to Excel format using BytesIO buffer
+- **Dynamic filename**: Export files are named `financial_report_{employer_code}.xlsx` for easy identification
+
+### Technical Details
+- Import added: `io` from standard library
+- Function signature: `to_excel(df) -> bytes`
+- Uses `openpyxl` engine (already in requirements.txt)
+- Button placed directly below the annual breakdown table
+- Proper MIME type set for Excel downloads: `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+
+### User Experience
+- Button label in Persian: "📥 دانلود گزارش به صورت اکسل"
+- One-click download with no additional configuration needed
+- Downloaded file preserves Persian column names and all formatting
+- Numbers are exported in their numeric format (not comma-formatted strings) for further Excel calculations
+
+### Code Changes
+**File**: `dashboard/app.py`
+- Line 3: Added `import io`
+- Lines 140-144: New `to_excel()` helper function
+- Lines 289-294: New `st.download_button` component
+
+### Dependencies
+No new dependencies required - `openpyxl` was already in requirements.txt
+
+---
+
+## Version 1.0 - Initial Release
+
+### Features
+- Employer selection dropdown
+- Hierarchical support (Mother + Subsidiaries)
+- Six KPI metrics
+- Annual breakdown table
+- Trend analysis chart
+- Persian UI with RTL support
+
+
+## File: dashboard\QUICKSTART.md
+------------------------------
+# راهنمای سریع اجرای داشبورد
+
+## نصب وابستگی‌ها
+
+اگر هنوز Streamlit را نصب نکرده‌اید:
+
+```bash
+pip install -r requirements.txt
+```
+
+## اجرای داشبورد
+
+از دایرکتوری اصلی پروژه دستور زیر را اجرا کنید:
+
+```bash
+streamlit run dashboard/app.py
+```
+
+یا می‌توانید مستقیماً از پوشه dashboard اجرا کنید:
+
+```bash
+cd dashboard
+streamlit run app.py
+```
+
+## دسترسی به داشبورد
+
+پس از اجرا، داشبورد به صورت خودکار در مرورگر پیش‌فرض باز می‌شود:
+- آدرس محلی: http://localhost:8501
+- آدرس شبکه: http://YOUR_IP:8501
+
+## توقف داشبورد
+
+برای توقف سرور Streamlit، در ترمینال `Ctrl+C` را فشار دهید.
+
+## عیب‌یابی
+
+### خطای اتصال به دیتابیس
+اطمینان حاصل کنید که:
+1. فایل `.env` در دایرکتوری اصلی پروژه موجود است
+2. متغیر `DATABASE_URL` به درستی تنظیم شده است
+3. سرویس PostgreSQL در حال اجرا است
+
+### خطای ماژول پیدا نشد
+از دایرکتوری اصلی پروژه (همان جایی که `core/` و `models/` هستند) دستور را اجرا کنید.
+
+### پورت در حال استفاده
+اگر پورت 8501 در حال استفاده است:
+```bash
+streamlit run dashboard/app.py --server.port 8502
+```
+
+## گزینه‌های پیشرفته
+
+### تغییر تم
+```bash
+streamlit run dashboard/app.py --theme.base "dark"
+```
+
+### اجرا بدون باز شدن مرورگر
+```bash
+streamlit run dashboard/app.py --server.headless true
+```
+
+### مشاهده لاگ‌ها
+Streamlit به صورت خودکار لاگ‌ها را در ترمینال نمایش می‌دهد.
+
+
+## File: dashboard\README.md
+------------------------------
+# داشبورد مدیریتی ساتع - ترازنامه مشمولین
+
+## توضیحات
+این داشبورد یک رابط کاربری تحت وب برای نمایش و تحلیل اطلاعات مالی مشمولین ساتع است. این برنامه با استفاده از Streamlit ساخته شده و اطلاعات را مستقیماً از پایگاه داده PostgreSQL می‌خواند.
+
+## ویژگی‌های اصلی
+
+### 1. انتخاب مشمول
+- لیست کشویی شامل تمام مشمولین فعال
+- نمایش نام و کد طبقه‌بندی
+
+### 2. اطلاعات کلی مشمول
+- نوع مشمول (Mother, Subsidiary, Independent)
+- استان
+- سازمان بالادست
+
+### 3. KPI های مالی (خلاصه)
+شش شاخص کلیدی برای کل دوره:
+- **اعتبار تکلیفی**: مجموع اعتبارات تکلیفی تخصیص یافته
+- **مجموع واریزی**: مجموع واریزهای انجام شده (شامل زیرمجموعه‌ها)
+- **هزینه کرد**: مجموع پرداخت‌های انجام شده
+- **انتقال ورودی**: مجموع انتقالات دریافتی
+- **انتقال خروجی**: مجموع انتقالات ارسالی
+- **مانده واقعی**: تراز نهایی محاسبه شده
+
+### 4. جدول تفصیلی سالانه
+نمایش اطلاعات مالی تفکیک شده به سال مالی با ستون‌های:
+- سال مالی
+- اعتبار تکلیفی
+- مجموع واریزی
+- هزینه کرد
+- انتقال ورودی
+- انتقال خروجی
+- مانده واقعی (محاسبه شده)
+
+### 5. نمودار تحلیلی
+نمودار خطی نمایش روند:
+- واریزی
+- هزینه
+- مانده
+
+## فرمول محاسبه مانده
+```
+مانده واقعی = (مجموع واریزی + انتقال ورودی) - (هزینه کرد + انتقال خروجی)
+```
+
+## نحوه اجرا
+
+### پیش‌نیازها
+```bash
+pip install -r requirements.txt
+```
+
+### اجرای داشبورد
+```bash
+streamlit run dashboard/app.py
+```
+
+پس از اجرا، داشبورد در مرورگر به صورت خودکار باز می‌شود (معمولاً در آدرس http://localhost:8501)
+
+## نکات مهم
+
+### پشتیبانی از ساختار سلسله‌مراتبی
+- برای مشمولین از نوع **Mother**، داشبورد به صورت خودکار تمام زیرمجموعه‌ها را شناسایی کرده و در محاسبات لحاظ می‌کند
+- این ویژگی از ستون `parent_code` در جدول `employers` استفاده می‌کند
+
+### فیلتر حذف نرم (Soft Delete)
+تمام کوئری‌ها فیلتر `is_deleted = False` را اعمال می‌کنند تا فقط رکوردهای فعال نمایش داده شوند.
+
+### عملکرد
+- استفاده از SQLAlchemy ORM برای کوئری‌های بهینه
+- استفاده از Pandas برای پردازش و نمایش داده‌ها
+- فرمت‌بندی اعداد با جداکننده هزارگان (comma-separated)
+
+## ساختار کد
+
+```
+dashboard/
+├── app.py              # فایل اصلی برنامه Streamlit
+└── README.md           # این فایل
+```
+
+### توابع اصلی:
+
+1. **get_active_employers()**: دریافت لیست مشمولین فعال
+2. **get_employer_financials()**: جمع‌آوری و ترکیب اطلاعات مالی از جداول مختلف
+3. **format_number()**: فرمت‌بندی اعداد برای نمایش
+4. **main()**: تابع اصلی برنامه Streamlit
+
+## منابع داده
+
+داشبورد از جداول زیر استفاده می‌کند:
+- `employers`: اطلاعات مشمولین
+- `annual_mandates`: اعتبارات تکلیفی سالانه
+- `deposit_receipts`: رسیدهای واریزی
+- `contracts`: قراردادها
+- `payments`: پرداخت‌ها
+- `credit_transfers`: انتقالات اعتباری
+
+## توسعه آینده
+
+پیشنهادات برای نسخه‌های بعدی:
+- اضافه کردن فیلتر محدوده زمانی
+- نمایش جزئیات قراردادها و پژوهشگران
+- امکان صادرات گزارش‌ها به Excel/PDF
+- نمودارهای تعاملی با Plotly
+- مقایسه چند مشمول همزمان
+- داشبورد خلاصه برای تمام مشمولین
+
+## پشتیبانی
+برای گزارش مشکلات یا پیشنهادات، لطفاً با تیم توسعه تماس بگیرید.
 
 
 ## File: Docs\Phase1_Complete.md
@@ -550,6 +1472,221 @@ def get_db():
 
 مسیر پیش رو از یک "پایگاه داده استاتیک" به یک "سامانه زنده و پویای مالی" است. استراتژی ما در فاز بعدی (در چت جدید)، شروع مقتدرانه فاز ۲ (طراحی API و توابع محاسبات مالی) خواهد بود.  
 این سند، نقشه راه ماست. هر زمان که آماده بودید، این سند و سند قبلی را در یک چت جدید بارگذاری کنید و فرمان شروع لایه Backend را صادر کنید\!  
+
+
+## File: Docs\Phase3_Dashboard_Complete.md
+------------------------------
+# Phase 3: Dashboard Implementation - Complete ✅
+
+## Overview
+Successfully created a comprehensive Streamlit dashboard for visualizing and debugging financial calculations for each employer in the SATE system.
+
+## Deliverables
+
+### 1. Dashboard Application (`dashboard/app.py`)
+A complete, production-ready Streamlit application with the following features:
+
+#### Core Functionality
+- **Employer Selection**: Dropdown to select any active employer by classification code
+- **Hierarchical Support**: Automatically includes subsidiary data for Mother-type employers
+- **Multi-year Analysis**: Aggregates financial data across all fiscal years
+- **Real-time Calculations**: Computes balance using the formula:
+  ```
+  Balance = (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
+  ```
+
+#### UI Components
+1. **Page Header**: Persian title with emoji icon
+2. **Employer Info Cards**: Display employer type, province, and upper organization
+3. **KPI Metrics** (6 cards):
+   - اعتبار تکلیفی (Mandated Amount)
+   - مجموع واریزی (Total Deposits)
+   - هزینه کرد (Payments)
+   - انتقال ورودی (Transfers In)
+   - انتقال خروجی (Transfers Out)
+   - مانده واقعی (Actual Balance)
+4. **Annual Details Table**: Year-by-year breakdown with Persian column names
+5. **Trend Chart**: Line chart showing deposits, payments, and balance over time
+
+#### Technical Features
+- **Database Integration**: Uses SQLAlchemy ORM with proper session management
+- **Soft Delete Filtering**: Only shows non-deleted records
+- **Number Formatting**: Comma-separated integers (Persian-friendly)
+- **Error Handling**: Graceful handling of empty data
+- **Wide Layout**: Optimized for financial data display
+- **Responsive Design**: Works on different screen sizes
+
+### 2. Documentation
+
+#### `dashboard/README.md`
+Comprehensive Persian documentation covering:
+- Feature descriptions
+- Balance calculation formula
+- Usage instructions
+- Code structure explanation
+- Data sources
+- Future enhancement suggestions
+
+#### `dashboard/QUICKSTART.md`
+Quick start guide in Persian with:
+- Installation commands
+- Running instructions
+- Troubleshooting tips
+- Advanced options
+
+### 3. Dependencies
+Updated `requirements.txt` to include:
+```
+pandas
+openpyxl
+SQLAlchemy
+python-dotenv
+psycopg2-binary
+jdatetime
+streamlit
+```
+
+## Data Integration
+
+The dashboard queries the following tables:
+1. **employers** - Employer master data
+2. **annual_mandates** - Mandated budget amounts
+3. **deposit_receipts** - Deposit transactions
+4. **contracts** - Contract records
+5. **payments** - Payment transactions
+6. **credit_transfers** - Credit transfer records
+
+## Key Implementation Details
+
+### Hierarchical Aggregation
+For Mother-type employers:
+```python
+if employer.employer_type == 'Mother':
+    codes_to_include = [employer_code]
+    subsidiaries = db.query(Employer.classification_code).filter(
+        Employer.parent_code == employer_code,
+        Employer.is_deleted == False
+    ).all()
+    codes_to_include.extend([s[0] for s in subsidiaries])
+```
+
+### Financial Calculation Logic
+```python
+# Merge all financial data by year
+df_merged = df_mandates.merge(df_deposits, on='year', how='outer')
+           .merge(df_payments, on='year', how='outer')
+           .merge(df_transfers_in, on='year', how='outer')
+           .merge(df_transfers_out, on='year', how='outer')
+           .fillna(0)
+
+# Calculate balance
+df_merged['balance'] = (
+    df_merged['deposit_amount'] + df_merged['transfer_in']
+) - (
+    df_merged['payment_amount'] + df_merged['transfer_out']
+)
+```
+
+## How to Run
+
+From the project root directory:
+```bash
+# Install dependencies (if not already installed)
+pip install -r requirements.txt
+
+# Run the dashboard
+streamlit run dashboard/app.py
+```
+
+The dashboard will open automatically in your default browser at `http://localhost:8501`
+
+## Testing Checklist
+
+Before deployment, verify:
+- [ ] Database connection works (check .env file)
+- [ ] Employers dropdown populates correctly
+- [ ] KPI metrics display accurate totals
+- [ ] Annual table shows all years with correct data
+- [ ] Chart renders properly
+- [ ] Number formatting is correct (comma-separated)
+- [ ] Persian text displays properly (RTL support)
+- [ ] Subsidiary aggregation works for Mother employers
+- [ ] Soft-deleted records are excluded
+- [ ] Empty states handle gracefully
+
+## Performance Considerations
+
+- Queries use proper indexing on foreign keys and year columns
+- SQLAlchemy sessions are properly closed in finally blocks
+- Pandas operations are efficient with vectorized calculations
+- Streamlit caching can be added for frequently accessed data
+
+## Security Notes
+
+- Database credentials are loaded from .env file (never hardcoded)
+- SQL injection is prevented by using SQLAlchemy ORM
+- No sensitive data is logged or displayed unnecessarily
+
+## Future Enhancements (Suggested)
+
+1. **Filtering**:
+   - Date range selector
+   - Province filter
+   - Employer type filter
+
+2. **Export**:
+   - Excel export button
+   - PDF report generation
+
+3. **Visualizations**:
+   - Interactive Plotly charts
+   - Pie charts for budget distribution
+   - Comparison mode (multiple employers)
+
+4. **Analytics**:
+   - Budget utilization percentage
+   - Trend predictions
+   - Anomaly detection
+
+5. **Performance**:
+   - Implement Streamlit caching
+   - Add pagination for large datasets
+   - Background data refresh
+
+6. **User Management**:
+   - Authentication/authorization
+   - User-specific views
+   - Audit logging
+
+## Project Status
+
+✅ Phase 1: Database Design and Data Import - Complete
+✅ Phase 2: Financial Engine and Calculation Logic - Complete
+✅ Phase 3: Dashboard for Visualization and Debugging - Complete
+
+**Next Steps**: Begin Phase 4 (if planned) or move to production deployment and user testing.
+
+## Files Created/Modified
+
+```
+dashboard/
+├── app.py              # Main Streamlit application (10.9 KB)
+├── README.md           # Comprehensive documentation (4.5 KB)
+└── QUICKSTART.md       # Quick start guide (1.9 KB)
+
+requirements.txt        # Updated with streamlit dependency
+```
+
+## Summary
+
+The Phase 3 dashboard provides a powerful, user-friendly interface for:
+- Viewing financial summaries for each employer
+- Debugging calculation logic
+- Identifying data inconsistencies
+- Supporting financial decision-making
+- Generating visual reports
+
+The implementation is clean, well-documented, and ready for immediate use by the SATE management team.
 
 
 ## File: models\contract.py
@@ -688,6 +1825,75 @@ class Researcher(SoftDeleteMixin, Base):
     status = Column(String(20), nullable=False, default="Active")
 
 
+## File: models\transfer.py
+------------------------------
+"""
+Credit Transfer Model
+Junction table for allocating unspent funds from employers to specific contracts
+"""
+
+from sqlalchemy import Column, Integer, String, Numeric, Text, ForeignKey
+from core.database import Base
+from models.employer import SoftDeleteMixin
+
+
+class CreditTransfer(Base, SoftDeleteMixin):
+    """
+    Credit Transfer model - tracks fund transfers between employers.
+    Allows allocation of unspent funds from various employers to contracts
+    managed by a central Secretariat without altering core deposit/payment tables.
+    """
+    __tablename__ = 'credit_transfers'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Source employer (where funds come from)
+    source_employer_code = Column(
+        String,
+        ForeignKey('employers.classification_code'),
+        nullable=False,
+        index=True
+    )
+    
+    # Destination employer (where funds go to, default is Secretariat)
+    destination_employer_code = Column(
+        String,
+        ForeignKey('employers.classification_code'),
+        nullable=False,
+        default='128342',
+        index=True
+    )
+    
+    # Optional broker facilitating the transfer
+    broker_name = Column(String, nullable=True)
+    
+    # Fiscal year the funds originated from
+    fiscal_year = Column(Integer, nullable=False, index=True)
+    
+    # Transfer amount in Rials
+    amount = Column(Numeric(22, 0), nullable=False)
+    
+    # Contract receiving the transferred funds
+    contract_tracking_code = Column(
+        String,
+        ForeignKey('contracts.tracking_code'),
+        nullable=False,
+        index=True
+    )
+    
+    # Supporting documentation or notes
+    documentation = Column(Text, nullable=True)
+    
+    def __repr__(self):
+        return (
+            f"<CreditTransfer(id={self.id}, "
+            f"from={self.source_employer_code}, "
+            f"to={self.destination_employer_code}, "
+            f"amount={self.amount}, "
+            f"year={self.fiscal_year})>"
+        )
+
+
 ## File: models\university.py
 ------------------------------
 from sqlalchemy import Column, String, Text
@@ -746,6 +1952,54 @@ class BalanceResponse(BaseModel):
         """
         now = jdatetime.datetime.now()
         return now.strftime("%Y/%m/%d")
+
+
+## File: schemas\payment_schema.py
+------------------------------
+from pydantic import BaseModel, Field
+from typing import Optional
+
+
+class PaymentValidationRequest(BaseModel):
+    """
+    Request schema for validating a payment before registration.
+    """
+    contract_tracking_code: str = Field(..., description="The contract tracking code linked to the payment")
+    amount: float = Field(..., description="The payment amount to be validated", gt=0)
+    funding_year: int = Field(..., description="The funding year for the payment", ge=1300, le=1500)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "contract_tracking_code": "CNT-1403-001",
+                "amount": 50000000.0,
+                "funding_year": 1403
+            }
+        }
+
+
+class PaymentValidationResponse(BaseModel):
+    """
+    Response schema for payment validation results.
+    """
+    employer_code: str = Field(..., description="The employer classification code")
+    current_balance: float = Field(..., description="Current balance before the payment")
+    payment_amount: float = Field(..., description="The payment amount being validated")
+    new_balance: float = Field(..., description="Projected balance after the payment")
+    is_negative: bool = Field(..., description="Whether the new balance will be negative")
+    warning_message: Optional[str] = Field(None, description="Warning message if balance becomes negative")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "employer_code": "EMP001",
+                "current_balance": 125000000.0,
+                "payment_amount": 50000000.0,
+                "new_balance": 75000000.0,
+                "is_negative": False,
+                "warning_message": None
+            }
+        }
 
 
 ## File: schemas\__init__.py
@@ -898,6 +2152,128 @@ if __name__ == "__main__":
     append_new_mandates()
 
 
+## File: scripts\chart01_total_trend.py
+------------------------------
+# chart01_total_trend.py
+from chart_config import (
+    load_data, fp, fmt_num, fa_year_formatter, CHARTS_DIR,
+    COLORS, plt
+)
+import matplotlib.ticker as mticker
+import numpy as np
+
+df = load_data()
+
+# ── آماده‌سازی داده ──────────────────────────────────────────────────────────
+yearly = (
+    df.groupby("سال")["اعتبار"]
+    .sum()
+    .reset_index()
+    .sort_values("سال")
+)
+
+years  = yearly["سال"].tolist()
+values = yearly["اعتبار"].tolist()
+
+# رشد سال به سال (YoY)
+yoy = [None] + [
+    (values[i] - values[i-1]) / values[i-1] * 100
+    for i in range(1, len(values))
+]
+
+# ── محور X: ایندکس مصنوعی برای فاصله یکنواخت ────────────────────────────────
+# به جای مقادیر واقعی سال، از ایندکس 0,1,2,... استفاده می‌کنیم
+# تا فاصله بین همه سال‌ها یکسان باشد
+x_pos = list(range(len(years)))
+
+# برچسب‌های فارسی سال + نشانگر ۱۴۰۳
+FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+def to_fa(n):
+    return str(n).translate(FA_DIGITS)
+
+x_labels = [to_fa(y) for y in years]
+
+# جایگاه ۱۴۰۳ بین ۱۴۰۲ و ۱۴۰۴
+idx_1402 = years.index(1402)
+x_1403 = (x_pos[idx_1402] + x_pos[idx_1402 + 1]) / 2  # دقیقاً وسط
+
+# ── رسم نمودار ───────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(11, 6))
+
+# خط اصلی
+ax.plot(x_pos, values, color=COLORS["primary"], linewidth=2.5,
+        marker="o", markersize=8, zorder=3)
+
+# سایه زیر خط
+ax.fill_between(x_pos, values, alpha=0.12, color=COLORS["primary"])
+
+# برچسب مقدار و رشد روی هر نقطه
+for xi, y, g in zip(x_pos, values, yoy):
+    ax.annotate(
+        fp(f"{fmt_num(y, 1)}"),
+        xy=(xi, y),
+        xytext=(0, 14),
+        textcoords="offset points",
+        ha="center", va="bottom",
+        fontsize=9,
+        color=COLORS["primary"],
+    )
+    if g is not None:
+        sign  = "+" if g >= 0 else ""
+        color = COLORS["accent"] if g >= 0 else COLORS["danger"]
+        ax.annotate(
+            fp(f"{sign}{fmt_num(g, 1)}٪"),
+            xy=(xi, y),
+            xytext=(0, -18),
+            textcoords="offset points",
+            ha="center", va="top",
+            fontsize=8,
+            color=color,
+        )
+
+# ── محورها ───────────────────────────────────────────────────────────────────
+ax.set_xticks(x_pos)
+ax.set_xticklabels(x_labels, fontsize=10)
+
+ax.yaxis.set_major_formatter(
+    mticker.FuncFormatter(lambda v, _: fp(fmt_num(v, 0)))
+)
+ax.set_ylabel(fp("اعتبار تکلیفی (میلیارد ریال)"), labelpad=10)
+
+# ── خط نقطه‌چین ۱۴۰۳ ─────────────────────────────────────────────────────────
+ax.axvline(x=x_1403, color=COLORS["neutral"], linewidth=1,
+           linestyle="--", alpha=0.6, zorder=1)
+
+# برچسب ۱۴۰۳ — بعد از رسم همه چیز، ylim را می‌گیریم
+ax.figure.canvas.draw()  # محدوده Y را نهایی می‌کند
+ymin, ymax = ax.get_ylim()
+ax.text(
+    x_1403 + 0.05, ymin + (ymax - ymin) * 0.03,
+    fp("۱۴۰۳\n(اطلاعات\nموجود نیست)"),
+    ha="left", va="bottom", fontsize=8,
+    color=COLORS["neutral"],
+    linespacing=1.5,
+)
+
+# ── عنوان و گرید ─────────────────────────────────────────────────────────────
+ax.set_title(fp("روند کل اعتبارات تکلیفی پیوست ۳ قانون بودجه (۱۳۹۸–۱۴۰۵)"),
+             pad=16, fontsize=14)
+ax.grid(axis="y", linestyle="--", alpha=0.4)
+ax.grid(axis="x", linestyle=":", alpha=0.2)
+ax.set_axisbelow(True)
+
+# کمی فضای اضافه در بالا برای برچسب‌ها
+ax.margins(x=0.06, y=0.15)  # به جای ax.margins(x=0.06)
+
+fig.tight_layout()
+
+# ── ذخیره ────────────────────────────────────────────────────────────────────
+out = CHARTS_DIR / "chart01_total_trend.png"
+fig.savefig(out, dpi=150, bbox_inches="tight")
+plt.close(fig)
+print(f"ذخیره شد: {out}")
+
+
 ## File: scripts\check_excel.py
 ------------------------------
 import pandas as pd
@@ -921,6 +2297,61 @@ with open(output_path, 'w', encoding='utf-8') as f:
     f.write(str(df.dtypes))
 
 print(f"Information written to {output_path}")
+
+
+## File: scripts\create_transfer_table.py
+------------------------------
+"""
+Credit Transfer Table Initialization Script
+Safely creates the credit_transfers table without dropping existing tables.
+"""
+
+import sys
+import os
+
+# Add project root to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from core.database import Base, engine
+from models.transfer import CreditTransfer
+
+
+def main():
+    print("=" * 60)
+    print("Credit Transfer Table Initialization")
+    print("=" * 60)
+    
+    print("\nCreating credit_transfers table...")
+    
+    try:
+        # Create only the CreditTransfer table, leaving other tables intact
+        Base.metadata.create_all(bind=engine, tables=[CreditTransfer.__table__])
+        
+        print("✓ Successfully created credit_transfers table")
+        print("\nTable structure:")
+        print("  - id (Integer, Primary Key)")
+        print("  - source_employer_code (String, FK -> employers)")
+        print("  - destination_employer_code (String, FK -> employers, default='128342')")
+        print("  - broker_name (String, nullable)")
+        print("  - fiscal_year (Integer, indexed)")
+        print("  - amount (Numeric(22,0))")
+        print("  - contract_tracking_code (String, FK -> contracts)")
+        print("  - documentation (Text, nullable)")
+        print("  - created_at, updated_at, is_deleted (from SoftDeleteMixin)")
+        
+        print("\n" + "=" * 60)
+        print("✓ Table initialization completed successfully!")
+        print("=" * 60)
+        
+    except Exception as e:
+        print(f"✗ Error creating table: {e}")
+        return 1
+    
+    return 0
+
+
+if __name__ == '__main__':
+    exit(main())
 
 
 ## File: scripts\example_1.py
@@ -960,7 +2391,7 @@ if __name__ == "__main__":
 ------------------------------
 """
 Financial Report Generator
-Calculates employer balances by comparing mandated budgets against actual payments.
+Calculates employer balances using: total_deposits - total_payments
 """
 
 import pandas as pd
@@ -980,7 +2411,7 @@ def main():
     print("=" * 60)
     
     # Step 1: Extract data from database
-    print("\n[1/5] Extracting data from database...")
+    print("\n[1/6] Extracting data from database...")
     
     try:
         # Read tables into DataFrames
@@ -989,6 +2420,9 @@ def main():
         
         df_mandates = pd.read_sql_table('annual_mandates', con=engine)
         print(f"   ✓ Loaded {len(df_mandates)} annual mandates")
+        
+        df_deposits = pd.read_sql_table('deposit_receipts', con=engine)
+        print(f"   ✓ Loaded {len(df_deposits)} deposit receipts")
         
         df_contracts = pd.read_sql_table('contracts', con=engine)
         print(f"   ✓ Loaded {len(df_contracts)} contracts")
@@ -1000,8 +2434,19 @@ def main():
         print(f"   ✗ Error reading tables: {e}")
         return
     
-    # Step 2: Aggregate payments by employer and funding year
-    print("\n[2/5] Aggregating payments by employer and funding year...")
+    # Step 2: Aggregate deposits by employer and fiscal year
+    print("\n[2/6] Aggregating deposits by employer and fiscal year...")
+    
+    # Group deposits by employer_code and fiscal_year, sum the deposit amounts
+    df_deposit_aggregates = df_deposits.groupby(
+        ['employer_code', 'fiscal_year']
+    )['deposit_amount'].sum().reset_index()
+    
+    df_deposit_aggregates.rename(columns={'deposit_amount': 'total_deposits'}, inplace=True)
+    print(f"   ✓ Aggregated deposits for {len(df_deposit_aggregates)} employer-year combinations")
+    
+    # Step 3: Aggregate payments by employer and funding year
+    print("\n[3/6] Aggregating payments by employer and funding year...")
     
     # Merge payments with contracts to get employer_code for each payment
     df_payments_with_employer = df_payments.merge(
@@ -1019,31 +2464,43 @@ def main():
     df_payment_aggregates.rename(columns={'amount': 'total_payments'}, inplace=True)
     print(f"   ✓ Aggregated payments for {len(df_payment_aggregates)} employer-year combinations")
     
-    # Step 3: Calculate balance
-    print("\n[3/5] Calculating financial balances...")
+    # Step 4: Calculate balance using deposits - payments
+    print("\n[4/6] Calculating financial balances...")
     
-    # Merge mandates with payment aggregates
+    # Start with mandates as base
     df_balance = df_mandates.merge(
+        df_deposit_aggregates,
+        on=['employer_code', 'fiscal_year'],
+        how='outer'
+    )
+    
+    # Merge with payment aggregates (join on employer_code and year)
+    df_balance = df_balance.merge(
         df_payment_aggregates,
         left_on=['employer_code', 'fiscal_year'],
         right_on=['employer_code', 'funding_year'],
         how='outer'
     )
     
-    # Fill NaN values with 0
-    df_balance['mandated_amount'] = df_balance['mandated_amount'].fillna(0)
-    df_balance['total_payments'] = df_balance['total_payments'].fillna(0)
-    
     # Use fiscal_year as the primary year column (coalesce with funding_year if needed)
     df_balance['year'] = df_balance['fiscal_year'].fillna(df_balance['funding_year']).astype(int)
     
-    # Calculate balance
-    df_balance['balance'] = df_balance['mandated_amount'] - df_balance['total_payments']
+    # Fill NaN values with 0 for all financial columns
+    df_balance['mandated_amount'] = df_balance['mandated_amount'].fillna(0)
+    df_balance['total_deposits'] = df_balance['total_deposits'].fillna(0)
+    df_balance['total_payments'] = df_balance['total_payments'].fillna(0)
+    
+    # Ensure employer_code is filled (from either side of the merge)
+    if 'employer_code_x' in df_balance.columns:
+        df_balance['employer_code'] = df_balance['employer_code_x'].fillna(df_balance['employer_code_y'])
+    
+    # Calculate the real balance: total_deposits - total_payments
+    df_balance['balance'] = df_balance['total_deposits'] - df_balance['total_payments']
     
     print(f"   ✓ Calculated balances for {len(df_balance)} records")
     
-    # Step 4: Format output with employer names
-    print("\n[4/5] Formatting final report with employer names...")
+    # Step 5: Format output with employer names
+    print("\n[5/6] Formatting final report with employer names...")
     
     # Merge with employers to get names
     df_final = df_balance.merge(
@@ -1059,6 +2516,7 @@ def main():
         'name',
         'year',
         'mandated_amount',
+        'total_deposits',
         'total_payments',
         'balance'
     ]]
@@ -1068,8 +2526,9 @@ def main():
         'نام مشمول',
         'سال مالی',
         'اعتبار تکلیفی (ریال)',
+        'مجموع واریزی (ریال)',
         'جمع پرداختی (ریال)',
-        'مانده (ریال)'
+        'مانده واقعی (ریال)'
     ]
     
     # Sort by employer code and year
@@ -1077,8 +2536,8 @@ def main():
     
     print(f"   ✓ Final report contains {len(df_final)} rows")
     
-    # Step 5: Export to Excel
-    print("\n[5/5] Exporting to Excel...")
+    # Step 6: Export to Excel
+    print("\n[6/6] Exporting to Excel...")
     
     # Ensure results directory exists
     results_dir = Path('results')
@@ -1100,8 +2559,9 @@ def main():
     print(f"Total employers: {df_final['کد مشمول'].nunique()}")
     print(f"Total fiscal years: {df_final['سال مالی'].nunique()}")
     print(f"Total mandated amount: {df_final['اعتبار تکلیفی (ریال)'].sum():,.0f} Rials")
+    print(f"Total deposited: {df_final['مجموع واریزی (ریال)'].sum():,.0f} Rials")
     print(f"Total payments: {df_final['جمع پرداختی (ریال)'].sum():,.0f} Rials")
-    print(f"Total remaining balance: {df_final['مانده (ریال)'].sum():,.0f} Rials")
+    print(f"Total real balance: {df_final['مانده واقعی (ریال)'].sum():,.0f} Rials")
     print("=" * 60)
     print("\n✓ Financial report generation completed successfully!")
 
@@ -1384,6 +2844,241 @@ if __name__ == "__main__":
     print("CONTRACT IMPORT SCRIPT")
     print("="*60)
     import_contracts()
+
+
+## File: scripts\import_credit_transfers.py
+------------------------------
+"""
+ETL Script: Import Credit Transfers from Excel
+Imports credit transfer data with validation and business logic checks
+"""
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import pandas as pd
+from core.database import SessionLocal, engine
+from models.transfer import CreditTransfer
+from models.contract import Contract
+from models.employer import Employer
+from services.financial_engine import calculate_real_balance
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXCEL_FILE_PATH = PROJECT_ROOT / "data" / "CreditTransfer.xlsx"
+
+
+def clean_amount(value):
+    """Remove thousand separators (commas and dots) and convert to numeric Rials."""
+    if pd.isna(value):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    cleaned = str(value).replace(',', '').replace('.', '').strip()
+    if not cleaned:
+        return 0
+    try:
+        return int(float(cleaned))
+    except ValueError:
+        return 0
+
+
+def import_credit_transfers():
+    """Main ETL function to import credit transfers"""
+    
+    print("=" * 70)
+    print("Credit Transfer Import Process Started")
+    print("=" * 70)
+    
+    # Statistics counters
+    total_rows = 0
+    inserted_rows = 0
+    skipped_fk_errors = 0
+    skipped_insufficient_funds = 0
+    
+    # Step 1: Drop and recreate table
+    print("\n[1/6] Dropping and recreating credit_transfers table...")
+    CreditTransfer.__table__.drop(engine, checkfirst=True)
+    CreditTransfer.__table__.create(engine, checkfirst=True)
+    print("✓ Table recreated successfully")
+    
+    # Step 2: Read Excel file
+    print("\n[2/6] Reading Excel file...")
+    if not EXCEL_FILE_PATH.is_file():
+        print(f"✗ Excel file not found: {EXCEL_FILE_PATH}")
+        return
+    try:
+        df = pd.read_excel(EXCEL_FILE_PATH)
+        total_rows = len(df)
+        print(f"✓ Loaded {total_rows} rows from {EXCEL_FILE_PATH.name}")
+    except Exception as e:
+        print(f"✗ Error reading Excel file: {e}")
+        return
+    
+    # Step 3: Load validation sets
+    print("\n[3/6] Loading validation data...")
+    db = SessionLocal()
+    try:
+        # Load all valid employer codes
+        valid_employers = set(
+            db.query(Employer.classification_code)
+            .filter(Employer.is_deleted == False)
+            .all()
+        )
+        valid_employer_codes = {code[0] for code in valid_employers}
+        
+        # Load all valid contract tracking codes
+        valid_contracts = set(
+            db.query(Contract.tracking_code)
+            .filter(Contract.is_deleted == False)
+            .all()
+        )
+        valid_contract_codes = {code[0] for code in valid_contracts}
+        
+        print(f"✓ Loaded {len(valid_employer_codes)} valid employer codes")
+        print(f"✓ Loaded {len(valid_contract_codes)} valid contract codes")
+        
+    except Exception as e:
+        print(f"✗ Error loading validation data: {e}")
+        db.close()
+        return
+    
+    # Step 4: Column mapping
+    print("\n[4/6] Mapping columns...")
+    column_mapping = {
+        'شماره طبقه بندی شرکت مبدأ': 'source_employer_code',
+        'شماره طبقه بندی شرکت مقصد': 'destination_employer_code',
+        'کارگزار قرارداد': 'broker_name',
+        'انتقال از محل سال مالی': 'fiscal_year',
+        'مبلغ انتقال (ریال)': 'amount',
+        'کد رهگیری قرارداد': 'contract_tracking_code'
+    }
+
+    missing_columns = [col for col in column_mapping if col not in df.columns]
+    if missing_columns:
+        print("✗ Missing expected columns in Excel file:")
+        for col in missing_columns:
+            print(f"  - {col}")
+        print(f"  Found columns: {list(df.columns)}")
+        db.close()
+        return
+
+    df = df.rename(columns=column_mapping)
+    print("✓ Columns mapped successfully")
+    
+    # Step 5: Process and validate rows
+    print("\n[5/6] Processing rows with validation...")
+    print("-" * 70)
+    
+    for idx, row in df.iterrows():
+        row_num = idx + 1
+        
+        # Extract and clean data
+        source_code = str(row.get('source_employer_code', '')).strip()
+        dest_code = str(row.get('destination_employer_code', '')).strip()
+        broker = str(row.get('broker_name', '')).strip() if pd.notna(row.get('broker_name')) else None
+        
+        try:
+            fiscal_year = int(row.get('fiscal_year', 0))
+        except (ValueError, TypeError):
+            print(f"⚠ Row {row_num}: Invalid fiscal year, skipping")
+            skipped_fk_errors += 1
+            continue
+        
+        amount = clean_amount(row.get('amount'))
+        if amount <= 0:
+            print(f"⚠ Row {row_num}: Invalid or zero amount ({row.get('amount')!r}), skipping")
+            skipped_fk_errors += 1
+            continue
+
+        contract_code = str(row.get('contract_tracking_code', '')).strip()
+        
+        # Validation 1: Check foreign key constraints
+        if source_code not in valid_employer_codes:
+            print(f"⚠ Row {row_num}: Invalid source employer '{source_code}', skipping")
+            skipped_fk_errors += 1
+            continue
+        
+        if dest_code not in valid_employer_codes:
+            print(f"⚠ Row {row_num}: Invalid destination employer '{dest_code}', skipping")
+            skipped_fk_errors += 1
+            continue
+        
+        if contract_code not in valid_contract_codes:
+            print(f"⚠ Row {row_num}: Invalid contract '{contract_code}', skipping")
+            skipped_fk_errors += 1
+            continue
+        
+        # Validation 2: Check balance (Business Logic)
+        try:
+            current_balance = calculate_real_balance(db, source_code, fiscal_year)
+            
+            if current_balance < amount:
+                print(f"⚠ Row {row_num}: INSUFFICIENT FUNDS for employer '{source_code}'")
+                print(f"  Current balance: {current_balance:,.0f} Rials")
+                print(f"  Transfer amount: {amount:,.0f} Rials")
+                print(f"  Deficit: {(amount - current_balance):,.0f} Rials")
+                skipped_insufficient_funds += 1
+                continue
+                
+        except Exception as e:
+            print(f"⚠ Row {row_num}: Error calculating balance: {e}, skipping")
+            skipped_fk_errors += 1
+            continue
+        
+        # Insert valid row
+        try:
+            credit_transfer = CreditTransfer(
+                source_employer_code=source_code,
+                destination_employer_code=dest_code,
+                broker_name=broker,
+                fiscal_year=fiscal_year,
+                amount=amount,
+                contract_tracking_code=contract_code
+            )
+            
+            db.add(credit_transfer)
+            inserted_rows += 1
+            
+            if inserted_rows % 10 == 0:
+                print(f"✓ Processed {inserted_rows} valid transfers...")
+                
+        except Exception as e:
+            print(f"✗ Row {row_num}: Database error: {e}")
+            skipped_fk_errors += 1
+            continue
+    
+    # Step 6: Commit and close
+    print("\n[6/6] Committing changes...")
+    try:
+        db.commit()
+        print("✓ All changes committed successfully")
+    except Exception as e:
+        print(f"✗ Error committing changes: {e}")
+        db.rollback()
+    finally:
+        db.close()
+    
+    # Print summary
+    print("\n" + "=" * 70)
+    print("IMPORT SUMMARY")
+    print("=" * 70)
+    print(f"Total rows in Excel:              {total_rows}")
+    print(f"Successfully inserted:            {inserted_rows}")
+    print(f"Skipped (FK/validation errors):   {skipped_fk_errors}")
+    print(f"Skipped (insufficient funds):     {skipped_insufficient_funds}")
+    print(f"Total skipped:                    {skipped_fk_errors + skipped_insufficient_funds}")
+    print("=" * 70)
+    
+    success_rate = (inserted_rows / total_rows * 100) if total_rows > 0 else 0
+    print(f"Success rate: {success_rate:.1f}%")
+    print("\n✓ Import process completed!\n")
+
+
+if __name__ == "__main__":
+    import_credit_transfers()
 
 
 ## File: scripts\import_deposits.py
@@ -2454,11 +4149,12 @@ from models.employer import Employer
 from models.deposits import DepositReceipt
 from models.contract import Contract
 from models.payment import Payment
+from models.transfer import CreditTransfer
 
 def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -> float:
     """
     Calculates the real financial balance for a specific employer and funding year.
-    Formula: Sum of deposits (self + subsidiaries) - Sum of payments linked to employer's contracts for the specified funding_year.
+    Formula: total_deposits + transfers_in - transfers_out - total_payments
     """
     
     # 1. Calculate Total Deposits (Including subsidiaries)
@@ -2489,8 +4185,32 @@ def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -
 
     total_payments = payments_query or Decimal('0.0')
 
-    # 3. Calculate Real Balance
-    real_balance = total_deposits - total_payments
+    # 3. Calculate Transfers Out (funds sent from this employer or its subsidiaries)
+    transfers_out_query = db.query(func.sum(CreditTransfer.amount)).join(
+        Employer, CreditTransfer.source_employer_code == Employer.classification_code
+    ).filter(
+        or_(
+            Employer.classification_code == employer_code,
+            Employer.parent_code == employer_code
+        ),
+        CreditTransfer.fiscal_year == funding_year,
+        CreditTransfer.is_deleted == False,
+        Employer.is_deleted == False
+    ).scalar()
+    
+    transfers_out = transfers_out_query or Decimal('0.0')
+
+    # 4. Calculate Transfers In (funds received by this employer)
+    transfers_in_query = db.query(func.sum(CreditTransfer.amount)).filter(
+        CreditTransfer.destination_employer_code == employer_code,
+        CreditTransfer.fiscal_year == funding_year,
+        CreditTransfer.is_deleted == False
+    ).scalar()
+    
+    transfers_in = transfers_in_query or Decimal('0.0')
+
+    # 5. Calculate Real Balance
+    real_balance = total_deposits + transfers_in - transfers_out - total_payments
     
     return float(real_balance)
 
@@ -2507,4 +4227,60 @@ def get_mandated_amount(db: Session, employer_code: str, fiscal_year: int) -> fl
     ).first()
     
     return float(mandate.mandated_amount) if mandate else 0.0
+def validate_payment_impact(db: Session, contract_code: str, payment_amount: float, funding_year: int) -> dict:
+    """
+    Validates the impact of a payment on the employer's balance.
+    
+    This function implements FR-18, FR-19, FR-20 from the conceptual design:
+    - FR-18: Query the contract to find the linked employer
+    - FR-19: Calculate current balance and project new balance after payment
+    - FR-20: Warn (but do not block) if the balance becomes negative
+    
+    Args:
+        db: Database session
+        contract_code: The contract tracking code
+        payment_amount: The amount to be paid
+        funding_year: The funding year for the payment
+    
+    Returns:
+        dict containing:
+            - employer_code: The employer's classification code
+            - current_balance: Current balance before payment
+            - payment_amount: The payment amount
+            - new_balance: Projected balance after payment
+            - is_negative: Whether the new balance will be negative
+    
+    Raises:
+        ValueError: If contract is not found or has been deleted
+    """
+    
+    # Step 1: Find the contract and get the employer_code
+    contract = db.query(Contract).filter(
+        Contract.tracking_code == contract_code,
+        Contract.is_deleted == False
+    ).first()
+    
+    if not contract:
+        raise ValueError(f"Contract with tracking code '{contract_code}' not found or has been deleted.")
+    
+    employer_code = contract.employer_code
+    
+    # Step 2: Calculate current balance using existing function
+    current_balance = calculate_real_balance(db, employer_code, funding_year)
+    
+    # Step 3: Calculate new balance after payment
+    new_balance = current_balance - payment_amount
+    
+    # Step 4: Determine if balance becomes negative
+    is_negative = new_balance < 0
+    
+    # Step 5: Return validation result
+    return {
+        "employer_code": employer_code,
+        "current_balance": current_balance,
+        "payment_amount": payment_amount,
+        "new_balance": new_balance,
+        "is_negative": is_negative
+    }
+
 

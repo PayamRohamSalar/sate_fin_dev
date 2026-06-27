@@ -16,6 +16,7 @@ from models.deposits import AnnualMandate, DepositReceipt
 from models.payment import Payment
 from models.contract import Contract
 from models.transfer import CreditTransfer
+from services.financial_engine import get_all_employers_financials
 
 
 def to_persian_numbers(text):
@@ -152,129 +153,6 @@ def get_employer_financials(db: Session, employer_code: str):
     )
     
     return df_merged
-
-
-def get_all_employers_financials(db: Session):
-    """
-    Fetch and aggregate financial data for ALL employers across ALL years.
-    Returns a DataFrame with one row per (employer, year) combination.
-    """
-    
-    # Get all active employers
-    employers = db.query(Employer).filter(
-        Employer.status == 'Active',
-        Employer.is_deleted == False
-    ).all()
-    
-    all_data = []
-    
-    for employer in employers:
-        employer_code = employer.classification_code
-        employer_name = employer.name
-        
-        # Determine which codes to include (main + subsidiaries for Mother entities)
-        if employer.employer_type == 'Mother':
-            codes_to_include = [employer_code]
-            subsidiaries = db.query(Employer.classification_code).filter(
-                Employer.parent_code == employer_code,
-                Employer.is_deleted == False
-            ).all()
-            codes_to_include.extend([s[0] for s in subsidiaries])
-        else:
-            codes_to_include = [employer_code]
-        
-        # Get Annual Mandates
-        mandates_query = db.query(
-            AnnualMandate.fiscal_year.label('year'),
-            func.sum(AnnualMandate.mandated_amount).label('mandated_amount')
-        ).filter(
-            AnnualMandate.employer_code.in_(codes_to_include),
-            AnnualMandate.is_deleted == False
-        ).group_by(AnnualMandate.fiscal_year)
-        
-        df_mandates = pd.read_sql(mandates_query.statement, db.bind)
-        
-        # Get Deposit Receipts
-        deposits_query = db.query(
-            DepositReceipt.fiscal_year.label('year'),
-            func.sum(DepositReceipt.deposit_amount).label('deposit_amount')
-        ).filter(
-            DepositReceipt.employer_code.in_(codes_to_include),
-            DepositReceipt.is_deleted == False
-        ).group_by(DepositReceipt.fiscal_year)
-        
-        df_deposits = pd.read_sql(deposits_query.statement, db.bind)
-        
-        # Get Payments
-        payments_query = db.query(
-            Payment.funding_year.label('year'),
-            func.sum(Payment.amount).label('payment_amount')
-        ).join(
-            Contract, Payment.contract_tracking_code == Contract.tracking_code
-        ).filter(
-            Contract.employer_code.in_(codes_to_include),
-            Payment.is_deleted == False,
-            Contract.is_deleted == False
-        ).group_by(Payment.funding_year)
-        
-        df_payments = pd.read_sql(payments_query.statement, db.bind)
-        
-        # Get Transfers IN
-        transfers_in_query = db.query(
-            CreditTransfer.fiscal_year.label('year'),
-            func.sum(CreditTransfer.amount).label('transfer_in')
-        ).filter(
-            CreditTransfer.destination_employer_code.in_(codes_to_include),
-            CreditTransfer.is_deleted == False
-        ).group_by(CreditTransfer.fiscal_year)
-        
-        df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
-        
-        # Get Transfers OUT
-        transfers_out_query = db.query(
-            CreditTransfer.fiscal_year.label('year'),
-            func.sum(CreditTransfer.amount).label('transfer_out')
-        ).filter(
-            CreditTransfer.source_employer_code.in_(codes_to_include),
-            CreditTransfer.is_deleted == False
-        ).group_by(CreditTransfer.fiscal_year)
-        
-        df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
-        
-        # Merge all dataframes
-        dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
-        df_merged = dfs[0] if not dfs[0].empty else pd.DataFrame(columns=['year'])
-        
-        for df in dfs[1:]:
-            if not df.empty:
-                df_merged = df_merged.merge(df, on='year', how='outer')
-        
-        # Fill NaN with 0
-        df_merged = df_merged.fillna(0)
-        
-        # Add employer info
-        df_merged['employer_code'] = employer_code
-        df_merged['employer_name'] = employer_name
-        
-        # Calculate balance
-        df_merged['balance'] = (
-            df_merged['mandated_amount'] + df_merged['deposit_amount'] + df_merged['transfer_in']
-        ) - (
-            df_merged['payment_amount'] + df_merged['transfer_out']
-        )
-        
-        all_data.append(df_merged)
-    
-    # Concatenate all employers
-    if all_data:
-        df_all = pd.concat(all_data, ignore_index=True)
-        # Reorder columns
-        df_all = df_all[['employer_code', 'employer_name', 'year', 'mandated_amount', 
-                         'deposit_amount', 'payment_amount', 'transfer_in', 
-                         'transfer_out', 'balance']]
-        return df_all
-    else:
-        return pd.DataFrame()
 
 
 def format_number(value):

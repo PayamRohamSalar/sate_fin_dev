@@ -21,15 +21,16 @@ EXCEL_FILE_PATH = PROJECT_ROOT / "data" / "CreditTransfer.xlsx"
 
 
 def clean_amount(value):
-    """Remove commas and convert to numeric"""
+    """Remove thousand separators (commas and dots) and convert to numeric Rials."""
     if pd.isna(value):
         return 0
     if isinstance(value, (int, float)):
-        return float(value)
-    # Remove commas and convert
-    cleaned = str(value).replace(',', '').strip()
+        return int(value)
+    cleaned = str(value).replace(',', '').replace('.', '').strip()
+    if not cleaned:
+        return 0
     try:
-        return float(cleaned)
+        return int(float(cleaned))
     except ValueError:
         return 0
 
@@ -55,10 +56,13 @@ def import_credit_transfers():
     
     # Step 2: Read Excel file
     print("\n[2/6] Reading Excel file...")
+    if not EXCEL_FILE_PATH.is_file():
+        print(f"✗ Excel file not found: {EXCEL_FILE_PATH}")
+        return
     try:
         df = pd.read_excel(EXCEL_FILE_PATH)
         total_rows = len(df)
-        print(f"✓ Loaded {total_rows} rows from Excel")
+        print(f"✓ Loaded {total_rows} rows from {EXCEL_FILE_PATH.name}")
     except Exception as e:
         print(f"✗ Error reading Excel file: {e}")
         return
@@ -98,11 +102,19 @@ def import_credit_transfers():
         'شماره طبقه بندی شرکت مقصد': 'destination_employer_code',
         'کارگزار قرارداد': 'broker_name',
         'انتقال از محل سال مالی': 'fiscal_year',
-        'مبلغ انتقال': 'amount',
+        'مبلغ انتقال (ریال)': 'amount',
         'کد رهگیری قرارداد': 'contract_tracking_code'
     }
-    
-    # Rename columns
+
+    missing_columns = [col for col in column_mapping if col not in df.columns]
+    if missing_columns:
+        print("✗ Missing expected columns in Excel file:")
+        for col in missing_columns:
+            print(f"  - {col}")
+        print(f"  Found columns: {list(df.columns)}")
+        db.close()
+        return
+
     df = df.rename(columns=column_mapping)
     print("✓ Columns mapped successfully")
     
@@ -126,6 +138,11 @@ def import_credit_transfers():
             continue
         
         amount = clean_amount(row.get('amount'))
+        if amount <= 0:
+            print(f"⚠ Row {row_num}: Invalid or zero amount ({row.get('amount')!r}), skipping")
+            skipped_fk_errors += 1
+            continue
+
         contract_code = str(row.get('contract_tracking_code', '')).strip()
         
         # Validation 1: Check foreign key constraints

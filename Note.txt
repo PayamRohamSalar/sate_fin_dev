@@ -3,11 +3,13 @@ cd /mnt/d/OneDrive/AI-Project/SATE_Fin_Dev
 cd /mnt/c/Users/pchin/OneDrive/AI-Project/SATE_Fin_Dev  #In laptop
 
 ls /mnt/d/OneDrive/AI-Project/SATE_Fin_Dev
-ls /mnt/c/Users/pchin/OneDrive/AI-Project/SATE_Fin_Dev
 
 ## Install requirements
 python3 -m pip install -r requirements.txt
 pip install jdatetime
+pip install fastapi uvicorn
+pip install streamlit
+pip install plotly
 
 ## Phase 1: Importing Phase
 python3 scripts/import_employers.py
@@ -18,29 +20,24 @@ python3 scripts/import_researchers.py
 python3 scripts/import_contracts.py
 python3 scripts/import_payments.py
 
-# Test Importing
-python scripts/generate_financial_report.py
-python generate_context.py
-
-# Run on database
-python3 scripts/example_1.py
-
 ## Phase 2: Backend development
-# Install requirements
-pip install fastapi uvicorn
-
-# Run the test script: تست موتور محاسباتی (CLI)
-python3 test_engine_cli.py
-
-# Start the API server: تست لایه API (محیط وب)
-uvicorn main:app --reload
-python -m uvicorn main:app --reload
-Then open browser: http://127.0.0.1:8000/docs
-
 # Import import_credit_transfers
 python3 scripts/import_credit_transfers.py
 
-## Phase 3
-pip install streamlit
+## Run Server
 python -m streamlit run dashboard/app.py
+Then open browser: http://127.0.0.1:8000/docs
 
+## Get Report
+python scripts/generate_financial_report.py
+python generate_context.py
+
+## Phase 3
+
+
+
+## Run Tests
+# Run the test script: تست موتور محاسباتی (CLI)
+python3 test_engine_cli.py
+# Text on database
+python3 scripts/example_1.py
