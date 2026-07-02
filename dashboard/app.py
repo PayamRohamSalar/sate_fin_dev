@@ -1,462 +1,604 @@
-import streamlit as st
-import pandas as pd
 import io
-from sqlalchemy import func, case
-from sqlalchemy.orm import Session
-import sys
 import os
+import sys
+
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 # Add parent directory to path to import project modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.database import SessionLocal, engine
-from models.employer import Employer
-from models.deposits import AnnualMandate, DepositReceipt
-from models.payment import Payment
+from core.database import SessionLocal
 from models.contract import Contract
+from models.deposits import AnnualMandate, DepositReceipt
+from models.employer import Employer
+from models.payment import Payment
 from models.transfer import CreditTransfer
 from services.financial_engine import get_all_employers_financials
 
+FINANCIAL_COLUMNS = [
+    "mandated_amount",
+    "deposit_amount",
+    "payment_amount",
+    "transfer_in",
+    "transfer_out",
+    "balance",
+]
 
-def to_persian_numbers(text):
-    """
-    Convert English digits to Persian digits and format numbers with thousand separators.
-    Handles strings, integers, floats, and already-formatted strings.
-    """
-    # Persian digit mapping
-    persian_digits = {
-        '0': '۰', '1': '۱', '2': '۲', '3': '۳', '4': '۴',
-        '5': '۵', '6': '۶', '7': '۷', '8': '۸', '9': '۹'
-    }
-    
-    # If it's a number, format it first with commas
-    if isinstance(text, (int, float)):
-        text = f"{int(text):,}"
-    else:
-        text = str(text)
-    
-    # Replace English digits with Persian
-    for eng, per in persian_digits.items():
-        text = text.replace(eng, per)
-    
-    return text
-
-
-def get_active_employers(db: Session):
-    """Fetch all active employers for dropdown."""
-    employers = db.query(Employer).filter(
-        Employer.status == 'Active',
-        Employer.is_deleted == False
-    ).order_by(Employer.name).all()
-    return employers
+TRANSFER_OUT_LABEL = "انتقال مانده طی اصلاحیه تبصره 2 ماده 5"
+COLUMN_LABELS = {
+    "year": "سال مالی",
+    "mandated_amount": "اعتبار تکلیفی",
+    "deposit_amount": "مجموع واریزی",
+    "payment_amount": "هزینه کرد",
+    "transfer_in": "انتقال ورودی",
+    "transfer_out": TRANSFER_OUT_LABEL,
+    "balance": "مانده واقعی",
+}
+DISPLAY_COLUMNS = [
+    "year",
+    "mandated_amount",
+    "deposit_amount",
+    "payment_amount",
+    "transfer_in",
+    "transfer_out",
+    "balance",
+]
 
 
 def get_employer_financials(db: Session, employer_code: str):
-    """
-    Fetch and aggregate financial data for a specific employer across all years.
-    Returns a DataFrame with columns for each financial metric by year.
-    """
-    
-    # Get the employer details to check if it's a Mother entity
+    """Fetch and aggregate financial data for a specific employer across all years."""
     employer = db.query(Employer).filter(Employer.classification_code == employer_code).first()
     if not employer:
         return pd.DataFrame()
-    
-    # Determine which codes to include (main + subsidiaries for Mother entities)
-    if employer.employer_type == 'Mother':
+
+    if employer.employer_type == "Mother":
         codes_to_include = [employer_code]
         subsidiaries = db.query(Employer.classification_code).filter(
             Employer.parent_code == employer_code,
-            Employer.is_deleted == False
+            Employer.is_deleted == False,
         ).all()
         codes_to_include.extend([s[0] for s in subsidiaries])
     else:
         codes_to_include = [employer_code]
-    
-    # 1. Get Annual Mandates
+
     mandates_query = db.query(
-        AnnualMandate.fiscal_year.label('year'),
-        func.sum(AnnualMandate.mandated_amount).label('mandated_amount')
+        AnnualMandate.fiscal_year.label("year"),
+        func.sum(AnnualMandate.mandated_amount).label("mandated_amount"),
     ).filter(
         AnnualMandate.employer_code.in_(codes_to_include),
-        AnnualMandate.is_deleted == False
+        AnnualMandate.is_deleted == False,
     ).group_by(AnnualMandate.fiscal_year)
-    
     df_mandates = pd.read_sql(mandates_query.statement, db.bind)
-    
-    # 2. Get Deposit Receipts
+
     deposits_query = db.query(
-        DepositReceipt.fiscal_year.label('year'),
-        func.sum(DepositReceipt.deposit_amount).label('deposit_amount')
+        DepositReceipt.fiscal_year.label("year"),
+        func.sum(DepositReceipt.deposit_amount).label("deposit_amount"),
     ).filter(
         DepositReceipt.employer_code.in_(codes_to_include),
-        DepositReceipt.is_deleted == False
+        DepositReceipt.is_deleted == False,
     ).group_by(DepositReceipt.fiscal_year)
-    
     df_deposits = pd.read_sql(deposits_query.statement, db.bind)
-    
-    # 3. Get Payments (via Contract relationship)
+
     payments_query = db.query(
-        Payment.funding_year.label('year'),
-        func.sum(Payment.amount).label('payment_amount')
+        Payment.funding_year.label("year"),
+        func.sum(Payment.amount).label("payment_amount"),
     ).join(
         Contract, Payment.contract_tracking_code == Contract.tracking_code
     ).filter(
         Contract.employer_code.in_(codes_to_include),
         Payment.is_deleted == False,
-        Contract.is_deleted == False
+        Contract.is_deleted == False,
     ).group_by(Payment.funding_year)
-    
     df_payments = pd.read_sql(payments_query.statement, db.bind)
-    
-    # 4. Get Transfers IN (where this employer is the destination)
+
     transfers_in_query = db.query(
-        CreditTransfer.fiscal_year.label('year'),
-        func.sum(CreditTransfer.amount).label('transfer_in')
+        CreditTransfer.fiscal_year.label("year"),
+        func.sum(CreditTransfer.amount).label("transfer_in"),
     ).filter(
         CreditTransfer.destination_employer_code.in_(codes_to_include),
-        CreditTransfer.is_deleted == False
+        CreditTransfer.is_deleted == False,
     ).group_by(CreditTransfer.fiscal_year)
-    
     df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
-    
-    # 5. Get Transfers OUT (where this employer is the source)
+
     transfers_out_query = db.query(
-        CreditTransfer.fiscal_year.label('year'),
-        func.sum(CreditTransfer.amount).label('transfer_out')
+        CreditTransfer.fiscal_year.label("year"),
+        func.sum(CreditTransfer.amount).label("transfer_out"),
     ).filter(
         CreditTransfer.source_employer_code.in_(codes_to_include),
-        CreditTransfer.is_deleted == False
+        CreditTransfer.is_deleted == False,
     ).group_by(CreditTransfer.fiscal_year)
-    
     df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
-    
-    # Merge all dataframes on year
+
     dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
     df_merged = dfs[0]
-    
     for df in dfs[1:]:
-        df_merged = df_merged.merge(df, on='year', how='outer')
-    
-    # Fill NaN with 0
+        df_merged = df_merged.merge(df, on="year", how="outer")
     df_merged = df_merged.fillna(0)
-    
-    # Sort by year
-    df_merged = df_merged.sort_values('year')
-    
-    # Calculate balance: (Deposits + Transfers IN) - (Payments + Transfers OUT)
-    df_merged['balance'] = (
-        df_merged['deposit_amount'] + df_merged['transfer_in']
-    ) - (
-        df_merged['payment_amount'] + df_merged['transfer_out']
+
+    df_merged["balance"] = (
+        df_merged["deposit_amount"]
+        + df_merged["transfer_in"]
+        - df_merged["payment_amount"]
+        - df_merged["transfer_out"]
     )
-    
+    df_merged = df_merged.sort_values("year")
     return df_merged
 
 
-def format_number(value):
-    """Format numbers with comma separators and no decimals (kept for raw data)."""
-    try:
-        return f"{int(value):,}"
-    except (ValueError, TypeError):
-        return "0"
+def render_kpi_card(year, mandated, adj_dep, adj_pay):
+    """Render a styled HTML KPI card for a single fiscal year."""
+    dep_pct = min(100, (adj_dep / mandated * 100) if mandated > 0 else 0)
+    pay_pct = min(100, (adj_pay / mandated * 100) if mandated > 0 else 0)
+
+    html_content = f"""
+    <div style="background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); direction: rtl; font-family: 'Vazirmatn', sans-serif;">
+        <h4 style="text-align: center; color: #111827;">سال {to_persian_numbers(int(year))}</h4>
+        <div style="font-size: 14px; margin-bottom: 10px;">اعتبار تکلیفی: {to_persian_numbers(int(mandated))}</div>
+        <div style="font-size: 14px; margin-bottom: 5px;">واریزی تعدیل‌شده: {to_persian_numbers(int(adj_dep))}</div>
+        <div style="background-color: #e5e7eb; border-radius: 4px; height: 8px; margin-bottom: 15px;">
+            <div style="width: {dep_pct}%; background-color: #10B981; height: 8px; border-radius: 4px;"></div>
+        </div>
+        <div style="font-size: 14px; margin-bottom: 5px;">هزینه‌کرد تعدیل‌شده: {to_persian_numbers(int(adj_pay))}</div>
+        <div style="background-color: #e5e7eb; border-radius: 4px; height: 8px;">
+            <div style="width: {pay_pct}%; background-color: #3B82F6; height: 8px; border-radius: 4px;"></div>
+        </div>
+    </div>
+    """
+    st.markdown(html_content, unsafe_allow_html=True)
 
 
-def to_excel(df):
-    """
-    Write a DataFrame to a BytesIO buffer as an Excel file and return the bytes.
-    This uses the raw numeric DataFrame before Persian digit conversion.
-    """
-    buffer = io.BytesIO()
-    df.to_excel(buffer, index=False, engine='openpyxl')
-    return buffer.getvalue()
+def to_persian_numbers(text):
+    """Convert English digits to Persian digits and format numbers with thousand separators."""
+    persian_digits = {
+        "0": "۰", "1": "۱", "2": "۲", "3": "۳", "4": "۴",
+        "5": "۵", "6": "۶", "7": "۷", "8": "۸", "9": "۹",
+    }
+    if isinstance(text, (int, float)):
+        text = f"{int(text):,}"
+    else:
+        text = str(text)
+    for eng, per in persian_digits.items():
+        text = text.replace(eng, per)
+    return text
+
+
+def get_active_employers(db: Session):
+    """Fetch all active employers for dropdown."""
+    return db.query(Employer).filter(
+        Employer.status == "Active",
+        Employer.is_deleted == False,
+    ).order_by(Employer.name).all()
+
+
+def to_excel(df: pd.DataFrame) -> bytes:
+    """Convert dataframe to Excel bytes for download."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Financial Report")
+    output.seek(0)
+    return output.getvalue()
+
+
+def add_adjusted_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["adjusted_deposits"] = df["deposit_amount"] + df["transfer_in"]
+    df["adjusted_payments"] = df["payment_amount"] + df["transfer_out"]
+    return df
+
+
+def convert_financials_to_millions(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    existing_financial_cols = [col for col in FINANCIAL_COLUMNS if col in df.columns]
+    df[existing_financial_cols] = df[existing_financial_cols] / 1_000_000
+    return df
+
+
+def million_rials_label():
+    st.markdown(
+        "<p style='text-align: center; font-size: 14px; color: gray;'>(ارقام بر حسب میلیون ریال)</p>",
+        unsafe_allow_html=True,
+    )
+
+
+def persian_tick_values(values, steps=5):
+    values = pd.Series(values).dropna()
+    if values.empty:
+        return [0], ["۰"]
+
+    min_value = min(0, float(values.min()))
+    max_value = max(0, float(values.max()))
+    if min_value == max_value:
+        return [0], ["۰"]
+
+    tickvals = [min_value + (max_value - min_value) * i / steps for i in range(steps + 1)]
+    ticktext = [to_persian_numbers(int(v)) for v in tickvals]
+    return tickvals, ticktext
+
+
+def render_yearly_kpi_cards(df: pd.DataFrame):
+    years = sorted(df["year"].unique())
+    kpi_cols = st.columns(len(years))
+
+    for idx, year in enumerate(years):
+        year_data = df[df["year"] == year].iloc[0]
+        with kpi_cols[idx]:
+            render_kpi_card(
+                year,
+                year_data["mandated_amount"],
+                year_data["adjusted_deposits"],
+                year_data["adjusted_payments"],
+            )
+
+
+def render_grouped_bar_chart(chart_data: pd.DataFrame):
+    chart_data = chart_data.sort_values("year")
+    years_persian = [to_persian_numbers(int(y)) for y in chart_data["year"]]
+    tickvals, ticktext = persian_tick_values(pd.concat([
+        chart_data["mandated_amount"],
+        chart_data["adjusted_deposits"],
+        chart_data["adjusted_payments"],
+    ]))
+
+    fig_grouped = go.Figure()
+    fig_grouped.add_trace(go.Bar(
+        x=years_persian,
+        y=chart_data["mandated_amount"],
+        name="اعتبار تکلیفی",
+        marker_color="#757575",
+        text=[to_persian_numbers(int(v)) for v in chart_data["mandated_amount"]],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=11),
+    ))
+    fig_grouped.add_trace(go.Bar(
+        x=years_persian,
+        y=chart_data["adjusted_deposits"],
+        name="واریزی تعدیل‌شده",
+        marker_color="#4CAF50",
+        text=[to_persian_numbers(int(v)) for v in chart_data["adjusted_deposits"]],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=11),
+    ))
+    fig_grouped.add_trace(go.Bar(
+        x=years_persian,
+        y=chart_data["adjusted_payments"],
+        name="هزینه تعدیل‌شده",
+        marker_color="#2196F3",
+        text=[to_persian_numbers(int(v)) for v in chart_data["adjusted_payments"]],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=11),
+    ))
+    fig_grouped.update_layout(
+        barmode="group",
+        font=dict(family="Vazirmatn", size=14),
+        title=dict(
+            text="مقایسه اعتبار تکلیفی، واریزی تعدیل‌شده و هزینه تعدیل‌شده",
+            x=0.5,
+            xanchor="center",
+            font=dict(family="Vazirmatn", size=18),
+        ),
+        title_font=dict(family="Vazirmatn"),
+        xaxis=dict(
+            title="سال مالی",
+            tickfont=dict(family="Vazirmatn", size=13),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        yaxis=dict(
+            title="مبلغ (میلیون ریال)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickfont=dict(family="Vazirmatn", size=12),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(family="Vazirmatn", size=13),
+        ),
+        legend_font=dict(family="Vazirmatn"),
+        height=600,
+        margin=dict(l=60, r=40, t=80, b=120),
+        plot_bgcolor="#f8f9fa",
+        paper_bgcolor="white",
+    )
+    st.plotly_chart(fig_grouped, use_container_width=True, theme=None)
+
+
+def render_waterfall_chart(chart_data: pd.DataFrame):
+    tot_dep = chart_data["adjusted_deposits"].sum()
+    tot_pay = chart_data["adjusted_payments"].sum()
+    tot_bal = chart_data["balance"].sum()
+
+    waterfall_labels = [" واریزی تعدیل‌شده", " هزینه تعدیل‌شده", " مانده واقعی"]
+    waterfall_values = [tot_dep, -tot_pay, tot_bal]
+    cumulative_values = [0, tot_dep, tot_dep - tot_pay, tot_bal]
+    tickvals, ticktext = persian_tick_values(cumulative_values)
+
+    fig_waterfall = go.Figure(go.Waterfall(
+        name="جریان منابع و مصارف",
+        orientation="v",
+        measure=["relative", "relative", "total"],
+        x=waterfall_labels,
+        y=waterfall_values,
+        text=[to_persian_numbers(int(v)) for v in waterfall_values],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=12),
+        connector=dict(line=dict(color="#9CA3AF")),
+        increasing=dict(marker=dict(color="#10B981")),
+        decreasing=dict(marker=dict(color="#EF4444")),
+        totals=dict(marker=dict(color="#3B82F6")),
+    ))
+    fig_waterfall.update_layout(
+        font=dict(family="Vazirmatn", size=14),
+        title=dict(
+            text="نمای تجمعی جریان منابع و مصارف",
+            x=0.5,
+            xanchor="center",
+            font=dict(family="Vazirmatn", size=18),
+        ),
+        title_font=dict(family="Vazirmatn"),
+        xaxis=dict(
+            tickfont=dict(family="Vazirmatn", size=13),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        yaxis=dict(
+            title="مبلغ (میلیون ریال)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickfont=dict(family="Vazirmatn", size=12),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(family="Vazirmatn", size=13),
+        ),
+        height=520,
+        margin=dict(l=60, r=40, t=80, b=120),
+        plot_bgcolor="#f8f9fa",
+        paper_bgcolor="white",
+    )
+    st.plotly_chart(fig_waterfall, use_container_width=True, theme=None)
+
+
+def render_detailed_table_and_download(df: pd.DataFrame, file_name: str):
+    st.subheader("📋 جدول تفصیلی به تفکیک سال")
+    million_rials_label()
+
+    df_display = df[DISPLAY_COLUMNS].copy().rename(columns=COLUMN_LABELS)
+    df_display[COLUMN_LABELS["year"]] = df_display[COLUMN_LABELS["year"]].apply(to_persian_numbers)
+    for col_key, col_label in COLUMN_LABELS.items():
+        if col_key != "year":
+            df_display[col_label] = df_display[col_label].apply(to_persian_numbers)
+
+    st.table(df_display)
+
+    df_excel = df[DISPLAY_COLUMNS].copy().rename(columns=COLUMN_LABELS)
+    st.download_button(
+        label="📥 دانلود گزارش به صورت اکسل",
+        data=to_excel(df_excel),
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def render_tab1(db: Session, employers):
+    employer_options = {emp.classification_code: f"{emp.name} ({emp.classification_code})" for emp in employers}
+    employer_keys = list(employer_options.keys())
+    default_index = employer_keys.index("231500") if "231500" in employer_keys else 0
+
+    selected_code = st.selectbox(
+        "انتخاب مشمول:",
+        options=employer_keys,
+        format_func=lambda x: employer_options[x],
+        index=default_index,
+    )
+
+    if not selected_code:
+        return
+
+    selected_employer = next(emp for emp in employers if emp.classification_code == selected_code)
+
+    st.subheader(f"اطلاعات مشمول: {selected_employer.name}")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.info(f"**کد طبقه‌بندی:** {selected_employer.classification_code}")
+    with col2:
+        st.info(f"**استان:** {selected_employer.province}")
+    with col3:
+        st.info(f"**سازمان بالادست:** {selected_employer.upper_organization}")
+
+    st.markdown("---")
+
+    with st.spinner("در حال بارگذاری اطلاعات مالی..."):
+        df = get_employer_financials(db, selected_code)
+
+    df = df[df["year"] >= 1402]
+    if df.empty:
+        st.warning("هیچ داده مالی برای این مشمول از سال ۱۴۰۲ به بعد یافت نشد.")
+        return
+
+    df = add_adjusted_columns(convert_financials_to_millions(df))
+
+    st.subheader("🔑 شاخص‌های کلیدی")
+    million_rials_label()
+    render_yearly_kpi_cards(df)
+
+    st.markdown("---")
+    render_detailed_table_and_download(df, f"financial_report_v2_{selected_code}.xlsx")
+
+    st.markdown("---")
+    st.subheader("📊 تحلیل و نمودار")
+    million_rials_label()
+    render_grouped_bar_chart(df)
+    render_waterfall_chart(df)
+
+
+def render_top10_employers_chart(df_all: pd.DataFrame):
+    st.markdown("### 📊 ۱۰ مشمول برتر بر اساس میزان واریزی")
+
+    top10 = df_all.groupby(
+        ["employer_code", "employer_name"], as_index=False
+    )["deposit_amount"].sum().nlargest(10, "deposit_amount")
+
+    tickvals, ticktext = persian_tick_values(top10["deposit_amount"])
+    fig_top10 = go.Figure(go.Bar(
+        x=top10["deposit_amount"],
+        y=top10["employer_name"],
+        orientation="h",
+        text=top10["deposit_amount"].apply(lambda v: to_persian_numbers(int(v))),
+        textposition="auto",
+        marker_color="#2196F3",
+        name="مجموع واریزی",
+    ))
+    fig_top10.update_layout(
+        font=dict(family="Vazirmatn", size=14),
+        xaxis=dict(
+            title="مبلغ واریزی (میلیون ریال)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickfont=dict(family="Vazirmatn", size=12),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        yaxis=dict(
+            title="",
+            autorange="reversed",
+            tickfont=dict(family="Vazirmatn", size=12),
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(family="Vazirmatn", size=13),
+        ),
+        height=500,
+        margin=dict(l=20, r=20, t=40, b=100),
+    )
+    st.plotly_chart(fig_top10, use_container_width=True, theme=None)
+
+
+def render_global_excel_download(df_all: pd.DataFrame):
+    df_export = df_all.copy().rename(columns={
+        "employer_code": "کد مشمول",
+        "employer_name": "نام مشمول",
+        "year": "سال مالی",
+        "mandated_amount": "اعتبار تکلیفی",
+        "deposit_amount": "مجموع واریزی",
+        "payment_amount": "هزینه کرد",
+        "transfer_in": "انتقال ورودی",
+        "transfer_out": "انتقال خروجی",
+        "balance": "مانده واقعی",
+    })
+
+    st.download_button(
+        label="📥 دانلود گزارش جامع کل مشمولین (اکسل)",
+        data=to_excel(df_export),
+        file_name="financial_report_all_employers.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def render_tab2(db: Session):
+    st.subheader("🏢 نمای کلان - خلاصه مدیریتی")
+
+    with st.spinner("در حال بارگذاری اطلاعات کلان..."):
+        df_all = get_all_employers_financials(db)
+
+    if df_all.empty:
+        st.warning("هیچ داده مالی در سیستم یافت نشد.")
+        return
+
+    df_all = df_all[df_all["year"] >= 1402]
+    if df_all.empty:
+        st.warning("هیچ داده مالی از سال ۱۴۰۲ به بعد یافت نشد.")
+        return
+
+    df_all = convert_financials_to_millions(df_all)
+    df_macro_yearly = df_all.groupby("year", as_index=False)[FINANCIAL_COLUMNS].sum()
+    df_macro_yearly = add_adjusted_columns(df_macro_yearly)
+
+    st.subheader("🔑 شاخص‌های کلیدی")
+    million_rials_label()
+    render_yearly_kpi_cards(df_macro_yearly)
+
+    st.markdown("---")
+    st.subheader("📊 تحلیل و نمودار")
+    million_rials_label()
+    render_grouped_bar_chart(df_macro_yearly)
+    render_waterfall_chart(df_macro_yearly)
+
+    st.markdown("---")
+    render_top10_employers_chart(df_all)
+
+    st.markdown("---")
+    render_global_excel_download(df_all)
 
 
 def main():
     st.set_page_config(
-        page_title="\u062f\u0627\u0634\u0628\u0648\u0631\u062f \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0633\u0627\u062a\u0639",
+        page_title="داشبورد ساتع - نسخه یکپارچه",
+        page_icon="📊",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="expanded",
     )
-    
-    # Inject CSS for Persian font (Vazirmatn), RTL layout, centered title & table styling
+
+    # ─── Main Title ───
+    st.markdown("<h1 style='text-align: center;'>📊 داشبورد مدیریتی ساتع - تراز مشمولین</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>(داده‌های مالی از سال ۱۴۰۲)</h3>", unsafe_allow_html=True)
+
+    # ─── Aggressive CSS: Vazirmatn font + full RTL override ───
     st.markdown("""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
-
-        html, body, [class*="css"], * {
-            font-family: 'Vazirmatn', sans-serif !important;
-            direction: rtl;
-            text-align: right;
-        }
-
-        h1, .stHeadingContainer {
-            text-align: center !important;
-            direction: rtl;
-        }
-
-        table, th, td, [data-testid="stTable"] {
-            font-family: 'Vazirmatn', sans-serif !important;
-            font-size: 16px !important;
-            text-align: center !important;
-            direction: rtl;
-        }
-
-        th {
-            background-color: #f0f2f6 !important;
-            border-bottom: 2px solid #4a4a4a !important;
-            font-weight: 700 !important;
-        }
-        </style>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    html, body, [class*="css"], * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        direction: rtl;
+        text-align: right;
+    }
+    h1, h2, h3, .stHeadingContainer { text-align: center !important; direction: rtl; }
+    table, th, td, .stTable, [data-testid="stTable"] * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        font-size: 15px !important;
+        text-align: center !important;
+        direction: rtl !important;
+    }
+    .stPlotlyChart, .js-plotly-plot, .plotly {
+        direction: ltr !important;
+    }
+    th { background-color: #f0f2f6 !important; border-bottom: 2px solid #4a4a4a !important; color: black !important; }
+    </style>
     """, unsafe_allow_html=True)
-    
-    st.title("\U0001f4ca \u062f\u0627\u0634\u0628\u0648\u0631\u062f \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0633\u0627\u062a\u0639 - \u062a\u0631\u0627\u0632\u0646\u0627\u0645\u0647 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646")
+
     st.markdown("---")
-    
-    # Initialize database session
+
     db = SessionLocal()
-    
     try:
-        # Get active employers for dropdown
         employers = get_active_employers(db)
-        
         if not employers:
-            st.warning("\u0647\u06cc\u0686 \u0645\u0634\u0645\u0648\u0644\u06cc \u0641\u0639\u0627\u0644 \u062f\u0631 \u0633\u06cc\u0633\u062a\u0645 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
+            st.warning("هیچ مشمولی فعال در سیستم یافت نشد.")
             return
-        
-        # Create tabs
-        tab1, tab2 = st.tabs(['\u062a\u0631\u0627\u0632\u0646\u0627\u0645\u0647 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646', '\u0646\u0645\u0627\u06cc \u06a9\u0644\u0627\u0646 (Executive Summary)'])
-        
-        # ─── Tab 1: Employer-Specific View ───
+
+        tab1, tab2 = st.tabs(["ترازنامه مشمولین", "نمای کلان - Executive Summary"])
         with tab1:
-            # Create employer selection dropdown
-            employer_options = {emp.classification_code: f"{emp.name} ({emp.classification_code})" for emp in employers}
-
-            # Default to employer with classification_code '231500', fallback to 0
-            default_index = 0
-            employer_keys = list(employer_options.keys())
-            if '231500' in employer_keys:
-                default_index = employer_keys.index('231500')
-
-            selected_code = st.selectbox(
-                "\u0627\u0646\u062a\u062e\u0627\u0628 \u0645\u0634\u0645\u0648\u0644:",
-                options=employer_keys,
-                format_func=lambda x: employer_options[x],
-                index=default_index
-            )
-            
-            if selected_code:
-                # Get selected employer details
-                selected_employer = next(emp for emp in employers if emp.classification_code == selected_code)
-                
-                # Display employer info
-                st.subheader(f"\u0627\u0637\u0644\u0627\u0639\u0627\u062a \u0645\u0634\u0645\u0648\u0644: {selected_employer.name}")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.info(f"**\u06a9\u062f \u0637\u0628\u0642\u0647\u200c\u0628\u0646\u062f\u06cc:** {selected_employer.classification_code}")
-                with col2:
-                    st.info(f"**\u0627\u0633\u062a\u0627\u0646:** {selected_employer.province}")
-                with col3:
-                    st.info(f"**\u0633\u0627\u0632\u0645\u0627\u0646 \u0628\u0627\u0644\u0627\u062f\u0633\u062a:** {selected_employer.upper_organization}")
-                
-                st.markdown("---")
-                
-                # Fetch financial data
-                with st.spinner("\u062f\u0631 \u062d\u0627\u0644 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0627\u0637\u0644\u0627\u0639\u0627\u062a \u0645\u0627\u0644\u06cc..."):
-                    df = get_employer_financials(db, selected_code)
-                
-                if df.empty:
-                    st.warning("\u0647\u06cc\u0686 \u062f\u0627\u062f\u0647 \u0645\u0627\u0644\u06cc \u0628\u0631\u0627\u06cc \u0627\u06cc\u0646 \u0645\u0634\u0645\u0648\u0644 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
-                else:
-                    # Calculate totals for KPIs
-                    total_mandated = df['mandated_amount'].sum()
-                    total_deposits = df['deposit_amount'].sum()
-                    total_payments = df['payment_amount'].sum()
-                    total_transfer_in = df['transfer_in'].sum()
-                    total_transfer_out = df['transfer_out'].sum()
-                    total_balance = df['balance'].sum()
-                    
-                    # Display KPI metrics with Persian numbers
-                    st.subheader("\U0001f511 \u0634\u0627\u062e\u0635\u200c\u0647\u0627\u06cc \u06a9\u0644\u06cc\u062f\u06cc")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc (\u06a9\u0644)", to_persian_numbers(total_mandated))
-                        st.metric("\u0648\u0627\u0631\u06cc\u0632\u06cc (\u06a9\u0644)", to_persian_numbers(total_deposits))
-                    with col2:
-                        st.metric("\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f (\u06a9\u0644)", to_persian_numbers(total_payments))
-                        st.metric("\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc (\u06a9\u0644)", to_persian_numbers(total_transfer_in))
-                    with col3:
-                        st.metric("\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc (\u06a9\u0644)", to_persian_numbers(total_transfer_out))
-                        st.metric("\u0645\u0627\u0646\u062f\u0647 \u0646\u0647\u0627\u06cc\u06cc (\u06a9\u0644)", to_persian_numbers(total_balance))
-                    
-                    st.markdown("---")
-                    st.subheader("\U0001f4cb \u062c\u062f\u0648\u0644 \u062a\u0641\u0635\u06cc\u0644\u06cc \u0628\u0647 \u062a\u0641\u06a9\u06cc\u06a9 \u0633\u0627\u0644")
-                    
-                    # Prepare display DataFrame with Persian digits
-                    df_display = df.copy()
-                    df_display = df_display.rename(columns={
-                        'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                        'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
-                        'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
-                        'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
-                        'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
-                        'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
-                        'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
-                    })
-                    
-                    # Apply Persian numbers to all columns
-                    for col in ['\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc']:
-                        df_display[col] = df_display[col].apply(to_persian_numbers)
-                        
-                    for col in ['\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc', '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc', '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f', '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc', '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc', '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc']:
-                        df_display[col] = df_display[col].apply(to_persian_numbers)
-                    
-                    # Display the table (using st.table for proper CSS styling)
-                    st.table(df_display)
-                    
-                    # Excel download button (uses raw df with English digits for Excel compatibility)
-                    df_excel = df.copy()
-                    df_excel = df_excel.rename(columns={
-                        'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                        'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
-                        'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
-                        'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
-                        'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
-                        'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
-                        'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
-                    })
-                    
-                    st.download_button(
-                        label="\U0001f4e5 \u062f\u0627\u0646\u0644\u0648\u062f \u06af\u0632\u0627\u0631\u0634 \u0628\u0647 \u0635\u0648\u0631\u062a \u0627\u06a9\u0633\u0644",
-                        data=to_excel(df_excel),
-                        file_name=f"financial_report_{selected_code}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                    
-                    # Additional analysis
-                    st.markdown("---")
-                    st.subheader("\U0001f4ca \u062a\u062d\u0644\u06cc\u0644 \u0648 \u0646\u0645\u0648\u062f\u0627\u0631")
-                    
-                    # Create a chart showing deposits vs payments over years with Persian font
-                    chart_data = df[['year', 'deposit_amount', 'payment_amount', 'balance']].copy()
-                    
-                    fig = go.Figure()
-                    
-                    fig.add_trace(go.Scatter(
-                        x=chart_data['year'],
-                        y=chart_data['deposit_amount'],
-                        mode='lines+markers',
-                        name='\u0648\u0627\u0631\u06cc\u0632\u06cc',
-                        line=dict(color='green', width=2)
-                    ))
-                    
-                    fig.add_trace(go.Scatter(
-                        x=chart_data['year'],
-                        y=chart_data['payment_amount'],
-                        mode='lines+markers',
-                        name='\u0647\u0632\u06cc\u0646\u0647',
-                        line=dict(color='red', width=2)
-                    ))
-                    
-                    fig.add_trace(go.Scatter(
-                        x=chart_data['year'],
-                        y=chart_data['balance'],
-                        mode='lines+markers',
-                        name='\u0645\u0627\u0646\u062f\u0647',
-                        line=dict(color='blue', width=2)
-                    ))
-                    
-                    fig.update_layout(
-                        font=dict(family='Vazirmatn', size=14),
-                        xaxis_title='\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                        yaxis_title='\u0645\u0628\u0644\u063a (\u0631\u06cc\u0627\u0644)',
-                        hovermode='x unified',
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-        
-        # ─── Tab 2: Executive Summary (Macro View) ───
+            render_tab1(db, employers)
         with tab2:
-            st.subheader("\U0001f3e2 \u0646\u0645\u0627\u06cc \u06a9\u0644\u0627\u0646 - \u062e\u0644\u0627\u0635\u0647 \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc")
-            
-            with st.spinner("\u062f\u0631 \u062d\u0627\u0644 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0627\u0637\u0644\u0627\u0639\u0627\u062a \u06a9\u0644\u0627\u0646..."):
-                df_all = get_all_employers_financials(db)
-            
-            if df_all.empty:
-                st.warning("\u0647\u06cc\u0686 \u062f\u0627\u062f\u0647 \u0645\u0627\u0644\u06cc \u062f\u0631 \u0633\u06cc\u0633\u062a\u0645 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
-            else:
-                # ── Global KPIs ──
-                grand_mandated = df_all['mandated_amount'].sum()
-                grand_deposits = df_all['deposit_amount'].sum()
-                grand_payments = df_all['payment_amount'].sum()
-                grand_balance = df_all['balance'].sum()
-                
-                st.markdown("### \U0001f511 \u0634\u0627\u062e\u0635\u200c\u0647\u0627\u06cc \u06a9\u0644\u06cc\u062f\u06cc \u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_mandated))
-                with col2:
-                    st.metric("\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_deposits))
-                with col3:
-                    st.metric("\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_payments))
-                with col4:
-                    st.metric("\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_balance))
-                
-                st.markdown("---")
-                
-                # ── Top 10 Employers by Deposit Amount ──
-                st.markdown("### \U0001f4ca \u06f1\u06f0 \u0645\u0634\u0645\u0648\u0644 \u0628\u0631\u062a\u0631 \u0628\u0631 \u0627\u0633\u0627\u0633 \u0645\u06cc\u0632\u0627\u0646 \u0648\u0627\u0631\u06cc\u0632\u06cc")
-                
-                top10 = df_all.groupby(
-                    ['employer_code', 'employer_name'], as_index=False
-                )['deposit_amount'].sum().nlargest(10, 'deposit_amount')
-                
-                fig_top10 = go.Figure(go.Bar(
-                    x=top10['deposit_amount'],
-                    y=top10['employer_name'],
-                    orientation='h',
-                    text=top10['deposit_amount'].apply(lambda v: to_persian_numbers(int(v))),
-                    textposition='auto',
-                    marker_color='#2196F3'
-                ))
-                
-                fig_top10.update_layout(
-                    font=dict(family='Vazirmatn', size=14),
-                    xaxis_title='\u0645\u0628\u0644\u063a \u0648\u0627\u0631\u06cc\u0632\u06cc (\u0631\u06cc\u0627\u0644)',
-                    yaxis_title='',
-                    yaxis=dict(autorange='reversed'),
-                    height=500,
-                    margin=dict(l=20, r=20, t=40, b=40)
-                )
-                
-                st.plotly_chart(fig_top10, use_container_width=True)
-                
-                st.markdown("---")
-                
-                # ── Global Excel Export ──
-                df_export = df_all.copy()
-                df_export = df_export.rename(columns={
-                    'employer_code': '\u06a9\u062f \u0645\u0634\u0645\u0648\u0644',
-                    'employer_name': '\u0646\u0627\u0645 \u0645\u0634\u0645\u0648\u0644',
-                    'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                    'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
-                    'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
-                    'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
-                    'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
-                    'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
-                    'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
-                })
-                
-                st.download_button(
-                    label="\U0001f4e5 \u062f\u0627\u0646\u0644\u0648\u062f \u06af\u0632\u0627\u0631\u0634 \u062c\u0627\u0645\u0639 \u06a9\u0644 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646 (\u0627\u06a9\u0633\u0644)",
-                    data=to_excel(df_export),
-                    file_name="financial_report_all_employers.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            
+            render_tab2(db)
     finally:
         db.close()
 
