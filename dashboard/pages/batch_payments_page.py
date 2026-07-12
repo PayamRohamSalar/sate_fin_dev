@@ -135,7 +135,8 @@ if st.session_state.payment_cart:
         try:
             submit_res = requests.post(f"{API_URL}/payments/bulk-submit", json=bulk_payload)
             if submit_res.status_code == 201:
-                st.success(f"🎉 لیست با موفقیت نهایی شد! {submit_res.json().get('count')} قلم پرداخت ثبت و قفل گردید.")
+                submitted_count = submit_res.json().get("submitted_count", 0)
+                st.success(f"🎉 لیست با موفقیت نهایی شد! {submitted_count} قلم پرداخت ثبت و قفل گردید.")
                 st.session_state.payment_cart = [] # Clear cart on success
             else:
                 st.error(f"❌ خطا در ثبت نهایی: {submit_res.json().get('detail')}")

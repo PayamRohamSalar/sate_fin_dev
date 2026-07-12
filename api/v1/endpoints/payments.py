@@ -152,7 +152,7 @@ def validate_draft_payment(
     )
 
 
-@router.post("/bulk-submit", response_model=PaymentBulkCreateResponse)
+@router.post("/bulk-submit", response_model=PaymentBulkCreateResponse, status_code=201)
 def bulk_submit_payments(
     request: PaymentBulkCreate,
     db: Session = Depends(get_db),
@@ -170,10 +170,22 @@ def bulk_submit_payments(
     - `payments`: List of payment objects to register atomically.
 
     **Returns:**
-    - HTTP 200 with the committed count and tracking codes when all succeed.
+    - HTTP 201 with the committed count and tracking codes when all succeed.
     - HTTP 400 (rolled back) identifying the contract/row that failed.
     """
     tracking_codes = [item.tracking_code for item in request.payments]
+
+    seen_codes = set()
+    for code in tracking_codes:
+        if code in seen_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"خطا: کد رهگیری پرداخت '{code}' "
+                    "قبلاً در سیستم ثبت شده است."
+                ),
+            )
+        seen_codes.add(code)
 
     existing = (
         db.query(Payment.tracking_code)
@@ -185,7 +197,6 @@ def bulk_submit_payments(
     )
     if existing:
         duplicate_code = existing[0]
-        db.rollback()
         raise HTTPException(
             status_code=400,
             detail=(
