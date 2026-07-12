@@ -1,6 +1,6 @@
 import pandas as pd
 from decimal import Decimal
-from sqlalchemy import func, or_
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from models.contract import Contract
@@ -8,6 +8,73 @@ from models.deposits import AnnualMandate, DepositReceipt
 from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
+
+
+def get_contracts_with_dynamic_status(
+    db: Session,
+    threshold_year: int = 1402,
+):
+    """
+    Retrieve contracts with a lifecycle status calculated entirely in SQL.
+
+    Non-deleted payments are aggregated per non-deleted contract. A contract is
+    completed when its total payments cover its total amount. Otherwise, its
+    most recent activity year is the greater of the last payment funding year
+    and the approximated Jalali contract creation year. Activity before
+    ``threshold_year`` is classified as stagnant; all other activity is active.
+    The persisted ``Contract.status`` column is never modified.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        threshold_year: Jalali year used as the active/stagnant boundary.
+
+    Returns:
+        SQLAlchemy result rows containing the contract entity, aggregated
+        payment values, Jalali activity years, and the dynamic status.
+    """
+    total_paid = func.coalesce(func.sum(Payment.amount), 0)
+    last_payment_funding_year = func.max(Payment.funding_year)
+    gregorian_contract_year = func.extract("year", Contract.contract_date)
+    contract_creation_year = case(
+        (
+            func.to_char(Contract.contract_date, "MMDD") < "0321",
+            gregorian_contract_year - 622,
+        ),
+        else_=gregorian_contract_year - 621,
+    )
+    activity_year = func.greatest(
+        func.coalesce(last_payment_funding_year, contract_creation_year, 0),
+        func.coalesce(contract_creation_year, last_payment_funding_year, 0),
+    )
+    dynamic_status = case(
+        (total_paid >= Contract.total_amount, "Completed"),
+        (activity_year < threshold_year, "Stagnant"),
+        else_="Active",
+    )
+
+    statement = (
+        select(
+            Contract,
+            total_paid.label("total_paid"),
+            func.coalesce(last_payment_funding_year, 0).label(
+                "last_payment_funding_year"
+            ),
+            contract_creation_year.label("contract_creation_year"),
+            activity_year.label("activity_year"),
+            dynamic_status.label("dynamic_status"),
+        )
+        .outerjoin(
+            Payment,
+            and_(
+                Payment.contract_tracking_code == Contract.tracking_code,
+                Payment.is_deleted == False,
+            ),
+        )
+        .where(Contract.is_deleted == False)
+        .group_by(Contract.tracking_code)
+    )
+
+    return db.execute(statement).all()
 
 def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -> float:
     """

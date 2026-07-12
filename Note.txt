@@ -32,6 +32,8 @@ Then open browser: http://127.0.0.1:8000/docs
 
 ## Get Report
 python scripts/generate_financial_report.py
+python scripts/generate_contract_status_report.py
+
 python generate_context.py
 
 ## Phase 3

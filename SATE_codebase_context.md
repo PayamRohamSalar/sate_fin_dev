@@ -5,6 +5,7 @@
     main.py
     SATE_codebase_context.md
     test_engine_cli.py
+    .cursor/
     .pgdata/
         base/
             1/
@@ -39,6 +40,7 @@
             api_router.py
             __init__.py
             endpoints/
+                contracts.py
                 employers.py
                 payments.py
                 __init__.py
@@ -46,6 +48,7 @@
         database.py
     dashboard/
         app.py
+        app_v2.py
         CHANGELOG.md
         QUICKSTART.md
         README.md
@@ -66,6 +69,7 @@
         university.py
     results/
     schemas/
+        contract_schema.py
         employer_schema.py
         payment_schema.py
         __init__.py
@@ -75,6 +79,7 @@
         check_excel.py
         create_transfer_table.py
         example_1.py
+        generate_contract_status_report.py
         generate_financial_report.py
         import_contracts.py
         import_credit_transfers.py
@@ -322,7 +327,7 @@ if __name__ == "__main__":
 ------------------------------
 from fastapi import APIRouter
 
-from api.v1.endpoints import employers, payments
+from api.v1.endpoints import contracts, employers, payments
 
 # Create the main API router for version 1
 api_router = APIRouter()
@@ -330,14 +335,91 @@ api_router = APIRouter()
 # Include sub-routers for different endpoint groups
 api_router.include_router(employers.router)
 api_router.include_router(payments.router)
+api_router.include_router(contracts.router)
 
 # Future routers can be added here as the system grows:
-# api_router.include_router(contracts.router)
 # api_router.include_router(deposits.router)
 
 
 ## File: api\v1\__init__.py
 ------------------------------
+
+
+## File: api\v1\endpoints\contracts.py
+------------------------------
+from typing import List
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from core.database import get_db
+from models.contract import Contract
+from models.employer import Employer
+from models.researchers import Researcher
+from models.university import University
+from schemas.contract_schema import ContractSearchResult
+
+router = APIRouter(
+    prefix="/contracts",
+    tags=["Contracts"]
+)
+
+
+@router.get("/search", response_model=List[ContractSearchResult])
+def search_contracts(
+    q: str = Query(..., min_length=1, description="Search term matched against tracking code or title"),
+    db: Session = Depends(get_db),
+):
+    """
+    Search active contracts for the payment auto-fill flow.
+
+    Matches the query `q` (case-insensitive) against either the contract
+    `tracking_code` or `title`. Only non-deleted contracts are returned, joined
+    with their employer, university, and researcher to provide display names.
+
+    **Parameters:**
+    - `q`: Free-text search term (partial matches supported).
+
+    **Returns:**
+    - A list of matching contracts with denormalized employer, university, and
+      researcher details for frontend auto-fill.
+    """
+    like_pattern = f"%{q}%"
+
+    rows = (
+        db.query(
+            Contract.tracking_code.label("contract_tracking_code"),
+            Contract.title.label("title"),
+            Employer.name.label("employer_name"),
+            Employer.classification_code.label("employer_classification_code"),
+            University.name.label("university_name"),
+            Researcher.full_name.label("researcher_name"),
+        )
+        .outerjoin(Employer, Contract.employer_code == Employer.classification_code)
+        .outerjoin(University, Contract.university_id == University.national_id)
+        .outerjoin(Researcher, Contract.researcher_id == Researcher.national_code)
+        .filter(
+            Contract.is_deleted == False,
+            or_(
+                Contract.tracking_code.ilike(like_pattern),
+                Contract.title.ilike(like_pattern),
+            ),
+        )
+        .all()
+    )
+
+    return [
+        ContractSearchResult(
+            contract_tracking_code=row.contract_tracking_code,
+            title=row.title,
+            employer_name=row.employer_name,
+            employer_classification_code=row.employer_classification_code,
+            university_name=row.university_name,
+            researcher_name=row.researcher_name,
+        )
+        for row in rows
+    ]
 
 
 ## File: api\v1\endpoints\employers.py
@@ -364,9 +446,11 @@ def get_employer_balance(
 ):
     """
     Calculate and return the real financial balance for a specific employer and funding year.
-    
+
     The balance is calculated as:
-    - Total deposits (including subsidiaries) - Total payments linked to employer's contracts
+    (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
+
+    Deposits include subsidiary receipts for Mother employers.
     
     **Parameters:**
     - `employer_id`: The employer's classification code
@@ -411,12 +495,23 @@ def get_employer_balance(
 
 ## File: api\v1\endpoints\payments.py
 ------------------------------
+from typing import List
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from core.database import get_db
-from services.financial_engine import validate_payment_impact
-from schemas.payment_schema import PaymentValidationRequest, PaymentValidationResponse
+from models.contract import Contract
+from models.payment import Payment
+from services.financial_engine import calculate_real_balance, validate_payment_impact
+from schemas.payment_schema import (
+    PaymentBatchValidationRequest,
+    PaymentBatchValidationResponse,
+    PaymentBulkCreate,
+    PaymentBulkCreateResponse,
+    PaymentValidationRequest,
+    PaymentValidationResponse,
+)
 
 router = APIRouter(
     prefix="/payments",
@@ -487,6 +582,166 @@ def validate_payment(
         )
 
 
+@router.post("/validate-draft", response_model=PaymentBatchValidationResponse)
+def validate_draft_payment(
+    request: PaymentBatchValidationRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Validate a single drafted (cart) payment against the employer's balance.
+
+    The available balance is computed as the current database balance minus the
+    `pending_cart_amount` (other drafts already reserved in the frontend cart
+    for the same employer). If the payment amount exceeds the available balance,
+    the request is rejected with HTTP 400 and the exact remaining balance.
+
+    **Parameters:**
+    - `contract_tracking_code`: Contract linked to the drafted payment.
+    - `amount`: Amount of the drafted payment.
+    - `funding_year`: Funding (budget consumption) year.
+    - `pending_cart_amount`: Sum of other drafts for the same employer in the cart.
+
+    **Returns:**
+    - HTTP 200 with balance breakdown when the draft is affordable.
+    - HTTP 400 with the remaining balance when funds are insufficient.
+    """
+    contract = db.query(Contract).filter(
+        Contract.tracking_code == request.contract_tracking_code,
+        Contract.is_deleted == False,
+    ).first()
+
+    if not contract:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Contract with tracking code '{request.contract_tracking_code}' not found or has been deleted.",
+        )
+
+    try:
+        current_db_balance = calculate_real_balance(
+            db, contract.employer_code, request.funding_year
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error calculating balance: {str(exc)}",
+        )
+
+    available_balance = current_db_balance - request.pending_cart_amount
+
+    if available_balance < request.amount:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Insufficient funds for this draft payment. "
+                f"Remaining available balance is {available_balance:,.0f} Rials, "
+                f"but the requested amount is {request.amount:,.0f} Rials."
+            ),
+        )
+
+    return PaymentBatchValidationResponse(
+        employer_code=contract.employer_code,
+        current_db_balance=current_db_balance,
+        pending_cart_amount=request.pending_cart_amount,
+        available_balance=available_balance,
+        amount=request.amount,
+        remaining_balance=available_balance - request.amount,
+        is_valid=True,
+    )
+
+
+@router.post("/bulk-submit", response_model=PaymentBulkCreateResponse)
+def bulk_submit_payments(
+    request: PaymentBulkCreate,
+    db: Session = Depends(get_db),
+):
+    """
+    Register a batch (cart) of payments inside a single database transaction.
+
+    The endpoint iterates through the submitted payments and recalculates a
+    running balance per employer/funding-year dynamically. Each payment reserves
+    part of the available balance so that later payments in the same batch see
+    the reduced balance. If any payment breaches the available balance, the
+    ENTIRE transaction is rolled back and an HTTP 400 identifies the failing row.
+
+    **Parameters:**
+    - `payments`: List of payment objects to register atomically.
+
+    **Returns:**
+    - HTTP 200 with the committed count and tracking codes when all succeed.
+    - HTTP 400 (rolled back) identifying the contract/row that failed.
+    """
+    running_balances: dict = {}
+    created_tracking_codes: List[str] = []
+
+    try:
+        for index, item in enumerate(request.payments):
+            contract = db.query(Contract).filter(
+                Contract.tracking_code == item.contract_tracking_code,
+                Contract.is_deleted == False,
+            ).first()
+
+            if not contract:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Row {index + 1} (tracking code '{item.tracking_code}') failed: "
+                        f"contract '{item.contract_tracking_code}' not found or has been deleted."
+                    ),
+                )
+
+            balance_key = (contract.employer_code, item.funding_year)
+            if balance_key not in running_balances:
+                running_balances[balance_key] = calculate_real_balance(
+                    db, contract.employer_code, item.funding_year
+                )
+
+            if running_balances[balance_key] < item.amount:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Row {index + 1} (tracking code '{item.tracking_code}', "
+                        f"contract '{item.contract_tracking_code}') failed: insufficient funds. "
+                        f"Remaining balance is {running_balances[balance_key]:,.0f} Rials, "
+                        f"but the requested amount is {item.amount:,.0f} Rials."
+                    ),
+                )
+
+            payment = Payment(
+                tracking_code=item.tracking_code,
+                contract_tracking_code=item.contract_tracking_code,
+                series=item.series,
+                amount=item.amount,
+                notification_letter_number=item.notification_letter_number,
+                notification_date=item.notification_date,
+                payment_year=item.payment_year,
+                funding_year=item.funding_year,
+                attachment_path=item.attachment_path,
+                is_deleted=False,
+            )
+            db.add(payment)
+
+            running_balances[balance_key] -= item.amount
+            created_tracking_codes.append(item.tracking_code)
+
+        db.commit()
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error during bulk submission (transaction rolled back): {str(exc)}",
+        )
+
+    return PaymentBulkCreateResponse(
+        message="All payments were registered successfully.",
+        submitted_count=len(created_tracking_codes),
+        tracking_codes=created_tracking_codes,
+    )
+
+
 ## File: api\v1\endpoints\__init__.py
 ------------------------------
 
@@ -522,10 +777,621 @@ def get_db():
 
 ## File: dashboard\app.py
 ------------------------------
+import io
+import os
+import sys
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+# Add parent directory to path to import project modules
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.database import SessionLocal
+from models.contract import Contract
+from models.deposits import AnnualMandate, DepositReceipt
+from models.employer import Employer
+from models.payment import Payment
+from models.transfer import CreditTransfer
+from services.financial_engine import get_all_employers_financials
+
+FINANCIAL_COLUMNS = [
+    "mandated_amount",
+    "deposit_amount",
+    "payment_amount",
+    "transfer_in",
+    "transfer_out",
+    "balance",
+]
+
+TRANSFER_OUT_LABEL = "انتقال مانده طی اصلاحیه تبصره 2 ماده 5"
+COLUMN_LABELS = {
+    "year": "سال مالی",
+    "mandated_amount": "اعتبار تکلیفی",
+    "deposit_amount": "مجموع واریزی",
+    "payment_amount": "هزینه کرد",
+    "transfer_in": "انتقال ورودی",
+    "transfer_out": TRANSFER_OUT_LABEL,
+    "balance": "مانده واقعی",
+}
+DISPLAY_COLUMNS = [
+    "year",
+    "mandated_amount",
+    "deposit_amount",
+    "payment_amount",
+    "transfer_in",
+    "transfer_out",
+    "balance",
+]
+
+
+def get_employer_financials(db: Session, employer_code: str):
+    """Fetch and aggregate financial data for a specific employer across all years."""
+    employer = db.query(Employer).filter(Employer.classification_code == employer_code).first()
+    if not employer:
+        return pd.DataFrame()
+
+    if employer.employer_type == "Mother":
+        codes_to_include = [employer_code]
+        subsidiaries = db.query(Employer.classification_code).filter(
+            Employer.parent_code == employer_code,
+            Employer.is_deleted == False,
+        ).all()
+        codes_to_include.extend([s[0] for s in subsidiaries])
+    else:
+        codes_to_include = [employer_code]
+
+    mandates_query = db.query(
+        AnnualMandate.fiscal_year.label("year"),
+        func.sum(AnnualMandate.mandated_amount).label("mandated_amount"),
+    ).filter(
+        AnnualMandate.employer_code.in_(codes_to_include),
+        AnnualMandate.is_deleted == False,
+    ).group_by(AnnualMandate.fiscal_year)
+    df_mandates = pd.read_sql(mandates_query.statement, db.bind)
+
+    deposits_query = db.query(
+        DepositReceipt.fiscal_year.label("year"),
+        func.sum(DepositReceipt.deposit_amount).label("deposit_amount"),
+    ).filter(
+        DepositReceipt.employer_code.in_(codes_to_include),
+        DepositReceipt.is_deleted == False,
+    ).group_by(DepositReceipt.fiscal_year)
+    df_deposits = pd.read_sql(deposits_query.statement, db.bind)
+
+    payments_query = db.query(
+        Payment.funding_year.label("year"),
+        func.sum(Payment.amount).label("payment_amount"),
+    ).join(
+        Contract, Payment.contract_tracking_code == Contract.tracking_code
+    ).filter(
+        Contract.employer_code.in_(codes_to_include),
+        Payment.is_deleted == False,
+        Contract.is_deleted == False,
+    ).group_by(Payment.funding_year)
+    df_payments = pd.read_sql(payments_query.statement, db.bind)
+
+    transfers_in_query = db.query(
+        CreditTransfer.fiscal_year.label("year"),
+        func.sum(CreditTransfer.amount).label("transfer_in"),
+    ).filter(
+        CreditTransfer.destination_employer_code.in_(codes_to_include),
+        CreditTransfer.is_deleted == False,
+    ).group_by(CreditTransfer.fiscal_year)
+    df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
+
+    transfers_out_query = db.query(
+        CreditTransfer.fiscal_year.label("year"),
+        func.sum(CreditTransfer.amount).label("transfer_out"),
+    ).filter(
+        CreditTransfer.source_employer_code.in_(codes_to_include),
+        CreditTransfer.is_deleted == False,
+    ).group_by(CreditTransfer.fiscal_year)
+    df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
+
+    dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
+    df_merged = dfs[0]
+    for df in dfs[1:]:
+        df_merged = df_merged.merge(df, on="year", how="outer")
+    df_merged = df_merged.fillna(0)
+
+    df_merged["balance"] = (
+        df_merged["deposit_amount"]
+        + df_merged["transfer_in"]
+        - df_merged["payment_amount"]
+        - df_merged["transfer_out"]
+    )
+    df_merged = df_merged.sort_values("year")
+    return df_merged
+
+
+def render_kpi_card(year, mandated, adj_dep, adj_pay):
+    """Render a styled HTML KPI card for a single fiscal year."""
+    dep_pct = min(100, (adj_dep / mandated * 100) if mandated > 0 else 0)
+    pay_pct = min(100, (adj_pay / mandated * 100) if mandated > 0 else 0)
+
+    html_content = f"""
+    <div style="background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); direction: rtl; font-family: 'Vazirmatn', sans-serif;">
+        <h4 style="text-align: center; color: #111827;">سال {to_persian_numbers(int(year))}</h4>
+        <div style="font-size: 14px; margin-bottom: 10px;">اعتبار تکلیفی: {to_persian_numbers(int(mandated))}</div>
+        <div style="font-size: 14px; margin-bottom: 5px;">واریزی تعدیل‌شده: {to_persian_numbers(int(adj_dep))}</div>
+        <div style="background-color: #e5e7eb; border-radius: 4px; height: 8px; margin-bottom: 15px;">
+            <div style="width: {dep_pct}%; background-color: #10B981; height: 8px; border-radius: 4px;"></div>
+        </div>
+        <div style="font-size: 14px; margin-bottom: 5px;">هزینه‌کرد تعدیل‌شده: {to_persian_numbers(int(adj_pay))}</div>
+        <div style="background-color: #e5e7eb; border-radius: 4px; height: 8px;">
+            <div style="width: {pay_pct}%; background-color: #3B82F6; height: 8px; border-radius: 4px;"></div>
+        </div>
+    </div>
+    """
+    st.markdown(html_content, unsafe_allow_html=True)
+
+
+def to_persian_numbers(text):
+    """Convert English digits to Persian digits and format numbers with thousand separators."""
+    persian_digits = {
+        "0": "۰", "1": "۱", "2": "۲", "3": "۳", "4": "۴",
+        "5": "۵", "6": "۶", "7": "۷", "8": "۸", "9": "۹",
+    }
+    if isinstance(text, (int, float)):
+        text = f"{int(text):,}"
+    else:
+        text = str(text)
+    for eng, per in persian_digits.items():
+        text = text.replace(eng, per)
+    return text
+
+
+def get_active_employers(db: Session):
+    """Fetch all active employers for dropdown."""
+    return db.query(Employer).filter(
+        Employer.status == "Active",
+        Employer.is_deleted == False,
+    ).order_by(Employer.name).all()
+
+
+def to_excel(df: pd.DataFrame) -> bytes:
+    """Convert dataframe to Excel bytes for download."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Financial Report")
+    output.seek(0)
+    return output.getvalue()
+
+
+def add_adjusted_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["adjusted_deposits"] = df["deposit_amount"] + df["transfer_in"]
+    df["adjusted_payments"] = df["payment_amount"] + df["transfer_out"]
+    return df
+
+
+def convert_financials_to_millions(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    existing_financial_cols = [col for col in FINANCIAL_COLUMNS if col in df.columns]
+    df[existing_financial_cols] = df[existing_financial_cols] / 1_000_000
+    return df
+
+
+def million_rials_label():
+    st.markdown(
+        "<p style='text-align: center; font-size: 14px; color: gray;'>(ارقام بر حسب میلیون ریال)</p>",
+        unsafe_allow_html=True,
+    )
+
+
+def persian_tick_values(values, steps=5):
+    values = pd.Series(values).dropna()
+    if values.empty:
+        return [0], ["۰"]
+
+    min_value = min(0, float(values.min()))
+    max_value = max(0, float(values.max()))
+    if min_value == max_value:
+        return [0], ["۰"]
+
+    tickvals = [min_value + (max_value - min_value) * i / steps for i in range(steps + 1)]
+    ticktext = [to_persian_numbers(int(v)) for v in tickvals]
+    return tickvals, ticktext
+
+
+def render_yearly_kpi_cards(df: pd.DataFrame):
+    years = sorted(df["year"].unique())
+    kpi_cols = st.columns(len(years))
+
+    for idx, year in enumerate(years):
+        year_data = df[df["year"] == year].iloc[0]
+        with kpi_cols[idx]:
+            render_kpi_card(
+                year,
+                year_data["mandated_amount"],
+                year_data["adjusted_deposits"],
+                year_data["adjusted_payments"],
+            )
+
+
+def render_grouped_bar_chart(chart_data: pd.DataFrame):
+    chart_data = chart_data.sort_values("year")
+    years_persian = [to_persian_numbers(int(y)) for y in chart_data["year"]]
+    tickvals, ticktext = persian_tick_values(pd.concat([
+        chart_data["mandated_amount"],
+        chart_data["adjusted_deposits"],
+        chart_data["adjusted_payments"],
+    ]))
+
+    fig_grouped = go.Figure()
+    fig_grouped.add_trace(go.Bar(
+        x=years_persian,
+        y=chart_data["mandated_amount"],
+        name="اعتبار تکلیفی",
+        marker_color="#757575",
+        text=[to_persian_numbers(int(v)) for v in chart_data["mandated_amount"]],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=11),
+    ))
+    fig_grouped.add_trace(go.Bar(
+        x=years_persian,
+        y=chart_data["adjusted_deposits"],
+        name="واریزی تعدیل‌شده",
+        marker_color="#4CAF50",
+        text=[to_persian_numbers(int(v)) for v in chart_data["adjusted_deposits"]],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=11),
+    ))
+    fig_grouped.add_trace(go.Bar(
+        x=years_persian,
+        y=chart_data["adjusted_payments"],
+        name="هزینه تعدیل‌شده",
+        marker_color="#2196F3",
+        text=[to_persian_numbers(int(v)) for v in chart_data["adjusted_payments"]],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=11),
+    ))
+    fig_grouped.update_layout(
+        barmode="group",
+        font=dict(family="Vazirmatn", size=14),
+        title=dict(
+            text="مقایسه اعتبار تکلیفی، واریزی تعدیل‌شده و هزینه تعدیل‌شده",
+            x=0.5,
+            xanchor="center",
+            font=dict(family="Vazirmatn", size=18),
+        ),
+        title_font=dict(family="Vazirmatn"),
+        xaxis=dict(
+            title="سال مالی",
+            tickfont=dict(family="Vazirmatn", size=13),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        yaxis=dict(
+            title="مبلغ (میلیون ریال)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickfont=dict(family="Vazirmatn", size=12),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(family="Vazirmatn", size=13),
+        ),
+        legend_font=dict(family="Vazirmatn"),
+        height=600,
+        margin=dict(l=60, r=40, t=80, b=120),
+        plot_bgcolor="#f8f9fa",
+        paper_bgcolor="white",
+    )
+    st.plotly_chart(fig_grouped, use_container_width=True, theme=None)
+
+
+def render_waterfall_chart(chart_data: pd.DataFrame):
+    tot_dep = chart_data["adjusted_deposits"].sum()
+    tot_pay = chart_data["adjusted_payments"].sum()
+    tot_bal = chart_data["balance"].sum()
+
+    waterfall_labels = [" واریزی تعدیل‌شده", " هزینه تعدیل‌شده", " مانده واقعی"]
+    waterfall_values = [tot_dep, -tot_pay, tot_bal]
+    cumulative_values = [0, tot_dep, tot_dep - tot_pay, tot_bal]
+    tickvals, ticktext = persian_tick_values(cumulative_values)
+
+    fig_waterfall = go.Figure(go.Waterfall(
+        name="جریان منابع و مصارف",
+        orientation="v",
+        measure=["relative", "relative", "total"],
+        x=waterfall_labels,
+        y=waterfall_values,
+        text=[to_persian_numbers(int(v)) for v in waterfall_values],
+        textposition="outside",
+        textfont=dict(family="Vazirmatn", size=12),
+        connector=dict(line=dict(color="#9CA3AF")),
+        increasing=dict(marker=dict(color="#10B981")),
+        decreasing=dict(marker=dict(color="#EF4444")),
+        totals=dict(marker=dict(color="#3B82F6")),
+    ))
+    fig_waterfall.update_layout(
+        font=dict(family="Vazirmatn", size=14),
+        title=dict(
+            text="نمای تجمعی جریان منابع و مصارف",
+            x=0.5,
+            xanchor="center",
+            font=dict(family="Vazirmatn", size=18),
+        ),
+        title_font=dict(family="Vazirmatn"),
+        xaxis=dict(
+            tickfont=dict(family="Vazirmatn", size=13),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        yaxis=dict(
+            title="مبلغ (میلیون ریال)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickfont=dict(family="Vazirmatn", size=12),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(family="Vazirmatn", size=13),
+        ),
+        height=520,
+        margin=dict(l=60, r=40, t=80, b=120),
+        plot_bgcolor="#f8f9fa",
+        paper_bgcolor="white",
+    )
+    st.plotly_chart(fig_waterfall, use_container_width=True, theme=None)
+
+
+def render_detailed_table_and_download(df: pd.DataFrame, file_name: str):
+    st.subheader("📋 جدول تفصیلی به تفکیک سال")
+    million_rials_label()
+
+    df_display = df[DISPLAY_COLUMNS].copy().rename(columns=COLUMN_LABELS)
+    df_display[COLUMN_LABELS["year"]] = df_display[COLUMN_LABELS["year"]].apply(to_persian_numbers)
+    for col_key, col_label in COLUMN_LABELS.items():
+        if col_key != "year":
+            df_display[col_label] = df_display[col_label].apply(to_persian_numbers)
+
+    st.table(df_display)
+
+    df_excel = df[DISPLAY_COLUMNS].copy().rename(columns=COLUMN_LABELS)
+    st.download_button(
+        label="📥 دانلود گزارش به صورت اکسل",
+        data=to_excel(df_excel),
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def render_tab1(db: Session, employers):
+    employer_options = {emp.classification_code: f"{emp.name} ({emp.classification_code})" for emp in employers}
+    employer_keys = list(employer_options.keys())
+    default_index = employer_keys.index("231500") if "231500" in employer_keys else 0
+
+    selected_code = st.selectbox(
+        "انتخاب مشمول:",
+        options=employer_keys,
+        format_func=lambda x: employer_options[x],
+        index=default_index,
+    )
+
+    if not selected_code:
+        return
+
+    selected_employer = next(emp for emp in employers if emp.classification_code == selected_code)
+
+    st.subheader(f"اطلاعات مشمول: {selected_employer.name}")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.info(f"**کد طبقه‌بندی:** {selected_employer.classification_code}")
+    with col2:
+        st.info(f"**استان:** {selected_employer.province}")
+    with col3:
+        st.info(f"**سازمان بالادست:** {selected_employer.upper_organization}")
+
+    st.markdown("---")
+
+    with st.spinner("در حال بارگذاری اطلاعات مالی..."):
+        df = get_employer_financials(db, selected_code)
+
+    df = df[df["year"] >= 1402]
+    if df.empty:
+        st.warning("هیچ داده مالی برای این مشمول از سال ۱۴۰۲ به بعد یافت نشد.")
+        return
+
+    df = add_adjusted_columns(convert_financials_to_millions(df))
+
+    st.subheader("🔑 شاخص‌های کلیدی")
+    million_rials_label()
+    render_yearly_kpi_cards(df)
+
+    st.markdown("---")
+    render_detailed_table_and_download(df, f"financial_report_v2_{selected_code}.xlsx")
+
+    st.markdown("---")
+    st.subheader("📊 تحلیل و نمودار")
+    million_rials_label()
+    render_grouped_bar_chart(df)
+    render_waterfall_chart(df)
+
+
+def render_top10_employers_chart(df_all: pd.DataFrame):
+    st.markdown("### 📊 ۱۰ مشمول برتر بر اساس میزان واریزی")
+
+    top10 = df_all.groupby(
+        ["employer_code", "employer_name"], as_index=False
+    )["deposit_amount"].sum().nlargest(10, "deposit_amount")
+
+    tickvals, ticktext = persian_tick_values(top10["deposit_amount"])
+    fig_top10 = go.Figure(go.Bar(
+        x=top10["deposit_amount"],
+        y=top10["employer_name"],
+        orientation="h",
+        text=top10["deposit_amount"].apply(lambda v: to_persian_numbers(int(v))),
+        textposition="auto",
+        marker_color="#2196F3",
+        name="مجموع واریزی",
+    ))
+    fig_top10.update_layout(
+        font=dict(family="Vazirmatn", size=14),
+        xaxis=dict(
+            title="مبلغ واریزی (میلیون ریال)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickfont=dict(family="Vazirmatn", size=12),
+            title_font=dict(family="Vazirmatn"),
+        ),
+        yaxis=dict(
+            title="",
+            autorange="reversed",
+            tickfont=dict(family="Vazirmatn", size=12),
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.15,
+            xanchor="center",
+            x=0.5,
+            font=dict(family="Vazirmatn", size=13),
+        ),
+        height=500,
+        margin=dict(l=20, r=20, t=40, b=100),
+    )
+    st.plotly_chart(fig_top10, use_container_width=True, theme=None)
+
+
+def render_global_excel_download(df_all: pd.DataFrame):
+    df_export = df_all.copy().rename(columns={
+        "employer_code": "کد مشمول",
+        "employer_name": "نام مشمول",
+        "year": "سال مالی",
+        "mandated_amount": "اعتبار تکلیفی",
+        "deposit_amount": "مجموع واریزی",
+        "payment_amount": "هزینه کرد",
+        "transfer_in": "انتقال ورودی",
+        "transfer_out": "انتقال خروجی",
+        "balance": "مانده واقعی",
+    })
+
+    st.download_button(
+        label="📥 دانلود گزارش جامع کل مشمولین (اکسل)",
+        data=to_excel(df_export),
+        file_name="financial_report_all_employers.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def render_tab2(db: Session):
+    st.subheader("🏢 نمای کلان - خلاصه مدیریتی")
+
+    with st.spinner("در حال بارگذاری اطلاعات کلان..."):
+        df_all = get_all_employers_financials(db)
+
+    if df_all.empty:
+        st.warning("هیچ داده مالی در سیستم یافت نشد.")
+        return
+
+    df_all = df_all[df_all["year"] >= 1402]
+    if df_all.empty:
+        st.warning("هیچ داده مالی از سال ۱۴۰۲ به بعد یافت نشد.")
+        return
+
+    df_all = convert_financials_to_millions(df_all)
+    df_macro_yearly = df_all.groupby("year", as_index=False)[FINANCIAL_COLUMNS].sum()
+    df_macro_yearly = add_adjusted_columns(df_macro_yearly)
+
+    st.subheader("🔑 شاخص‌های کلیدی")
+    million_rials_label()
+    render_yearly_kpi_cards(df_macro_yearly)
+
+    st.markdown("---")
+    st.subheader("📊 تحلیل و نمودار")
+    million_rials_label()
+    render_grouped_bar_chart(df_macro_yearly)
+    render_waterfall_chart(df_macro_yearly)
+
+    st.markdown("---")
+    render_top10_employers_chart(df_all)
+
+    st.markdown("---")
+    render_global_excel_download(df_all)
+
+
+def main():
+    st.set_page_config(
+        page_title="داشبورد ساتع - نسخه یکپارچه",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # ─── Main Title ───
+    st.markdown("<h1 style='text-align: center;'>📊 داشبورد مدیریتی ساتع - تراز مشمولین</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>(داده‌های مالی از سال ۱۴۰۲)</h3>", unsafe_allow_html=True)
+
+    # ─── Aggressive CSS: Vazirmatn font + full RTL override ───
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    html, body, [class*="css"], * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        direction: rtl;
+        text-align: right;
+    }
+    h1, h2, h3, .stHeadingContainer { text-align: center !important; direction: rtl; }
+    table, th, td, .stTable, [data-testid="stTable"] * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        font-size: 15px !important;
+        text-align: center !important;
+        direction: rtl !important;
+    }
+    .stPlotlyChart, .js-plotly-plot, .plotly {
+        direction: ltr !important;
+    }
+    th { background-color: #f0f2f6 !important; border-bottom: 2px solid #4a4a4a !important; color: black !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    db = SessionLocal()
+    try:
+        employers = get_active_employers(db)
+        if not employers:
+            st.warning("هیچ مشمولی فعال در سیستم یافت نشد.")
+            return
+
+        tab1, tab2 = st.tabs(["ترازنامه مشمولین", "نمای کلان - Executive Summary"])
+        with tab1:
+            render_tab1(db, employers)
+        with tab2:
+            render_tab2(db)
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
+## File: dashboard\app_v2.py
+------------------------------
 import streamlit as st
 import pandas as pd
 import io
-from sqlalchemy import func, case
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 import sys
 import os
@@ -534,7 +1400,7 @@ import plotly.graph_objects as go
 # Add parent directory to path to import project modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.database import SessionLocal, engine
+from core.database import SessionLocal
 from models.employer import Employer
 from models.deposits import AnnualMandate, DepositReceipt
 from models.payment import Payment
@@ -543,26 +1409,17 @@ from models.transfer import CreditTransfer
 
 
 def to_persian_numbers(text):
-    """
-    Convert English digits to Persian digits and format numbers with thousand separators.
-    Handles strings, integers, floats, and already-formatted strings.
-    """
-    # Persian digit mapping
+    """Convert English digits to Persian digits and format numbers with thousand separators."""
     persian_digits = {
         '0': '۰', '1': '۱', '2': '۲', '3': '۳', '4': '۴',
         '5': '۵', '6': '۶', '7': '۷', '8': '۸', '9': '۹'
     }
-    
-    # If it's a number, format it first with commas
     if isinstance(text, (int, float)):
         text = f"{int(text):,}"
     else:
         text = str(text)
-    
-    # Replace English digits with Persian
     for eng, per in persian_digits.items():
         text = text.replace(eng, per)
-    
     return text
 
 
@@ -576,17 +1433,11 @@ def get_active_employers(db: Session):
 
 
 def get_employer_financials(db: Session, employer_code: str):
-    """
-    Fetch and aggregate financial data for a specific employer across all years.
-    Returns a DataFrame with columns for each financial metric by year.
-    """
-    
-    # Get the employer details to check if it's a Mother entity
+    """Fetch and aggregate financial data for a specific employer across all years."""
     employer = db.query(Employer).filter(Employer.classification_code == employer_code).first()
     if not employer:
         return pd.DataFrame()
-    
-    # Determine which codes to include (main + subsidiaries for Mother entities)
+
     if employer.employer_type == 'Mother':
         codes_to_include = [employer_code]
         subsidiaries = db.query(Employer.classification_code).filter(
@@ -596,8 +1447,7 @@ def get_employer_financials(db: Session, employer_code: str):
         codes_to_include.extend([s[0] for s in subsidiaries])
     else:
         codes_to_include = [employer_code]
-    
-    # 1. Get Annual Mandates
+
     mandates_query = db.query(
         AnnualMandate.fiscal_year.label('year'),
         func.sum(AnnualMandate.mandated_amount).label('mandated_amount')
@@ -605,10 +1455,8 @@ def get_employer_financials(db: Session, employer_code: str):
         AnnualMandate.employer_code.in_(codes_to_include),
         AnnualMandate.is_deleted == False
     ).group_by(AnnualMandate.fiscal_year)
-    
     df_mandates = pd.read_sql(mandates_query.statement, db.bind)
-    
-    # 2. Get Deposit Receipts
+
     deposits_query = db.query(
         DepositReceipt.fiscal_year.label('year'),
         func.sum(DepositReceipt.deposit_amount).label('deposit_amount')
@@ -616,10 +1464,8 @@ def get_employer_financials(db: Session, employer_code: str):
         DepositReceipt.employer_code.in_(codes_to_include),
         DepositReceipt.is_deleted == False
     ).group_by(DepositReceipt.fiscal_year)
-    
     df_deposits = pd.read_sql(deposits_query.statement, db.bind)
-    
-    # 3. Get Payments (via Contract relationship)
+
     payments_query = db.query(
         Payment.funding_year.label('year'),
         func.sum(Payment.amount).label('payment_amount')
@@ -630,10 +1476,8 @@ def get_employer_financials(db: Session, employer_code: str):
         Payment.is_deleted == False,
         Contract.is_deleted == False
     ).group_by(Payment.funding_year)
-    
     df_payments = pd.read_sql(payments_query.statement, db.bind)
-    
-    # 4. Get Transfers IN (where this employer is the destination)
+
     transfers_in_query = db.query(
         CreditTransfer.fiscal_year.label('year'),
         func.sum(CreditTransfer.amount).label('transfer_in')
@@ -641,10 +1485,8 @@ def get_employer_financials(db: Session, employer_code: str):
         CreditTransfer.destination_employer_code.in_(codes_to_include),
         CreditTransfer.is_deleted == False
     ).group_by(CreditTransfer.fiscal_year)
-    
     df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
-    
-    # 5. Get Transfers OUT (where this employer is the source)
+
     transfers_out_query = db.query(
         CreditTransfer.fiscal_year.label('year'),
         func.sum(CreditTransfer.amount).label('transfer_out')
@@ -652,467 +1494,378 @@ def get_employer_financials(db: Session, employer_code: str):
         CreditTransfer.source_employer_code.in_(codes_to_include),
         CreditTransfer.is_deleted == False
     ).group_by(CreditTransfer.fiscal_year)
-    
     df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
-    
-    # Merge all dataframes on year
+
     dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
     df_merged = dfs[0]
-    
     for df in dfs[1:]:
         df_merged = df_merged.merge(df, on='year', how='outer')
-    
-    # Fill NaN with 0
     df_merged = df_merged.fillna(0)
-    
-    # Sort by year
-    df_merged = df_merged.sort_values('year')
-    
-    # Calculate balance: (Deposits + Transfers IN) - (Payments + Transfers OUT)
+
     df_merged['balance'] = (
-        df_merged['deposit_amount'] + df_merged['transfer_in']
-    ) - (
-        df_merged['payment_amount'] + df_merged['transfer_out']
+        df_merged['deposit_amount'] +
+        df_merged['transfer_in'] -
+        df_merged['payment_amount'] -
+        df_merged['transfer_out']
     )
-    
+    df_merged = df_merged.sort_values('year')
     return df_merged
 
 
-def get_all_employers_financials(db: Session):
-    """
-    Fetch and aggregate financial data for ALL employers across ALL years.
-    Returns a DataFrame with one row per (employer, year) combination.
-    """
-    
-    # Get all active employers
-    employers = db.query(Employer).filter(
-        Employer.status == 'Active',
-        Employer.is_deleted == False
-    ).all()
-    
-    all_data = []
-    
-    for employer in employers:
-        employer_code = employer.classification_code
-        employer_name = employer.name
-        
-        # Determine which codes to include (main + subsidiaries for Mother entities)
-        if employer.employer_type == 'Mother':
-            codes_to_include = [employer_code]
-            subsidiaries = db.query(Employer.classification_code).filter(
-                Employer.parent_code == employer_code,
-                Employer.is_deleted == False
-            ).all()
-            codes_to_include.extend([s[0] for s in subsidiaries])
-        else:
-            codes_to_include = [employer_code]
-        
-        # Get Annual Mandates
-        mandates_query = db.query(
-            AnnualMandate.fiscal_year.label('year'),
-            func.sum(AnnualMandate.mandated_amount).label('mandated_amount')
-        ).filter(
-            AnnualMandate.employer_code.in_(codes_to_include),
-            AnnualMandate.is_deleted == False
-        ).group_by(AnnualMandate.fiscal_year)
-        
-        df_mandates = pd.read_sql(mandates_query.statement, db.bind)
-        df_mandates = df_mandates.reindex(columns=['year', 'mandated_amount']).fillna(0.0)
-        
-        # Get Deposit Receipts
-        deposits_query = db.query(
-            DepositReceipt.fiscal_year.label('year'),
-            func.sum(DepositReceipt.deposit_amount).label('deposit_amount')
-        ).filter(
-            DepositReceipt.employer_code.in_(codes_to_include),
-            DepositReceipt.is_deleted == False
-        ).group_by(DepositReceipt.fiscal_year)
-        
-        df_deposits = pd.read_sql(deposits_query.statement, db.bind)
-        df_deposits = df_deposits.reindex(columns=['year', 'deposit_amount']).fillna(0.0)
-        
-        # Get Payments
-        payments_query = db.query(
-            Payment.funding_year.label('year'),
-            func.sum(Payment.amount).label('payment_amount')
-        ).join(
-            Contract, Payment.contract_tracking_code == Contract.tracking_code
-        ).filter(
-            Contract.employer_code.in_(codes_to_include),
-            Payment.is_deleted == False,
-            Contract.is_deleted == False
-        ).group_by(Payment.funding_year)
-        
-        df_payments = pd.read_sql(payments_query.statement, db.bind)
-        df_payments = df_payments.reindex(columns=['year', 'payment_amount']).fillna(0.0)
-        
-        # Get Transfers IN
-        transfers_in_query = db.query(
-            CreditTransfer.fiscal_year.label('year'),
-            func.sum(CreditTransfer.amount).label('transfer_in')
-        ).filter(
-            CreditTransfer.destination_employer_code.in_(codes_to_include),
-            CreditTransfer.is_deleted == False
-        ).group_by(CreditTransfer.fiscal_year)
-        
-        df_transfers_in = pd.read_sql(transfers_in_query.statement, db.bind)
-        df_transfers_in = df_transfers_in.reindex(columns=['year', 'transfer_in']).fillna(0.0)
-        
-        # Get Transfers OUT
-        transfers_out_query = db.query(
-            CreditTransfer.fiscal_year.label('year'),
-            func.sum(CreditTransfer.amount).label('transfer_out')
-        ).filter(
-            CreditTransfer.source_employer_code.in_(codes_to_include),
-            CreditTransfer.is_deleted == False
-        ).group_by(CreditTransfer.fiscal_year)
-        
-        df_transfers_out = pd.read_sql(transfers_out_query.statement, db.bind)
-        df_transfers_out = df_transfers_out.reindex(columns=['year', 'transfer_out']).fillna(0.0)
-        
-        # Merge all dataframes (each has explicit columns, so outer merge is safe)
-        dfs = [df_mandates, df_deposits, df_payments, df_transfers_in, df_transfers_out]
-        df_merged = dfs[0]
-        
-        for df in dfs[1:]:
-            df_merged = df_merged.merge(df, on='year', how='outer')
-        
-        # Fill NaN with 0 (infer_objects(copy=False) avoids FutureWarning on downcasting)
-        df_merged = df_merged.fillna(0).infer_objects(copy=False)
-        
-        # Add employer info
-        df_merged['employer_code'] = employer_code
-        df_merged['employer_name'] = employer_name
-        
-        # Safety check: ensure all required columns exist before calculating balance
-        required_cols = ['mandated_amount', 'deposit_amount', 'payment_amount', 'transfer_in', 'transfer_out']
-        for col in required_cols:
-            if col not in df_merged.columns:
-                df_merged[col] = 0.0
-        
-        # Calculate balance
-        df_merged['balance'] = (
-            df_merged['mandated_amount'] + df_merged['deposit_amount'] + df_merged['transfer_in']
-        ) - (
-            df_merged['payment_amount'] + df_merged['transfer_out']
-        )
-        
-        all_data.append(df_merged)
-    
-    # Concatenate all employers
-    if all_data:
-        df_all = pd.concat(all_data, ignore_index=True)
-        # Reorder columns
-        df_all = df_all[['employer_code', 'employer_name', 'year', 'mandated_amount', 
-                         'deposit_amount', 'payment_amount', 'transfer_in', 
-                         'transfer_out', 'balance']]
-        return df_all
-    else:
-        return pd.DataFrame()
+def format_million_value(value) -> str:
+    """Format a million-scale amount with commas and Persian digits."""
+    return to_persian_numbers(round(value))
 
 
-def format_number(value):
-    """Format numbers with comma separators and no decimals (kept for raw data)."""
-    try:
-        return f"{int(value):,}"
-    except (ValueError, TypeError):
-        return "0"
+def render_kpi_card(year, mandated, adj_dep, adj_pay):
+    """Render a styled HTML KPI card for a single fiscal year."""
+    dep_pct = min(100, (adj_dep / mandated * 100) if mandated > 0 else 0)
+    pay_pct = min(100, (adj_pay / mandated * 100) if mandated > 0 else 0)
+
+    html_content = f'''
+    <div style="background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); direction: rtl; font-family: 'Vazirmatn', sans-serif;">
+        <h4 style="text-align: center; color: #111827;">سال {to_persian_numbers(int(year))}</h4>
+        <div style="font-size: 14px; margin-bottom: 10px;">اعتبار تکلیفی: {to_persian_numbers(int(mandated))}</div>
+        <div style="font-size: 14px; margin-bottom: 5px;">واریزی تعدیل‌شده: {to_persian_numbers(int(adj_dep))}</div>
+        <div style="background-color: #e5e7eb; border-radius: 4px; height: 8px; margin-bottom: 15px;">
+            <div style="width: {dep_pct}%; background-color: #10B981; height: 8px; border-radius: 4px;"></div>
+        </div>
+        <div style="font-size: 14px; margin-bottom: 5px;">هزینه‌کرد تعدیل‌شده: {to_persian_numbers(int(adj_pay))}</div>
+        <div style="background-color: #e5e7eb; border-radius: 4px; height: 8px;">
+            <div style="width: {pay_pct}%; background-color: #3B82F6; height: 8px; border-radius: 4px;"></div>
+        </div>
+    </div>
+    '''
+    st.markdown(html_content, unsafe_allow_html=True)
 
 
-def to_excel(df):
-    """
-    Write a DataFrame to a BytesIO buffer as an Excel file and return the bytes.
-    This uses the raw numeric DataFrame before Persian digit conversion.
-    """
-    buffer = io.BytesIO()
-    df.to_excel(buffer, index=False, engine='openpyxl')
-    return buffer.getvalue()
+def to_excel(df: pd.DataFrame) -> bytes:
+    """Convert dataframe to Excel bytes for download."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Financial Report')
+    output.seek(0)
+    return output.getvalue()
 
 
 def main():
     st.set_page_config(
-        page_title="\u062f\u0627\u0634\u0628\u0648\u0631\u062f \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0633\u0627\u062a\u0639",
+        page_title="داشبورد ساتع - نسخه پیشرفته",
+        page_icon="📊",
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
-    # Inject CSS for Persian font (Vazirmatn), RTL layout, centered title & table styling
+
+    # ─── Main Title ───
+    st.markdown("<h1 style='text-align: center;'>📊 داشبورد مدیریتی ساتع - تراز مشمولین</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>(داده‌های مالی از سال ۱۴۰۲)</h3>", unsafe_allow_html=True)
+
+    # ─── Aggressive CSS: Vazirmatn font + full RTL override ───
     st.markdown("""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
-
-        html, body, [class*="css"], * {
-            font-family: 'Vazirmatn', sans-serif !important;
-            direction: rtl;
-            text-align: right;
-        }
-
-        h1, .stHeadingContainer {
-            text-align: center !important;
-            direction: rtl;
-        }
-
-        table, th, td, [data-testid="stTable"] {
-            font-family: 'Vazirmatn', sans-serif !important;
-            font-size: 16px !important;
-            text-align: center !important;
-            direction: rtl;
-        }
-
-        th {
-            background-color: #f0f2f6 !important;
-            border-bottom: 2px solid #4a4a4a !important;
-            font-weight: 700 !important;
-        }
-        </style>
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    html, body, [class*="css"], * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        direction: rtl;
+        text-align: right;
+    }
+    h1, h2, h3, .stHeadingContainer { text-align: center !important; direction: rtl; }
+    table, th, td, .stTable, [data-testid="stTable"] * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        font-size: 15px !important;
+        text-align: center !important;
+        direction: rtl !important;
+    }
+    .stPlotlyChart, .js-plotly-plot, .plotly {
+        direction: ltr !important;
+    }
+    th { background-color: #f0f2f6 !important; border-bottom: 2px solid #4a4a4a !important; color: black !important; }
+    </style>
     """, unsafe_allow_html=True)
-    
-    st.title("\U0001f4ca \u062f\u0627\u0634\u0628\u0648\u0631\u062f \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0633\u0627\u062a\u0639 - \u062a\u0631\u0627\u0632\u0646\u0627\u0645\u0647 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646")
+
     st.markdown("---")
-    
-    # Initialize database session
+
     db = SessionLocal()
-    
+
     try:
-        # Get active employers for dropdown
         employers = get_active_employers(db)
-        
+
         if not employers:
-            st.warning("\u0647\u06cc\u0686 \u0645\u0634\u0645\u0648\u0644\u06cc \u0641\u0639\u0627\u0644 \u062f\u0631 \u0633\u06cc\u0633\u062a\u0645 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
+            st.warning("هیچ مشمولی فعال در سیستم یافت نشد.")
             return
-        
-        # Create tabs
-        tab1, tab2 = st.tabs(['\u062a\u0631\u0627\u0632\u0646\u0627\u0645\u0647 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646', '\u0646\u0645\u0627\u06cc \u06a9\u0644\u0627\u0646 (Executive Summary)'])
-        
-        # ─── Tab 1: Employer-Specific View ───
-        with tab1:
-            # Create employer selection dropdown
-            employer_options = {emp.classification_code: f"{emp.name} ({emp.classification_code})" for emp in employers}
 
-            # Default to employer with classification_code '231500', fallback to 0
-            default_index = 0
-            employer_keys = list(employer_options.keys())
-            if '231500' in employer_keys:
-                default_index = employer_keys.index('231500')
+        # ─── Employer Selection ───
+        employer_options = {emp.classification_code: f"{emp.name} ({emp.classification_code})" for emp in employers}
+        employer_keys = list(employer_options.keys())
 
-            selected_code = st.selectbox(
-                "\u0627\u0646\u062a\u062e\u0627\u0628 \u0645\u0634\u0645\u0648\u0644:",
-                options=employer_keys,
-                format_func=lambda x: employer_options[x],
-                index=default_index
-            )
-            
-            if selected_code:
-                # Get selected employer details
-                selected_employer = next(emp for emp in employers if emp.classification_code == selected_code)
-                
-                # Display employer info
-                st.subheader(f"\u0627\u0637\u0644\u0627\u0639\u0627\u062a \u0645\u0634\u0645\u0648\u0644: {selected_employer.name}")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.info(f"**\u06a9\u062f \u0637\u0628\u0642\u0647\u200c\u0628\u0646\u062f\u06cc:** {selected_employer.classification_code}")
-                with col2:
-                    st.info(f"**\u0627\u0633\u062a\u0627\u0646:** {selected_employer.province}")
-                with col3:
-                    st.info(f"**\u0633\u0627\u0632\u0645\u0627\u0646 \u0628\u0627\u0644\u0627\u062f\u0633\u062a:** {selected_employer.upper_organization}")
-                
-                st.markdown("---")
-                
-                # Fetch financial data
-                with st.spinner("\u062f\u0631 \u062d\u0627\u0644 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0627\u0637\u0644\u0627\u0639\u0627\u062a \u0645\u0627\u0644\u06cc..."):
-                    df = get_employer_financials(db, selected_code)
-                
-                if df.empty:
-                    st.warning("\u0647\u06cc\u0686 \u062f\u0627\u062f\u0647 \u0645\u0627\u0644\u06cc \u0628\u0631\u0627\u06cc \u0627\u06cc\u0646 \u0645\u0634\u0645\u0648\u0644 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
-                else:
-                    # Calculate totals for KPIs
-                    total_mandated = df['mandated_amount'].sum()
-                    total_deposits = df['deposit_amount'].sum()
-                    total_payments = df['payment_amount'].sum()
-                    total_transfer_in = df['transfer_in'].sum()
-                    total_transfer_out = df['transfer_out'].sum()
-                    total_balance = df['balance'].sum()
-                    
-                    # Display KPI metrics with Persian numbers
-                    st.subheader("\U0001f511 \u0634\u0627\u062e\u0635\u200c\u0647\u0627\u06cc \u06a9\u0644\u06cc\u062f\u06cc")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc (\u06a9\u0644)", to_persian_numbers(total_mandated))
-                        st.metric("\u0648\u0627\u0631\u06cc\u0632\u06cc (\u06a9\u0644)", to_persian_numbers(total_deposits))
-                    with col2:
-                        st.metric("\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f (\u06a9\u0644)", to_persian_numbers(total_payments))
-                        st.metric("\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc (\u06a9\u0644)", to_persian_numbers(total_transfer_in))
-                    with col3:
-                        st.metric("\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc (\u06a9\u0644)", to_persian_numbers(total_transfer_out))
-                        st.metric("\u0645\u0627\u0646\u062f\u0647 \u0646\u0647\u0627\u06cc\u06cc (\u06a9\u0644)", to_persian_numbers(total_balance))
-                    
-                    st.markdown("---")
-                    st.subheader("\U0001f4cb \u062c\u062f\u0648\u0644 \u062a\u0641\u0635\u06cc\u0644\u06cc \u0628\u0647 \u062a\u0641\u06a9\u06cc\u06a9 \u0633\u0627\u0644")
-                    
-                    # Prepare display DataFrame with Persian digits
-                    df_display = df.copy()
-                    df_display = df_display.rename(columns={
-                        'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                        'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
-                        'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
-                        'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
-                        'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
-                        'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
-                        'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
-                    })
-                    
-                    # Apply Persian numbers to all columns
-                    for col in ['\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc']:
-                        df_display[col] = df_display[col].apply(to_persian_numbers)
-                        
-                    for col in ['\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc', '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc', '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f', '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc', '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc', '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc']:
-                        df_display[col] = df_display[col].apply(to_persian_numbers)
-                    
-                    # Display the table (using st.table for proper CSS styling)
-                    st.table(df_display)
-                    
-                    # Excel download button (uses raw df with English digits for Excel compatibility)
-                    df_excel = df.copy()
-                    df_excel = df_excel.rename(columns={
-                        'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                        'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
-                        'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
-                        'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
-                        'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
-                        'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
-                        'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
-                    })
-                    
-                    st.download_button(
-                        label="\U0001f4e5 \u062f\u0627\u0646\u0644\u0648\u062f \u06af\u0632\u0627\u0631\u0634 \u0628\u0647 \u0635\u0648\u0631\u062a \u0627\u06a9\u0633\u0644",
-                        data=to_excel(df_excel),
-                        file_name=f"financial_report_{selected_code}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                    
-                    # Additional analysis
-                    st.markdown("---")
-                    st.subheader("\U0001f4ca \u062a\u062d\u0644\u06cc\u0644 \u0648 \u0646\u0645\u0648\u062f\u0627\u0631")
-                    
-                    # Create a chart showing deposits vs payments over years with Persian font
-                    chart_data = df[['year', 'deposit_amount', 'payment_amount', 'balance']].copy()
-                    
-                    fig = go.Figure()
-                    
-                    fig.add_trace(go.Scatter(
-                        x=chart_data['year'],
-                        y=chart_data['deposit_amount'],
-                        mode='lines+markers',
-                        name='\u0648\u0627\u0631\u06cc\u0632\u06cc',
-                        line=dict(color='green', width=2)
-                    ))
-                    
-                    fig.add_trace(go.Scatter(
-                        x=chart_data['year'],
-                        y=chart_data['payment_amount'],
-                        mode='lines+markers',
-                        name='\u0647\u0632\u06cc\u0646\u0647',
-                        line=dict(color='red', width=2)
-                    ))
-                    
-                    fig.add_trace(go.Scatter(
-                        x=chart_data['year'],
-                        y=chart_data['balance'],
-                        mode='lines+markers',
-                        name='\u0645\u0627\u0646\u062f\u0647',
-                        line=dict(color='blue', width=2)
-                    ))
-                    
-                    fig.update_layout(
-                        font=dict(family='Vazirmatn', size=14),
-                        xaxis_title='\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                        yaxis_title='\u0645\u0628\u0644\u063a (\u0631\u06cc\u0627\u0644)',
-                        hovermode='x unified',
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-        
-        # ─── Tab 2: Executive Summary (Macro View) ───
-        with tab2:
-            st.subheader("\U0001f3e2 \u0646\u0645\u0627\u06cc \u06a9\u0644\u0627\u0646 - \u062e\u0644\u0627\u0635\u0647 \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc")
-            
-            with st.spinner("\u062f\u0631 \u062d\u0627\u0644 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0627\u0637\u0644\u0627\u0639\u0627\u062a \u06a9\u0644\u0627\u0646..."):
-                df_all = get_all_employers_financials(db)
-            
-            if df_all.empty:
-                st.warning("\u0647\u06cc\u0686 \u062f\u0627\u062f\u0647 \u0645\u0627\u0644\u06cc \u062f\u0631 \u0633\u06cc\u0633\u062a\u0645 \u06cc\u0627\u0641\u062a \u0646\u0634\u062f.")
+        default_index = 0
+        if '231500' in employer_keys:
+            default_index = employer_keys.index('231500')
+
+        selected_code = st.selectbox(
+            "انتخاب مشمول:",
+            options=employer_keys,
+            format_func=lambda x: employer_options[x],
+            index=default_index
+        )
+
+        if selected_code:
+            selected_employer = next(emp for emp in employers if emp.classification_code == selected_code)
+
+            # Employer info
+            st.subheader(f"اطلاعات مشمول: {selected_employer.name}")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.info(f"**کد طبقه‌بندی:** {selected_employer.classification_code}")
+            with col2:
+                st.info(f"**استان:** {selected_employer.province}")
+            with col3:
+                st.info(f"**سازمان بالادست:** {selected_employer.upper_organization}")
+
+            st.markdown("---")
+
+            # Fetch data
+            with st.spinner("در حال بارگذاری اطلاعات مالی..."):
+                df = get_employer_financials(db, selected_code)
+
+            # Filter: year >= 1402
+            df = df[df['year'] >= 1402]
+
+            if df.empty:
+                st.warning("هیچ داده مالی برای این مشمول از سال ۱۴۰۲ به بعد یافت نشد.")
             else:
-                # ── Global KPIs ──
-                grand_mandated = df_all['mandated_amount'].sum()
-                grand_deposits = df_all['deposit_amount'].sum()
-                grand_payments = df_all['payment_amount'].sum()
-                grand_balance = df_all['balance'].sum()
-                
-                st.markdown("### \U0001f511 \u0634\u0627\u062e\u0635\u200c\u0647\u0627\u06cc \u06a9\u0644\u06cc\u062f\u06cc \u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_mandated))
-                with col2:
-                    st.metric("\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_deposits))
-                with col3:
-                    st.metric("\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_payments))
-                with col4:
-                    st.metric("\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc (\u06a9\u0644 \u0633\u06cc\u0633\u062a\u0645)", to_persian_numbers(grand_balance))
-                
-                st.markdown("---")
-                
-                # ── Top 10 Employers by Deposit Amount ──
-                st.markdown("### \U0001f4ca \u06f1\u06f0 \u0645\u0634\u0645\u0648\u0644 \u0628\u0631\u062a\u0631 \u0628\u0631 \u0627\u0633\u0627\u0633 \u0645\u06cc\u0632\u0627\u0646 \u0648\u0627\u0631\u06cc\u0632\u06cc")
-                
-                top10 = df_all.groupby(
-                    ['employer_code', 'employer_name'], as_index=False
-                )['deposit_amount'].sum().nlargest(10, 'deposit_amount')
-                
-                fig_top10 = go.Figure(go.Bar(
-                    x=top10['deposit_amount'],
-                    y=top10['employer_name'],
-                    orientation='h',
-                    text=top10['deposit_amount'].apply(lambda v: to_persian_numbers(int(v))),
-                    textposition='auto',
-                    marker_color='#2196F3'
-                ))
-                
-                fig_top10.update_layout(
-                    font=dict(family='Vazirmatn', size=14),
-                    xaxis_title='\u0645\u0628\u0644\u063a \u0648\u0627\u0631\u06cc\u0632\u06cc (\u0631\u06cc\u0627\u0644)',
-                    yaxis_title='',
-                    yaxis=dict(autorange='reversed'),
-                    height=500,
-                    margin=dict(l=20, r=20, t=40, b=40)
+                # Convert to millions
+                financial_cols = [
+                    'mandated_amount', 'deposit_amount', 'payment_amount',
+                    'transfer_in', 'transfer_out', 'balance'
+                ]
+                df[financial_cols] = df[financial_cols] / 1_000_000
+
+                # Visualization-only adjusted columns
+                df['adjusted_deposits'] = df['deposit_amount'] + df['transfer_in']
+                df['adjusted_payments'] = df['payment_amount'] + df['transfer_out']
+
+                # ─── KPIs: HTML Cards per Year ───
+                st.subheader("🔑 شاخص‌های کلیدی")
+                st.markdown(
+                    "<p style='text-align: center; font-size: 14px; color: gray;'>(ارقام بر حسب میلیون ریال)</p>",
+                    unsafe_allow_html=True
                 )
-                
-                st.plotly_chart(fig_top10, use_container_width=True)
-                
+
+                years = sorted(df['year'].unique())
+                kpi_cols = st.columns(len(years))
+
+                for idx, year in enumerate(years):
+                    year_data = df[df['year'] == year].iloc[0]
+                    mandated = year_data['mandated_amount']
+                    adj_dep = year_data['adjusted_deposits']
+                    adj_pay = year_data['adjusted_payments']
+
+                    with kpi_cols[idx]:
+                        render_kpi_card(year, mandated, adj_dep, adj_pay)
+
                 st.markdown("---")
-                
-                # ── Global Excel Export ──
-                df_export = df_all.copy()
-                df_export = df_export.rename(columns={
-                    'employer_code': '\u06a9\u062f \u0645\u0634\u0645\u0648\u0644',
-                    'employer_name': '\u0646\u0627\u0645 \u0645\u0634\u0645\u0648\u0644',
-                    'year': '\u0633\u0627\u0644 \u0645\u0627\u0644\u06cc',
-                    'mandated_amount': '\u0627\u0639\u062a\u0628\u0627\u0631 \u062a\u06a9\u0644\u06cc\u0641\u06cc',
-                    'deposit_amount': '\u0645\u062c\u0645\u0648\u0639 \u0648\u0627\u0631\u06cc\u0632\u06cc',
-                    'payment_amount': '\u0647\u0632\u06cc\u0646\u0647 \u06a9\u0631\u062f',
-                    'transfer_in': '\u0627\u0646\u062a\u0642\u0627\u0644 \u0648\u0631\u0648\u062f\u06cc',
-                    'transfer_out': '\u0627\u0646\u062a\u0642\u0627\u0644 \u062e\u0631\u0648\u062c\u06cc',
-                    'balance': '\u0645\u0627\u0646\u062f\u0647 \u0648\u0627\u0642\u0639\u06cc'
-                })
-                
+
+                # ─── Detailed Table ───
+                st.subheader("📋 جدول تفصیلی به تفکیک سال")
+                st.markdown(
+                    "<p style='text-align: center; font-size: 14px; color: gray;'>(ارقام بر حسب میلیون ریال)</p>",
+                    unsafe_allow_html=True
+                )
+
+                transfer_out_label = 'انتقال مانده طی اصلاحیه تبصره 2 ماده 5'
+                column_labels = {
+                    'year': 'سال مالی',
+                    'mandated_amount': 'اعتبار تکلیفی',
+                    'deposit_amount': 'مجموع واریزی',
+                    'payment_amount': 'هزینه کرد',
+                    'transfer_in': 'انتقال ورودی',
+                    'transfer_out': transfer_out_label,
+                    'balance': 'مانده واقعی'
+                }
+                display_cols = [
+                    'year', 'mandated_amount', 'deposit_amount',
+                    'payment_amount', 'transfer_in', 'transfer_out', 'balance'
+                ]
+
+                df_display = df[display_cols].copy().rename(columns=column_labels)
+                df_display[column_labels['year']] = df_display[column_labels['year']].apply(to_persian_numbers)
+                for col_key, col_label in column_labels.items():
+                    if col_key != 'year':
+                        df_display[col_label] = df_display[col_label].apply(to_persian_numbers)
+
+                st.table(df_display)
+
+                # Excel export (no adjusted columns)
+                df_excel = df[display_cols].copy().rename(columns=column_labels)
                 st.download_button(
-                    label="\U0001f4e5 \u062f\u0627\u0646\u0644\u0648\u062f \u06af\u0632\u0627\u0631\u0634 \u062c\u0627\u0645\u0639 \u06a9\u0644 \u0645\u0634\u0645\u0648\u0644\u06cc\u0646 (\u0627\u06a9\u0633\u0644)",
-                    data=to_excel(df_export),
-                    file_name="financial_report_all_employers.xlsx",
+                    label="📥 دانلود گزارش به صورت اکسل",
+                    data=to_excel(df_excel),
+                    file_name=f"financial_report_v2_{selected_code}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            
+
+                st.markdown("---")
+
+                # ─── Advanced Analytics: Grouped Bar Chart ───
+                st.subheader("📊 تحلیل و نمودار")
+                st.markdown(
+                    "<p style='text-align: center; font-size: 14px; color: gray;'>(ارقام بر حسب میلیون ریال)</p>",
+                    unsafe_allow_html=True
+                )
+
+                chart_data = df.sort_values('year')
+                years_persian = [to_persian_numbers(int(y)) for y in chart_data['year']]
+
+                grouped_max_value = max(
+                    chart_data['mandated_amount'].max(),
+                    chart_data['adjusted_deposits'].max(),
+                    chart_data['adjusted_payments'].max(),
+                    0
+                )
+                grouped_tickvals = [grouped_max_value * i / 5 for i in range(6)] if grouped_max_value > 0 else [0]
+                grouped_ticktext = [to_persian_numbers(int(v)) for v in grouped_tickvals]
+
+                fig_grouped = go.Figure()
+
+                fig_grouped.add_trace(go.Bar(
+                    x=years_persian,
+                    y=chart_data['mandated_amount'],
+                    name='اعتبار تکلیفی',
+                    marker_color='#757575',
+                    text=[to_persian_numbers(int(v)) for v in chart_data['mandated_amount']],
+                    textposition='outside',
+                    textfont=dict(family='Vazirmatn', size=11)
+                ))
+
+                fig_grouped.add_trace(go.Bar(
+                    x=years_persian,
+                    y=chart_data['adjusted_deposits'],
+                    name='واریزی تعدیل‌شده',
+                    marker_color='#4CAF50',
+                    text=[to_persian_numbers(int(v)) for v in chart_data['adjusted_deposits']],
+                    textposition='outside',
+                    textfont=dict(family='Vazirmatn', size=11)
+                ))
+
+                fig_grouped.add_trace(go.Bar(
+                    x=years_persian,
+                    y=chart_data['adjusted_payments'],
+                    name='هزینه تعدیل‌شده',
+                    marker_color='#2196F3',
+                    text=[to_persian_numbers(int(v)) for v in chart_data['adjusted_payments']],
+                    textposition='outside',
+                    textfont=dict(family='Vazirmatn', size=11)
+                ))
+
+                fig_grouped.update_layout(
+                    barmode='group',
+                    font=dict(family='Vazirmatn', size=14),
+                    title=dict(
+                        text='مقایسه اعتبار تکلیفی، واریزی تعدیل‌شده و هزینه تعدیل‌شده',
+                        x=0.5,
+                        xanchor='center',
+                        font=dict(family='Vazirmatn', size=18)
+                    ),
+                    title_font=dict(family='Vazirmatn'),
+                    xaxis=dict(
+                        title='سال مالی',
+                        tickfont=dict(family='Vazirmatn', size=13),
+                        title_font=dict(family='Vazirmatn')
+                    ),
+                    yaxis=dict(
+                        title='مبلغ (میلیون ریال)',
+                        tickmode='array',
+                        tickvals=grouped_tickvals,
+                        ticktext=grouped_ticktext,
+                        tickfont=dict(family='Vazirmatn', size=12),
+                        title_font=dict(family='Vazirmatn')
+                    ),
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.15,
+                        xanchor='center',
+                        x=0.5,
+                        font=dict(family='Vazirmatn', size=13)
+                    ),
+                    legend_font=dict(family='Vazirmatn'),
+                    height=600,
+                    margin=dict(l=60, r=40, t=80, b=120),
+                    plot_bgcolor='#f8f9fa',
+                    paper_bgcolor='white'
+                )
+
+                st.plotly_chart(fig_grouped, use_container_width=True, theme=None)
+
+                # ─── Cumulative Flow: Waterfall Chart ───
+                tot_dep = chart_data['adjusted_deposits'].sum()
+                tot_pay = chart_data['adjusted_payments'].sum()
+                tot_bal = chart_data['balance'].sum()
+
+                waterfall_labels = [
+                    ' واریزی تعدیل‌شده',
+                    ' هزینه تعدیل‌شده',
+                    ' مانده واقعی'
+                ]
+                waterfall_values = [tot_dep, -tot_pay, tot_bal]
+
+                waterfall_max_value = max(tot_dep, tot_pay, abs(tot_bal), 0)
+                waterfall_tickvals = [waterfall_max_value * i / 5 for i in range(6)] if waterfall_max_value > 0 else [0]
+                waterfall_ticktext = [to_persian_numbers(int(v)) for v in waterfall_tickvals]
+
+                fig_waterfall = go.Figure(go.Waterfall(
+                    orientation='v',
+                    measure=['relative', 'relative', 'total'],
+                    x=waterfall_labels,
+                    y=waterfall_values,
+                    text=[to_persian_numbers(int(v)) for v in waterfall_values],
+                    textposition='outside',
+                    textfont=dict(family='Vazirmatn', size=12),
+                    connector=dict(line=dict(color='#9CA3AF')),
+                    increasing=dict(marker=dict(color='#10B981')),
+                    decreasing=dict(marker=dict(color='#EF4444')),
+                    totals=dict(marker=dict(color='#3B82F6'))
+                ))
+
+                fig_waterfall.update_layout(
+                    font=dict(family='Vazirmatn', size=14),
+                    title=dict(
+                        text='نمای تجمعی جریان منابع و مصارف',
+                        x=0.5,
+                        xanchor='center',
+                        font=dict(family='Vazirmatn', size=18)
+                    ),
+                    title_font=dict(family='Vazirmatn'),
+                    xaxis=dict(
+                        tickfont=dict(family='Vazirmatn', size=13),
+                        title_font=dict(family='Vazirmatn')
+                    ),
+                    yaxis=dict(
+                        title='مبلغ (میلیون ریال)',
+                        tickmode='array',
+                        tickvals=waterfall_tickvals,
+                        ticktext=waterfall_ticktext,
+                        tickfont=dict(family='Vazirmatn', size=12),
+                        title_font=dict(family='Vazirmatn')
+                    ),
+                    showlegend=True,
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.15,
+                        xanchor='center',
+                        x=0.5,
+                        font=dict(family='Vazirmatn', size=13)
+                    ),
+                    height=520,
+                    margin=dict(l=60, r=40, t=80, b=120),
+                    plot_bgcolor='#f8f9fa',
+                    paper_bgcolor='white'
+                )
+
+                st.plotly_chart(fig_waterfall, use_container_width=True, theme=None)
+
     finally:
         db.close()
 
@@ -1918,6 +2671,39 @@ class University(SoftDeleteMixin, Base):
         return f"<University(national_id='{self.national_id}', name='{self.name}')>"
 
 
+## File: schemas\contract_schema.py
+------------------------------
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class ContractSearchResult(BaseModel):
+    """
+    Single contract match returned by the contract search (auto-fill) endpoint.
+    """
+    contract_tracking_code: str = Field(..., description="The contract tracking code")
+    title: str = Field(..., description="The contract title")
+    employer_name: Optional[str] = Field(None, description="Name of the linked employer")
+    employer_classification_code: Optional[str] = Field(
+        None, description="Classification code of the linked employer"
+    )
+    university_name: Optional[str] = Field(None, description="Name of the executing university")
+    researcher_name: Optional[str] = Field(None, description="Full name of the researcher")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "contract_tracking_code": "CNT-1403-001",
+                "title": "\u067e\u0631\u0648\u0698\u0647 \u067e\u0698\u0648\u0647\u0634\u06cc \u0646\u0645\u0648\u0646\u0647",
+                "employer_name": "\u0648\u0632\u0627\u0631\u062a \u0646\u0645\u0648\u0646\u0647",
+                "employer_classification_code": "EMP001",
+                "university_name": "\u062f\u0627\u0646\u0634\u06af\u0627\u0647 \u0646\u0645\u0648\u0646\u0647",
+                "researcher_name": "\u0639\u0644\u06cc \u0631\u0636\u0627\u06cc\u06cc",
+            }
+        }
+
+
 ## File: schemas\employer_schema.py
 ------------------------------
 from pydantic import BaseModel, Field
@@ -1928,10 +2714,18 @@ import jdatetime
 class BalanceResponse(BaseModel):
     """
     Response schema for employer balance inquiry.
+
+    Balance formula: (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
     """
     employer_code: str = Field(..., description="The employer's classification code")
     funding_year: int = Field(..., description="The funding year (fiscal year) for the balance calculation")
-    total_balance: float = Field(..., description="The calculated real balance (deposits - payments)")
+    total_balance: float = Field(
+        ...,
+        description=(
+            "The calculated real balance: "
+            "(Total Deposits + Transfers In) - (Total Payments + Transfers Out)"
+        ),
+    )
     inquiry_date_jalali: str = Field(..., description="Current date in Persian/Jalali calendar format")
 
     class Config:
@@ -1956,8 +2750,10 @@ class BalanceResponse(BaseModel):
 
 ## File: schemas\payment_schema.py
 ------------------------------
+from datetime import date
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
-from typing import Optional
 
 
 class PaymentValidationRequest(BaseModel):
@@ -2000,6 +2796,96 @@ class PaymentValidationResponse(BaseModel):
                 "warning_message": None
             }
         }
+
+
+class PaymentBatchValidationRequest(BaseModel):
+    """
+    Request schema for validating a single drafted (cart) payment.
+
+    The `pending_cart_amount` represents the sum of other drafted payments that
+    target the SAME employer inside the frontend's temporary cart. It is
+    subtracted from the current database balance so that the available balance
+    reflects funds already reserved by not-yet-submitted drafts.
+    """
+    contract_tracking_code: str = Field(..., description="The contract tracking code linked to the payment")
+    amount: float = Field(..., description="The payment amount to be validated", gt=0)
+    funding_year: int = Field(..., description="The funding year for the payment", ge=1300, le=1500)
+    pending_cart_amount: float = Field(
+        0.0,
+        ge=0,
+        description="Sum of other drafted payments for the same employer in the cart",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "contract_tracking_code": "CNT-1403-001",
+                "amount": 50000000.0,
+                "funding_year": 1403,
+                "pending_cart_amount": 20000000.0,
+            }
+        }
+
+
+class PaymentBatchValidationResponse(BaseModel):
+    """
+    Response schema returned when a drafted payment passes validation.
+    """
+    employer_code: str = Field(..., description="The employer classification code")
+    current_db_balance: float = Field(..., description="Current balance from the database")
+    pending_cart_amount: float = Field(..., description="Reserved amount from other drafts in the cart")
+    available_balance: float = Field(..., description="Balance available after reserving cart drafts")
+    amount: float = Field(..., description="The payment amount being validated")
+    remaining_balance: float = Field(..., description="Available balance after this payment")
+    is_valid: bool = Field(True, description="Whether the drafted payment is valid")
+
+
+class PaymentBulkItem(BaseModel):
+    """
+    Single payment entry inside a bulk submission.
+    """
+    tracking_code: str = Field(..., description="Unique payment tracking code")
+    contract_tracking_code: str = Field(..., description="Contract tracking code linked to the payment")
+    amount: float = Field(..., description="Payment amount in base Rials", gt=0)
+    payment_year: int = Field(..., description="Cash flow year", ge=1300, le=1500)
+    funding_year: int = Field(..., description="Budget consumption year", ge=1300, le=1500)
+    series: Optional[str] = Field(None, description="Payment series identifier")
+    notification_letter_number: Optional[str] = Field(None, description="Notification letter number")
+    notification_date: Optional[date] = Field(None, description="Notification date")
+    attachment_path: Optional[str] = Field(None, description="Path to the payment attachment")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "tracking_code": "PAY-1403-0001",
+                "contract_tracking_code": "CNT-1403-001",
+                "amount": 50000000.0,
+                "payment_year": 1403,
+                "funding_year": 1403,
+                "series": "Q1",
+                "notification_letter_number": "123/456",
+                "notification_date": "2024-06-01",
+                "attachment_path": None,
+            }
+        }
+
+
+class PaymentBulkCreate(BaseModel):
+    """
+    Request schema for submitting a batch (cart) of payments at once.
+    """
+    payments: List[PaymentBulkItem] = Field(
+        ..., min_length=1, description="List of payments to register in a single transaction"
+    )
+
+
+class PaymentBulkCreateResponse(BaseModel):
+    """
+    Response schema returned after a successful bulk submission.
+    """
+    message: str = Field(..., description="Human readable success message")
+    submitted_count: int = Field(..., description="Number of payments committed")
+    tracking_codes: List[str] = Field(..., description="Tracking codes of the committed payments")
 
 
 ## File: schemas\__init__.py
@@ -2387,186 +3273,235 @@ def run_pandas_example():
 if __name__ == "__main__":
     run_pandas_example()
 
+## File: scripts\generate_contract_status_report.py
+------------------------------
+"""Generate an Excel breakdown of dynamically calculated contract statuses."""
+
+import os
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.database import SessionLocal
+from services.financial_engine import get_contracts_with_dynamic_status
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_PATH = PROJECT_ROOT / "results" / "contract_status_breakdown.xlsx"
+STATUS_ORDER = ["Completed", "Stagnant", "Active"]
+STATUS_TRANSLATIONS = {
+    "Completed": "خاتمه‌یافته",
+    "Stagnant": "راکد",
+    "Active": "فعال",
+}
+DETAIL_COLUMN_TRANSLATIONS = {
+    "tracking_code": "کد رهگیری",
+    "employer_code": "کد دستگاه",
+    "university_id": "شناسه دانشگاه",
+    "researcher_id": "کد ملی پژوهشگر",
+    "proposal_id": "شناسه پیشنهاد",
+    "contract_number": "شماره قرارداد",
+    "contract_date": "تاریخ قرارداد",
+    "contract_creation_year": "سال انعقاد (شمسی)",
+    "total_amount": "مبلغ کل قرارداد (ریال)",
+    "total_paid": "مجموع پرداختی (ریال)",
+    "last_payment_funding_year": "سال تأمین اعتبار آخرین پرداخت",
+    "activity_year": "سال آخرین فعالیت",
+    "dynamic_status": "وضعیت قرارداد",
+    "title": "عنوان قرارداد",
+}
+SUMMARY_COLUMN_TRANSLATIONS = {
+    "contract_creation_year": "سال انعقاد (شمسی)",
+    "Completed": "خاتمه‌یافته",
+    "Stagnant": "راکد",
+    "Active": "فعال",
+    "Total": "مجموع",
+}
+
+
+def _results_to_dataframe(rows) -> pd.DataFrame:
+    """Convert SQLAlchemy result rows into report-friendly contract records."""
+    records = []
+    for row in rows:
+        contract = row.Contract
+        records.append(
+            {
+                "tracking_code": contract.tracking_code,
+                "employer_code": contract.employer_code,
+                "university_id": contract.university_id,
+                "researcher_id": contract.researcher_id,
+                "proposal_id": contract.proposal_id,
+                "contract_number": contract.contract_number,
+                "contract_date": contract.contract_date,
+                "contract_creation_year": int(row.contract_creation_year) if row.contract_creation_year is not None else None,
+                "total_amount": contract.total_amount,
+                "total_paid": row.total_paid,
+                "last_payment_funding_year": row.last_payment_funding_year,
+                "activity_year": int(row.activity_year) if row.activity_year is not None else None,
+                "dynamic_status": row.dynamic_status,
+                "title": contract.title,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def _build_summary(details: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate contract counts by Jalali creation year and dynamic status."""
+    if details.empty:
+        return pd.DataFrame(columns=["contract_creation_year", *STATUS_ORDER, "Total"])
+
+    summary = pd.pivot_table(
+        details,
+        index="contract_creation_year",
+        columns="dynamic_status",
+        values="tracking_code",
+        aggfunc="count",
+        fill_value=0,
+    )
+    summary = summary.reindex(columns=STATUS_ORDER, fill_value=0)
+    summary["Total"] = summary.sum(axis=1)
+    return summary.reset_index().sort_values("contract_creation_year", na_position="last")
+
+
+def main() -> None:
+    """Generate detailed and aggregated contract status Excel worksheets."""
+    db = SessionLocal()
+    try:
+        rows = get_contracts_with_dynamic_status(db, threshold_year=1402)
+        details = _results_to_dataframe(rows)
+        summary = _build_summary(details)
+
+        if "dynamic_status" in details.columns:
+            details["dynamic_status"] = details["dynamic_status"].replace(
+                STATUS_TRANSLATIONS
+            )
+        details = details.rename(columns=DETAIL_COLUMN_TRANSLATIONS)
+        summary = summary.rename(columns=SUMMARY_COLUMN_TRANSLATIONS)
+
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
+            summary.to_excel(writer, sheet_name="Summary Dashboard", index=False)
+            details.to_excel(writer, sheet_name="Detailed Data", index=False)
+
+        print(f"Generated {OUTPUT_PATH}")
+        print(f"Detailed contracts: {len(details)}")
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    main()
+
+
 ## File: scripts\generate_financial_report.py
 ------------------------------
 """
 Financial Report Generator
-Calculates employer balances using: total_deposits - total_payments
+Exports employer balances using the centralized macro engine in financial_engine.
 """
 
-import pandas as pd
 import os
-from pathlib import Path
-from sqlalchemy import create_engine
-
-# Import database engine
 import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from core.database import engine
+from pathlib import Path
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.database import SessionLocal
+from services.financial_engine import get_all_employers_financials
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_PATH = PROJECT_ROOT / "results" / "financial_report_summary.xlsx"
+
+PERSIAN_COLUMNS = [
+    "کد مشمول",
+    "نام مشمول",
+    "سال مالی",
+    "اعتبار تکلیفی (ریال)",
+    "مجموع واریزی (ریال)",
+    "هزینه کرد (ریال)",
+    "انتقال ورودی (ریال)",
+    "انتقال خروجی (ریال)",
+    "مانده واقعی (ریال)",
+]
+
+COLUMN_MAPPING = {
+    "employer_code": PERSIAN_COLUMNS[0],
+    "employer_name": PERSIAN_COLUMNS[1],
+    "year": PERSIAN_COLUMNS[2],
+    "mandated_amount": PERSIAN_COLUMNS[3],
+    "deposit_amount": PERSIAN_COLUMNS[4],
+    "payment_amount": PERSIAN_COLUMNS[5],
+    "transfer_in": PERSIAN_COLUMNS[6],
+    "transfer_out": PERSIAN_COLUMNS[7],
+    "balance": PERSIAN_COLUMNS[8],
+}
 
 
 def main():
     print("=" * 60)
     print("Financial Report Generator - Employer Balance Analysis")
     print("=" * 60)
-    
-    # Step 1: Extract data from database
-    print("\n[1/6] Extracting data from database...")
-    
+
+    db = SessionLocal()
     try:
-        # Read tables into DataFrames
-        df_employers = pd.read_sql_table('employers', con=engine)
-        print(f"   ✓ Loaded {len(df_employers)} employers")
-        
-        df_mandates = pd.read_sql_table('annual_mandates', con=engine)
-        print(f"   ✓ Loaded {len(df_mandates)} annual mandates")
-        
-        df_deposits = pd.read_sql_table('deposit_receipts', con=engine)
-        print(f"   ✓ Loaded {len(df_deposits)} deposit receipts")
-        
-        df_contracts = pd.read_sql_table('contracts', con=engine)
-        print(f"   ✓ Loaded {len(df_contracts)} contracts")
-        
-        df_payments = pd.read_sql_table('payments', con=engine)
-        print(f"   ✓ Loaded {len(df_payments)} payments")
-        
-    except Exception as e:
-        print(f"   ✗ Error reading tables: {e}")
-        return
-    
-    # Step 2: Aggregate deposits by employer and fiscal year
-    print("\n[2/6] Aggregating deposits by employer and fiscal year...")
-    
-    # Group deposits by employer_code and fiscal_year, sum the deposit amounts
-    df_deposit_aggregates = df_deposits.groupby(
-        ['employer_code', 'fiscal_year']
-    )['deposit_amount'].sum().reset_index()
-    
-    df_deposit_aggregates.rename(columns={'deposit_amount': 'total_deposits'}, inplace=True)
-    print(f"   ✓ Aggregated deposits for {len(df_deposit_aggregates)} employer-year combinations")
-    
-    # Step 3: Aggregate payments by employer and funding year
-    print("\n[3/6] Aggregating payments by employer and funding year...")
-    
-    # Merge payments with contracts to get employer_code for each payment
-    df_payments_with_employer = df_payments.merge(
-        df_contracts[['tracking_code', 'employer_code']],
-        left_on='contract_tracking_code',
-        right_on='tracking_code',
-        how='left'
-    )
-    
-    # Group by employer and funding year, sum the amounts
-    df_payment_aggregates = df_payments_with_employer.groupby(
-        ['employer_code', 'funding_year']
-    )['amount'].sum().reset_index()
-    
-    df_payment_aggregates.rename(columns={'amount': 'total_payments'}, inplace=True)
-    print(f"   ✓ Aggregated payments for {len(df_payment_aggregates)} employer-year combinations")
-    
-    # Step 4: Calculate balance using deposits - payments
-    print("\n[4/6] Calculating financial balances...")
-    
-    # Start with mandates as base
-    df_balance = df_mandates.merge(
-        df_deposit_aggregates,
-        on=['employer_code', 'fiscal_year'],
-        how='outer'
-    )
-    
-    # Merge with payment aggregates (join on employer_code and year)
-    df_balance = df_balance.merge(
-        df_payment_aggregates,
-        left_on=['employer_code', 'fiscal_year'],
-        right_on=['employer_code', 'funding_year'],
-        how='outer'
-    )
-    
-    # Use fiscal_year as the primary year column (coalesce with funding_year if needed)
-    df_balance['year'] = df_balance['fiscal_year'].fillna(df_balance['funding_year']).astype(int)
-    
-    # Fill NaN values with 0 for all financial columns
-    df_balance['mandated_amount'] = df_balance['mandated_amount'].fillna(0)
-    df_balance['total_deposits'] = df_balance['total_deposits'].fillna(0)
-    df_balance['total_payments'] = df_balance['total_payments'].fillna(0)
-    
-    # Ensure employer_code is filled (from either side of the merge)
-    if 'employer_code_x' in df_balance.columns:
-        df_balance['employer_code'] = df_balance['employer_code_x'].fillna(df_balance['employer_code_y'])
-    
-    # Calculate the real balance: total_deposits - total_payments
-    df_balance['balance'] = df_balance['total_deposits'] - df_balance['total_payments']
-    
-    print(f"   ✓ Calculated balances for {len(df_balance)} records")
-    
-    # Step 5: Format output with employer names
-    print("\n[5/6] Formatting final report with employer names...")
-    
-    # Merge with employers to get names
-    df_final = df_balance.merge(
-        df_employers[['classification_code', 'name']],
-        left_on='employer_code',
-        right_on='classification_code',
-        how='left'
-    )
-    
-    # Select and rename columns to Persian
-    df_final = df_final[[
-        'employer_code',
-        'name',
-        'year',
-        'mandated_amount',
-        'total_deposits',
-        'total_payments',
-        'balance'
-    ]]
-    
-    df_final.columns = [
-        'کد مشمول',
-        'نام مشمول',
-        'سال مالی',
-        'اعتبار تکلیفی (ریال)',
-        'مجموع واریزی (ریال)',
-        'جمع پرداختی (ریال)',
-        'مانده واقعی (ریال)'
-    ]
-    
-    # Sort by employer code and year
-    df_final = df_final.sort_values(['کد مشمول', 'سال مالی'])
-    
-    print(f"   ✓ Final report contains {len(df_final)} rows")
-    
-    # Step 6: Export to Excel
-    print("\n[6/6] Exporting to Excel...")
-    
-    # Ensure results directory exists
-    results_dir = Path('results')
-    results_dir.mkdir(exist_ok=True)
-    
-    output_path = results_dir / 'financial_report_summary.xlsx'
-    
-    try:
-        df_final.to_excel(output_path, index=False, engine='openpyxl')
-        print(f"   ✓ Exported to: {output_path}")
-    except Exception as e:
-        print(f"   ✗ Error exporting to Excel: {e}")
-        return
-    
-    # Summary statistics
-    print("\n" + "=" * 60)
-    print("REPORT SUMMARY")
-    print("=" * 60)
-    print(f"Total employers: {df_final['کد مشمول'].nunique()}")
-    print(f"Total fiscal years: {df_final['سال مالی'].nunique()}")
-    print(f"Total mandated amount: {df_final['اعتبار تکلیفی (ریال)'].sum():,.0f} Rials")
-    print(f"Total deposited: {df_final['مجموع واریزی (ریال)'].sum():,.0f} Rials")
-    print(f"Total payments: {df_final['جمع پرداختی (ریال)'].sum():,.0f} Rials")
-    print(f"Total real balance: {df_final['مانده واقعی (ریال)'].sum():,.0f} Rials")
-    print("=" * 60)
-    print("\n✓ Financial report generation completed successfully!")
+        print("\n[1/3] Calculating employer financials via macro engine...")
+        df = get_all_employers_financials(db)
+
+        if df.empty:
+            print("   No financial data found.")
+            return
+
+        print(f"   Loaded {df['employer_code'].nunique()} employers")
+        print(f"   Generated {len(df)} employer-year records")
+
+        print("\n[2/3] Formatting report columns...")
+        df_report = df.rename(columns=COLUMN_MAPPING)
+        df_report = df_report.sort_values([PERSIAN_COLUMNS[0], PERSIAN_COLUMNS[2]])
+
+        print("\n[3/3] Exporting to Excel...")
+        OUTPUT_PATH.parent.mkdir(exist_ok=True)
+        df_report.to_excel(OUTPUT_PATH, index=False, engine="openpyxl")
+        print(f"   Exported to: {OUTPUT_PATH}")
+
+        print("\n" + "=" * 60)
+        print("REPORT SUMMARY")
+        print("=" * 60)
+        print(f"Total employers:        {df_report[PERSIAN_COLUMNS[0]].nunique()}")
+        print(f"Total fiscal years:     {df_report[PERSIAN_COLUMNS[2]].nunique()}")
+        print(
+            f"Total mandated amount:  "
+            f"{df_report[PERSIAN_COLUMNS[3]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total deposited:        "
+            f"{df_report[PERSIAN_COLUMNS[4]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total payments:         "
+            f"{df_report[PERSIAN_COLUMNS[5]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total transfers in:     "
+            f"{df_report[PERSIAN_COLUMNS[6]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total transfers out:    "
+            f"{df_report[PERSIAN_COLUMNS[7]].sum():,.0f} Rials"
+        )
+        print(
+            f"Total real balance:     "
+            f"{df_report[PERSIAN_COLUMNS[8]].sum():,.0f} Rials"
+        )
+        print("=" * 60)
+        print("\nFinancial report generation completed successfully!")
+    finally:
+        db.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
 
 
@@ -4140,21 +5075,89 @@ session.close()
 
 ## File: services\financial_engine.py
 ------------------------------
-from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+import pandas as pd
 from decimal import Decimal
+from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.orm import Session
 
-# Import models from the root-level 'models' directory
-from models.employer import Employer
-from models.deposits import DepositReceipt
 from models.contract import Contract
+from models.deposits import AnnualMandate, DepositReceipt
+from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
+
+
+def get_contracts_with_dynamic_status(
+    db: Session,
+    threshold_year: int = 1402,
+):
+    """
+    Retrieve contracts with a lifecycle status calculated entirely in SQL.
+
+    Non-deleted payments are aggregated per non-deleted contract. A contract is
+    completed when its total payments cover its total amount. Otherwise, its
+    most recent activity year is the greater of the last payment funding year
+    and the approximated Jalali contract creation year. Activity before
+    ``threshold_year`` is classified as stagnant; all other activity is active.
+    The persisted ``Contract.status`` column is never modified.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        threshold_year: Jalali year used as the active/stagnant boundary.
+
+    Returns:
+        SQLAlchemy result rows containing the contract entity, aggregated
+        payment values, Jalali activity years, and the dynamic status.
+    """
+    total_paid = func.coalesce(func.sum(Payment.amount), 0)
+    last_payment_funding_year = func.max(Payment.funding_year)
+    gregorian_contract_year = func.extract("year", Contract.contract_date)
+    contract_creation_year = case(
+        (
+            func.to_char(Contract.contract_date, "MMDD") < "0321",
+            gregorian_contract_year - 622,
+        ),
+        else_=gregorian_contract_year - 621,
+    )
+    activity_year = func.greatest(
+        func.coalesce(last_payment_funding_year, contract_creation_year, 0),
+        func.coalesce(contract_creation_year, last_payment_funding_year, 0),
+    )
+    dynamic_status = case(
+        (total_paid >= Contract.total_amount, "Completed"),
+        (activity_year < threshold_year, "Stagnant"),
+        else_="Active",
+    )
+
+    statement = (
+        select(
+            Contract,
+            total_paid.label("total_paid"),
+            func.coalesce(last_payment_funding_year, 0).label(
+                "last_payment_funding_year"
+            ),
+            contract_creation_year.label("contract_creation_year"),
+            activity_year.label("activity_year"),
+            dynamic_status.label("dynamic_status"),
+        )
+        .outerjoin(
+            Payment,
+            and_(
+                Payment.contract_tracking_code == Contract.tracking_code,
+                Payment.is_deleted == False,
+            ),
+        )
+        .where(Contract.is_deleted == False)
+        .group_by(Contract.tracking_code)
+    )
+
+    return db.execute(statement).all()
 
 def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -> float:
     """
     Calculates the real financial balance for a specific employer and funding year.
-    Formula: total_deposits + transfers_in - transfers_out - total_payments
+
+    Formula: (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
     """
     
     # 1. Calculate Total Deposits (Including subsidiaries)
@@ -4218,8 +5221,6 @@ def get_mandated_amount(db: Session, employer_code: str, fiscal_year: int) -> fl
     """
     Retrieves the mandated budget amount (اعتبار تکلیفی) for a specific employer.
     """
-    from models.deposits import AnnualMandate
-    
     mandate = db.query(AnnualMandate).filter(
         AnnualMandate.employer_code == employer_code,
         AnnualMandate.fiscal_year == fiscal_year,
@@ -4227,6 +5228,141 @@ def get_mandated_amount(db: Session, employer_code: str, fiscal_year: int) -> fl
     ).first()
     
     return float(mandate.mandated_amount) if mandate else 0.0
+
+
+def _codes_to_include(db: Session, employer: Employer) -> list[str]:
+    """Return employer code plus subsidiary codes for Mother entities."""
+    if employer.employer_type == "Mother":
+        subsidiaries = db.query(Employer.classification_code).filter(
+            Employer.parent_code == employer.classification_code,
+            Employer.is_deleted == False,
+        ).all()
+        return [employer.classification_code] + [s[0] for s in subsidiaries]
+    return [employer.classification_code]
+
+
+def get_all_employers_financials(db: Session) -> pd.DataFrame:
+    """
+    Aggregate financial data for all active employers across all fiscal years.
+
+    For Mother employers, deposits, mandates, payments, and transfers are rolled up
+    to include all subsidiaries. Balance formula (single source of truth):
+
+        (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
+    """
+    employers = db.query(Employer).filter(
+        Employer.status == "Active",
+        Employer.is_deleted == False,
+    ).all()
+
+    all_data = []
+
+    for employer in employers:
+        employer_code = employer.classification_code
+        employer_name = employer.name
+        codes_to_include = _codes_to_include(db, employer)
+
+        mandates_query = db.query(
+            AnnualMandate.fiscal_year.label("year"),
+            func.sum(AnnualMandate.mandated_amount).label("mandated_amount"),
+        ).filter(
+            AnnualMandate.employer_code.in_(codes_to_include),
+            AnnualMandate.is_deleted == False,
+        ).group_by(AnnualMandate.fiscal_year)
+
+        deposits_query = db.query(
+            DepositReceipt.fiscal_year.label("year"),
+            func.sum(DepositReceipt.deposit_amount).label("deposit_amount"),
+        ).filter(
+            DepositReceipt.employer_code.in_(codes_to_include),
+            DepositReceipt.is_deleted == False,
+        ).group_by(DepositReceipt.fiscal_year)
+
+        payments_query = db.query(
+            Payment.funding_year.label("year"),
+            func.sum(Payment.amount).label("payment_amount"),
+        ).join(
+            Contract, Payment.contract_tracking_code == Contract.tracking_code
+        ).filter(
+            Contract.employer_code.in_(codes_to_include),
+            Payment.is_deleted == False,
+            Contract.is_deleted == False,
+        ).group_by(Payment.funding_year)
+
+        transfers_in_query = db.query(
+            CreditTransfer.fiscal_year.label("year"),
+            func.sum(CreditTransfer.amount).label("transfer_in"),
+        ).filter(
+            CreditTransfer.destination_employer_code.in_(codes_to_include),
+            CreditTransfer.is_deleted == False,
+        ).group_by(CreditTransfer.fiscal_year)
+
+        transfers_out_query = db.query(
+            CreditTransfer.fiscal_year.label("year"),
+            func.sum(CreditTransfer.amount).label("transfer_out"),
+        ).filter(
+            CreditTransfer.source_employer_code.in_(codes_to_include),
+            CreditTransfer.is_deleted == False,
+        ).group_by(CreditTransfer.fiscal_year)
+
+        metric_frames = []
+        for query, columns in (
+            (mandates_query, ["year", "mandated_amount"]),
+            (deposits_query, ["year", "deposit_amount"]),
+            (payments_query, ["year", "payment_amount"]),
+            (transfers_in_query, ["year", "transfer_in"]),
+            (transfers_out_query, ["year", "transfer_out"]),
+        ):
+            df_metric = pd.read_sql(query.statement, db.bind)
+            df_metric = df_metric.reindex(columns=columns).fillna(0.0)
+            metric_frames.append(df_metric)
+
+        df_merged = metric_frames[0]
+        for df_metric in metric_frames[1:]:
+            df_merged = df_merged.merge(df_metric, on="year", how="outer")
+
+        df_merged = df_merged.fillna(0).infer_objects(copy=False)
+        df_merged["employer_code"] = employer_code
+        df_merged["employer_name"] = employer_name
+
+        required_cols = [
+            "mandated_amount",
+            "deposit_amount",
+            "payment_amount",
+            "transfer_in",
+            "transfer_out",
+        ]
+        for col in required_cols:
+            if col not in df_merged.columns:
+                df_merged[col] = 0.0
+
+        df_merged["balance"] = (
+            df_merged["deposit_amount"] + df_merged["transfer_in"]
+        ) - (
+            df_merged["payment_amount"] + df_merged["transfer_out"]
+        )
+
+        all_data.append(df_merged)
+
+    if not all_data:
+        return pd.DataFrame()
+
+    df_all = pd.concat(all_data, ignore_index=True)
+    return df_all[
+        [
+            "employer_code",
+            "employer_name",
+            "year",
+            "mandated_amount",
+            "deposit_amount",
+            "payment_amount",
+            "transfer_in",
+            "transfer_out",
+            "balance",
+        ]
+    ]
+
+
 def validate_payment_impact(db: Session, contract_code: str, payment_amount: float, funding_year: int) -> dict:
     """
     Validates the impact of a payment on the employer's balance.
