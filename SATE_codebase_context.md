@@ -52,6 +52,8 @@
         CHANGELOG.md
         QUICKSTART.md
         README.md
+        pages/
+            batch_payments_page.py
     data/
         Archive/
             Payments/
@@ -649,7 +651,7 @@ def validate_draft_payment(
     )
 
 
-@router.post("/bulk-submit", response_model=PaymentBulkCreateResponse)
+@router.post("/bulk-submit", response_model=PaymentBulkCreateResponse, status_code=201)
 def bulk_submit_payments(
     request: PaymentBulkCreate,
     db: Session = Depends(get_db),
@@ -667,9 +669,41 @@ def bulk_submit_payments(
     - `payments`: List of payment objects to register atomically.
 
     **Returns:**
-    - HTTP 200 with the committed count and tracking codes when all succeed.
+    - HTTP 201 with the committed count and tracking codes when all succeed.
     - HTTP 400 (rolled back) identifying the contract/row that failed.
     """
+    tracking_codes = [item.tracking_code for item in request.payments]
+
+    seen_codes = set()
+    for code in tracking_codes:
+        if code in seen_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"خطا: کد رهگیری پرداخت '{code}' "
+                    "قبلاً در سیستم ثبت شده است."
+                ),
+            )
+        seen_codes.add(code)
+
+    existing = (
+        db.query(Payment.tracking_code)
+        .filter(
+            Payment.tracking_code.in_(tracking_codes),
+            Payment.is_deleted == False,
+        )
+        .first()
+    )
+    if existing:
+        duplicate_code = existing[0]
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"خطا: کد رهگیری پرداخت '{duplicate_code}' "
+                "قبلاً در سیستم ثبت شده است."
+            ),
+        )
+
     running_balances: dict = {}
     created_tracking_codes: List[str] = []
 
@@ -1087,7 +1121,7 @@ def render_grouped_bar_chart(chart_data: pd.DataFrame):
         plot_bgcolor="#f8f9fa",
         paper_bgcolor="white",
     )
-    st.plotly_chart(fig_grouped, use_container_width=True, theme=None)
+    st.plotly_chart(fig_grouped, width="stretch", theme=None)
 
 
 def render_waterfall_chart(chart_data: pd.DataFrame):
@@ -1149,7 +1183,7 @@ def render_waterfall_chart(chart_data: pd.DataFrame):
         plot_bgcolor="#f8f9fa",
         paper_bgcolor="white",
     )
-    st.plotly_chart(fig_waterfall, use_container_width=True, theme=None)
+    st.plotly_chart(fig_waterfall, width="stretch", theme=None)
 
 
 def render_detailed_table_and_download(df: pd.DataFrame, file_name: str):
@@ -1269,7 +1303,7 @@ def render_top10_employers_chart(df_all: pd.DataFrame):
         height=500,
         margin=dict(l=20, r=20, t=40, b=100),
     )
-    st.plotly_chart(fig_top10, use_container_width=True, theme=None)
+    st.plotly_chart(fig_top10, width="stretch", theme=None)
 
 
 def render_global_excel_download(df_all: pd.DataFrame):
@@ -1329,14 +1363,8 @@ def render_tab2(db: Session):
     render_global_excel_download(df_all)
 
 
-def main():
-    st.set_page_config(
-        page_title="داشبورد ساتع - نسخه یکپارچه",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
+def render_dashboard():
+    """Render the main management dashboard (used as a st.Page target)."""
     # ─── Main Title ───
     st.markdown("<h1 style='text-align: center;'>📊 داشبورد مدیریتی ساتع - تراز مشمولین</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>(داده‌های مالی از سال ۱۴۰۲)</h3>", unsafe_allow_html=True)
@@ -1380,6 +1408,76 @@ def main():
             render_tab2(db)
     finally:
         db.close()
+
+
+def _inject_global_css():
+    """Global CSS: Vazirmatn font + larger, RTL sidebar navigation labels."""
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    /* Global Vazirmatn font */
+    html, body, [class*="css"] {
+        font-family: 'Vazirmatn', sans-serif !important;
+        direction: rtl;
+    }
+    /* Sidebar navigation: Vazirmatn font + larger, readable items */
+    [data-testid="stSidebar"], section[data-testid="stSidebar"] * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        direction: rtl;
+        text-align: right;
+    }
+    /* Nav page links */
+    nav[data-testid="stSidebarNav"] {
+        font-family: 'Vazirmatn', sans-serif !important;
+    }
+    [data-testid="stSidebarNav"] span,
+    [data-testid="stSidebarNav"] a,
+    [data-testid="stSidebarNavLink"] {
+        font-size: 1.05rem !important;
+    }
+    /* Section group headers in the navigation */
+    [data-testid="stSidebarNav"] header,
+    [data-testid="stSidebar"] .stSidebarNavGroupHeader {
+        font-size: 1.1rem !important;
+        font-weight: 700 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def main():
+    """Application entry point: structured st.navigation with grouped Persian pages."""
+    st.set_page_config(
+        page_title="داشبورد ساتع - نسخه یکپارچه",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    _inject_global_css()
+
+    # Define pages via the st.Page API.
+    dashboard_page = st.Page(
+        render_dashboard,
+        title="داشبورد مدیریتی",
+        icon="📊",
+        default=True,
+    )
+    batch_payments_page = st.Page(
+        "pages/batch_payments_page.py",
+        title="ثبت دسته‌ای پرداخت‌ها",
+        icon="📂",
+    )
+
+    # Group pages into sections so individual sections can later be hidden
+    # from unauthorized roles (e.g. "فرم‌های ورود اطلاعات").
+    pages = {
+        "داشبوردهای مدیریتی": [dashboard_page],
+        "فرم‌های ورود اطلاعات": [batch_payments_page],
+    }
+
+    pg = st.navigation(pages)
+    pg.run()
 
 
 if __name__ == "__main__":
@@ -2104,6 +2202,188 @@ dashboard/
 ## پشتیبانی
 برای گزارش مشکلات یا پیشنهادات، لطفاً با تیم توسعه تماس بگیرید.
 
+
+## File: dashboard\pages\batch_payments_page.py
+------------------------------
+# File: pages/batch_payments_page.py
+import streamlit as st
+import requests
+import pandas as pd
+from datetime import datetime
+
+# Backend API Base URL
+API_URL = "http://localhost:8000/api/v1"
+
+# ─── Compact Persian (RTL) theme: Vazirmatn font + tight spacing ───
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+/* Global font + RTL direction */
+html, body, [class*="css"], * {
+    font-family: 'Vazirmatn', sans-serif !important;
+}
+.main, [data-testid="stMain"], .block-container,
+[data-testid="stAppViewContainer"], [data-testid="stSidebar"] * {
+    direction: rtl !important;
+    text-align: right !important;
+}
+/* Inputs and labels inherit RTL */
+label, .stWidget label, input, [data-baseweb="input"] {
+    direction: rtl !important;
+    text-align: right !important;
+}
+/* Compact headers and rules so all sections fit without excessive scrolling */
+h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
+h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
+hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
+/* Tighten generic block spacing */
+.stBlock, .stVerticalBlock, [data-testid="stVerticalBlock"] > div {
+    margin-top: 0.1rem !important;
+    margin-bottom: 0.1rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📂 فرم ثبت دسته‌ای لیست پرداخت (کارتابل صندوق عتف)")
+
+# 1. Initialize Temporary Cart in Session State
+if "payment_cart" not in st.session_state:
+    st.session_state.payment_cart = []
+
+# 2. Top Bar: Global Batch Configuration
+st.subheader("۱. اطلاعات کلی لیست پرداخت")
+col_s1, col_s2, col_s3 = st.columns(3)
+with col_s1:
+    series_number = st.number_input("شماره سری پرداخت (لیست):", min_value=1, value=15, step=1)
+with col_s2:
+    # Default to current Jalali year (1405 based on conceptual doc context)
+    payment_year = st.number_input("سال پرداخت (شمسی):", min_value=1398, max_value=1410, value=1405)
+with col_s3:
+    st.info("💡 این اطلاعات به طور خودکار به تمام ردیف‌های این لیست اعمال خواهد شد.")
+
+st.markdown("---")
+
+# 3. Data Entry Section (Row by Row)
+st.subheader("۲. ورود اطلاعات ردیف جدید")
+
+# Live search for contracts
+search_query = st.text_input("🔍 جستجوی قرارداد (کد رهگیری یا بخشی از عنوان قرارداد):")
+selected_contract = None
+
+if search_query:
+    try:
+        response = requests.get(f"{API_URL}/contracts/search", params={"q": search_query}, timeout=5)
+        if response.status_code == 200 and response.json():
+            contracts_found = response.json()
+            # Format display for the selectbox
+            options = {f"{c['contract_tracking_code']} - {c['title'][:40]}...": c for c in contracts_found}
+            choice = st.selectbox("قرارداد مورد نظر را انتخاب کنید:", list(options.keys()))
+            selected_contract = options[choice]
+            
+            # Auto-fill Read-only data to assure the clerk
+            st.success(f"🏢 متقاضی (شرکت مادر): {selected_contract['employer_name']} | 🎓 مجری: {selected_contract['university_name']} | 🧑‍💻 فناور: {selected_contract['researcher_name']}")
+        else:
+            st.warning("هیچ قراردادی با این مشخصات یافت نشد.")
+    except requests.exceptions.ConnectionError:
+        st.error("خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است.")
+    except requests.exceptions.Timeout:
+        st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+    except Exception as e:
+        st.error(f"خطا در اتصال به بک‌اند: {e}")
+
+# Other input fields for the row
+col_r1, col_r2, col_r3 = st.columns(3)
+with col_r1:
+    pay_tracking_code = st.text_input("کد رهگیری پرداخت (از سامانه ساتع):")
+with col_r2:
+    amount = st.number_input("مبلغ پرداختی (ریال):", min_value=0.0, step=1000000.0, format="%.2f")
+with col_r3:
+    funding_year = st.number_input("پرداخت از محل سال مالی (شمسی):", min_value=1398, max_value=1410, value=1402)
+
+# Row Validation and Insertion into Temporary Cart
+if st.button("➕ بررسی و اضافه کردن به لیست"):
+    if not selected_contract or not pay_tracking_code or amount <= 0:
+        st.error("لطفاً تمامی فیلدهای الزامی ردیف را تکمیل کنید.")
+    else:
+        # Calculate pending amount for this employer in the current cart
+        employer_code = selected_contract['employer_classification_code']
+        pending_amount = sum(item['amount'] for item in st.session_state.payment_cart 
+                             if item['employer_code'] == employer_code and item['funding_year'] == funding_year)
+        
+        # Call Backend to validate draft with pending cart consideration
+        val_payload = {
+            "contract_tracking_code": selected_contract['contract_tracking_code'],
+            "amount": amount,
+            "funding_year": funding_year,
+            "pending_cart_amount": pending_amount
+        }
+        
+        try:
+            val_response = requests.post(f"{API_URL}/payments/validate-draft", json=val_payload)
+            if val_response.status_code == 200:
+                # Add to local state (Memory Cart)
+                new_row = {
+                    "tracking_code": pay_tracking_code,
+                    "contract_tracking_code": selected_contract['contract_tracking_code'],
+                    "title": selected_contract['title'],
+                    "employer_name": selected_contract['employer_name'],
+                    "employer_code": employer_code,
+                    "amount": amount,
+                    "funding_year": funding_year,
+                    "payment_year": payment_year,
+                    "series": str(series_number)
+                }
+                st.session_state.payment_cart.append(new_row)
+                st.toast("✅ ردیف با موفقیت تایید و به لیست پیش‌نویس اضافه شد.", icon="🔥")
+            else:
+                err_detail = val_response.json().get('detail', 'موجودی کافی نیست.')
+                st.error(f"❌ خطای عدم کفایت موجودی: {err_detail}")
+        except Exception as e:
+            st.error(f"خطا در ارتباط با سرور اعتبارسنجی: {e}")
+
+st.markdown("---")
+
+# 4. Display Current Temporary Cart Table
+st.subheader("۳. لیست پیش‌نویس پرداخت‌های در حال انتظار (ثبت موقت)")
+if st.session_state.payment_cart:
+    df_cart = pd.DataFrame(st.session_state.payment_cart)
+    # Re-order columns for display
+    display_df = df_cart[['series', 'tracking_code', 'contract_tracking_code', 'employer_name', 'amount', 'funding_year', 'payment_year']]
+    display_df.columns = ['سری', 'کد رهگیری پرداخت', 'کد قرارداد', 'نام کارفرما', 'مبلغ (ریال)', 'محل سال مالی', 'سال خروج پول']
+    st.dataframe(display_df, width="stretch")
+    
+    if st.button("🗑️ خالی کردن کل لیست"):
+        st.session_state.payment_cart = []
+        st.rerun()
+        
+    st.markdown("### 🚀 نهایی‌سازی و ثبت در دیتابیس")
+    if st.button("💾 تأیید نهایی و ارسال لیست به صندوق", type="primary"):
+        # Format payload for bulk submit
+        bulk_payload = {
+            "payments": [
+                {
+                    "tracking_code": item['tracking_code'],
+                    "contract_tracking_code": item['contract_tracking_code'],
+                    "amount": item['amount'],
+                    "series": item['series'],
+                    "payment_year": item['payment_year'],
+                    "funding_year": item['funding_year']
+                } for item in st.session_state.payment_cart
+            ]
+        }
+        
+        try:
+            submit_res = requests.post(f"{API_URL}/payments/bulk-submit", json=bulk_payload)
+            if submit_res.status_code == 201:
+                submitted_count = submit_res.json().get("submitted_count", 0)
+                st.success(f"🎉 لیست با موفقیت نهایی شد! {submitted_count} قلم پرداخت ثبت و قفل گردید.")
+                st.session_state.payment_cart = [] # Clear cart on success
+            else:
+                st.error(f"❌ خطا در ثبت نهایی: {submit_res.json().get('detail')}")
+        except Exception as e:
+            st.error(f"خطا در ارسال نهایی به سرور: {e}")
+else:
+    st.info("لیست پیش‌نویس در حال حاضر خالی است. ردیف‌های پرداخت را از بخش بالا اضافه کنید.")
 
 ## File: Docs\Phase1_Complete.md
 ------------------------------
@@ -2849,10 +3129,16 @@ class PaymentBulkItem(BaseModel):
     amount: float = Field(..., description="Payment amount in base Rials", gt=0)
     payment_year: int = Field(..., description="Cash flow year", ge=1300, le=1500)
     funding_year: int = Field(..., description="Budget consumption year", ge=1300, le=1500)
-    series: Optional[str] = Field(None, description="Payment series identifier")
-    notification_letter_number: Optional[str] = Field(None, description="Notification letter number")
-    notification_date: Optional[date] = Field(None, description="Notification date")
-    attachment_path: Optional[str] = Field(None, description="Path to the payment attachment")
+    series: Optional[str] = Field(default=None, description="Payment series identifier")
+    notification_letter_number: Optional[str] = Field(
+        default=None,
+        description="Notification letter number (optional; may be filled later via update form)",
+    )
+    notification_date: Optional[date] = Field(
+        default=None,
+        description="Notification date (optional; may be filled later via update form)",
+    )
+    attachment_path: Optional[str] = Field(default=None, description="Path to the payment attachment")
 
     class Config:
         json_schema_extra = {
@@ -2863,8 +3149,8 @@ class PaymentBulkItem(BaseModel):
                 "payment_year": 1403,
                 "funding_year": 1403,
                 "series": "Q1",
-                "notification_letter_number": "123/456",
-                "notification_date": "2024-06-01",
+                "notification_letter_number": None,
+                "notification_date": None,
                 "attachment_path": None,
             }
         }

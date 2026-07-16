@@ -5,9 +5,36 @@ import pandas as pd
 from datetime import datetime
 
 # Backend API Base URL
-API_URL = "http://localhost:8000/api/v1"
+API_URL = "http://127.0.0.1:8000/api/v1"
 
-st.set_page_config(layout="wide")
+# ─── Aggressive RTL override + compact Persian theme ───
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+* { font-family: 'Vazirmatn', sans-serif !important; }
+/* Force RTL on main containers and text inputs */
+.block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
+    direction: rtl !important;
+    text-align: right !important;
+}
+/* Fix sidebar text alignment */
+[data-testid="stSidebarNav"] span {
+    direction: rtl !important;
+    text-align: right !important;
+    font-size: 1.05rem !important;
+}
+/* Compact headers and rules so all sections fit without excessive scrolling */
+h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
+h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
+hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
+.stBlock, .stVerticalBlock, [data-testid="stVerticalBlock"] > div {
+    margin-top: 0.1rem !important;
+    margin-bottom: 0.1rem !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 st.title("📂 فرم ثبت دسته‌ای لیست پرداخت (کارتابل صندوق عتف)")
 
 # 1. Initialize Temporary Cart in Session State
@@ -36,7 +63,7 @@ selected_contract = None
 
 if search_query:
     try:
-        response = requests.get(f"{API_URL}/contracts/search", params={"q": search_query})
+        response = requests.get(f"{API_URL}/contracts/search", params={"q": search_query}, timeout=5)
         if response.status_code == 200 and response.json():
             contracts_found = response.json()
             # Format display for the selectbox
@@ -48,6 +75,10 @@ if search_query:
             st.success(f"🏢 متقاضی (شرکت مادر): {selected_contract['employer_name']} | 🎓 مجری: {selected_contract['university_name']} | 🧑‍💻 فناور: {selected_contract['researcher_name']}")
         else:
             st.warning("هیچ قراردادی با این مشخصات یافت نشد.")
+    except requests.exceptions.ConnectionError:
+        st.error("خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است.")
+    except requests.exceptions.Timeout:
+        st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
     except Exception as e:
         st.error(f"خطا در اتصال به بک‌اند: {e}")
 
@@ -110,7 +141,7 @@ if st.session_state.payment_cart:
     # Re-order columns for display
     display_df = df_cart[['series', 'tracking_code', 'contract_tracking_code', 'employer_name', 'amount', 'funding_year', 'payment_year']]
     display_df.columns = ['سری', 'کد رهگیری پرداخت', 'کد قرارداد', 'نام کارفرما', 'مبلغ (ریال)', 'محل سال مالی', 'سال خروج پول']
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(display_df, width="stretch")
     
     if st.button("🗑️ خالی کردن کل لیست"):
         st.session_state.payment_cart = []

@@ -308,7 +308,7 @@ def render_grouped_bar_chart(chart_data: pd.DataFrame):
         plot_bgcolor="#f8f9fa",
         paper_bgcolor="white",
     )
-    st.plotly_chart(fig_grouped, use_container_width=True, theme=None)
+    st.plotly_chart(fig_grouped, width="stretch", theme=None)
 
 
 def render_waterfall_chart(chart_data: pd.DataFrame):
@@ -370,7 +370,7 @@ def render_waterfall_chart(chart_data: pd.DataFrame):
         plot_bgcolor="#f8f9fa",
         paper_bgcolor="white",
     )
-    st.plotly_chart(fig_waterfall, use_container_width=True, theme=None)
+    st.plotly_chart(fig_waterfall, width="stretch", theme=None)
 
 
 def render_detailed_table_and_download(df: pd.DataFrame, file_name: str):
@@ -490,7 +490,7 @@ def render_top10_employers_chart(df_all: pd.DataFrame):
         height=500,
         margin=dict(l=20, r=20, t=40, b=100),
     )
-    st.plotly_chart(fig_top10, use_container_width=True, theme=None)
+    st.plotly_chart(fig_top10, width="stretch", theme=None)
 
 
 def render_global_excel_download(df_all: pd.DataFrame):
@@ -550,14 +550,8 @@ def render_tab2(db: Session):
     render_global_excel_download(df_all)
 
 
-def main():
-    st.set_page_config(
-        page_title="داشبورد ساتع - نسخه یکپارچه",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
+def render_dashboard():
+    """Render the main management dashboard (used as a st.Page target)."""
     # ─── Main Title ───
     st.markdown("<h1 style='text-align: center;'>📊 داشبورد مدیریتی ساتع - تراز مشمولین</h1>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align: center;'>(داده‌های مالی از سال ۱۴۰۲)</h3>", unsafe_allow_html=True)
@@ -601,6 +595,47 @@ def main():
             render_tab2(db)
     finally:
         db.close()
+
+
+def _inject_global_css():
+    """Global CSS: aggressive RTL override for Streamlit internal containers."""
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    * { font-family: 'Vazirmatn', sans-serif !important; }
+    /* Force RTL on main containers and text inputs */
+    .block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    /* Fix sidebar text alignment */
+    [data-testid="stSidebarNav"] span {
+        direction: rtl !important;
+        text-align: right !important;
+        font-size: 1.05rem !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+def main():
+    # 1. MUST be the first Streamlit command executed in the file.
+    st.set_page_config(page_title="سامانه مالی ساتع", layout="wide")
+
+    # 2. Define the pages via the st.Page API.
+    dash_page = st.Page(render_dashboard, title="داشبورد اصلی", icon="📊", default=True)
+    batch_payments_page = st.Page("views/batch_payments_page.py", title="ثبت دسته‌ای پرداخت", icon="📝")
+
+    # 3. Group and initialize navigation.
+    pg = st.navigation({
+        "داشبوردهای مدیریتی": [dash_page],
+        "فرم‌های ورود اطلاعات": [batch_payments_page],
+    })
+
+    # 4. Inject global CSS (RTL & Fonts) before rendering the active page.
+    _inject_global_css()
+
+    # 5. CRITICAL: Execute the navigation / render the active page.
+    pg.run()
 
 
 if __name__ == "__main__":
