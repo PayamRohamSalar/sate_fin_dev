@@ -52,7 +52,7 @@
         CHANGELOG.md
         QUICKSTART.md
         README.md
-        pages/
+        views/
             batch_payments_page.py
     data/
         Archive/
@@ -1411,72 +1411,43 @@ def render_dashboard():
 
 
 def _inject_global_css():
-    """Global CSS: Vazirmatn font + larger, RTL sidebar navigation labels."""
+    """Global CSS: aggressive RTL override for Streamlit internal containers."""
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
-    /* Global Vazirmatn font */
-    html, body, [class*="css"] {
-        font-family: 'Vazirmatn', sans-serif !important;
-        direction: rtl;
+    * { font-family: 'Vazirmatn', sans-serif !important; }
+    /* Force RTL on main containers and text inputs */
+    .block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
+        direction: rtl !important;
+        text-align: right !important;
     }
-    /* Sidebar navigation: Vazirmatn font + larger, readable items */
-    [data-testid="stSidebar"], section[data-testid="stSidebar"] * {
-        font-family: 'Vazirmatn', sans-serif !important;
-        direction: rtl;
-        text-align: right;
-    }
-    /* Nav page links */
-    nav[data-testid="stSidebarNav"] {
-        font-family: 'Vazirmatn', sans-serif !important;
-    }
-    [data-testid="stSidebarNav"] span,
-    [data-testid="stSidebarNav"] a,
-    [data-testid="stSidebarNavLink"] {
+    /* Fix sidebar text alignment */
+    [data-testid="stSidebarNav"] span {
+        direction: rtl !important;
+        text-align: right !important;
         font-size: 1.05rem !important;
-    }
-    /* Section group headers in the navigation */
-    [data-testid="stSidebarNav"] header,
-    [data-testid="stSidebar"] .stSidebarNavGroupHeader {
-        font-size: 1.1rem !important;
-        font-weight: 700 !important;
     }
     </style>
     """, unsafe_allow_html=True)
 
-
 def main():
-    """Application entry point: structured st.navigation with grouped Persian pages."""
-    st.set_page_config(
-        page_title="داشبورد ساتع - نسخه یکپارچه",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+    # 1. MUST be the first Streamlit command executed in the file.
+    st.set_page_config(page_title="سامانه مالی ساتع", layout="wide")
 
+    # 2. Define the pages via the st.Page API.
+    dash_page = st.Page(render_dashboard, title="داشبورد اصلی", icon="📊", default=True)
+    batch_payments_page = st.Page("views/batch_payments_page.py", title="ثبت دسته‌ای پرداخت", icon="📝")
+
+    # 3. Group and initialize navigation.
+    pg = st.navigation({
+        "داشبوردهای مدیریتی": [dash_page],
+        "فرم‌های ورود اطلاعات": [batch_payments_page],
+    })
+
+    # 4. Inject global CSS (RTL & Fonts) before rendering the active page.
     _inject_global_css()
 
-    # Define pages via the st.Page API.
-    dashboard_page = st.Page(
-        render_dashboard,
-        title="داشبورد مدیریتی",
-        icon="📊",
-        default=True,
-    )
-    batch_payments_page = st.Page(
-        "pages/batch_payments_page.py",
-        title="ثبت دسته‌ای پرداخت‌ها",
-        icon="📂",
-    )
-
-    # Group pages into sections so individual sections can later be hidden
-    # from unauthorized roles (e.g. "فرم‌های ورود اطلاعات").
-    pages = {
-        "داشبوردهای مدیریتی": [dashboard_page],
-        "فرم‌های ورود اطلاعات": [batch_payments_page],
-    }
-
-    pg = st.navigation(pages)
+    # 5. CRITICAL: Execute the navigation / render the active page.
     pg.run()
 
 
@@ -2203,7 +2174,7 @@ dashboard/
 برای گزارش مشکلات یا پیشنهادات، لطفاً با تیم توسعه تماس بگیرید.
 
 
-## File: dashboard\pages\batch_payments_page.py
+## File: dashboard\views\batch_payments_page.py
 ------------------------------
 # File: pages/batch_payments_page.py
 import streamlit as st
@@ -2212,37 +2183,35 @@ import pandas as pd
 from datetime import datetime
 
 # Backend API Base URL
-API_URL = "http://localhost:8000/api/v1"
+API_URL = "http://127.0.0.1:8000/api/v1"
 
-# ─── Compact Persian (RTL) theme: Vazirmatn font + tight spacing ───
+# ─── Aggressive RTL override + compact Persian theme ───
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
-/* Global font + RTL direction */
-html, body, [class*="css"], * {
-    font-family: 'Vazirmatn', sans-serif !important;
-}
-.main, [data-testid="stMain"], .block-container,
-[data-testid="stAppViewContainer"], [data-testid="stSidebar"] * {
+* { font-family: 'Vazirmatn', sans-serif !important; }
+/* Force RTL on main containers and text inputs */
+.block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
     direction: rtl !important;
     text-align: right !important;
 }
-/* Inputs and labels inherit RTL */
-label, .stWidget label, input, [data-baseweb="input"] {
+/* Fix sidebar text alignment */
+[data-testid="stSidebarNav"] span {
     direction: rtl !important;
     text-align: right !important;
+    font-size: 1.05rem !important;
 }
 /* Compact headers and rules so all sections fit without excessive scrolling */
 h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
 h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
 hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
-/* Tighten generic block spacing */
 .stBlock, .stVerticalBlock, [data-testid="stVerticalBlock"] > div {
     margin-top: 0.1rem !important;
     margin-bottom: 0.1rem !important;
 }
 </style>
 """, unsafe_allow_html=True)
+
 
 st.title("📂 فرم ثبت دسته‌ای لیست پرداخت (کارتابل صندوق عتف)")
 

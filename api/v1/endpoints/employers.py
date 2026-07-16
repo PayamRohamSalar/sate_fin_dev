@@ -65,3 +65,12 @@ def get_employer_balance(
         total_balance=balance,
         inquiry_date_jalali=BalanceResponse.get_current_jalali_date()
     )
+
+@router.get("/lookup", summary="Employer lookup for dropdowns")
+def employer_lookup(db: Session = Depends(get_db)):
+    """Return classification_code + name for non-subsidiary employers."""
+    rows = db.query(Employer.classification_code, Employer.name).filter(
+        Employer.employer_type != "Subsidiary",
+        Employer.is_deleted == False,
+    ).order_by(Employer.name).all()
+    return [{"classification_code": code, "name": name} for code, name in rows]

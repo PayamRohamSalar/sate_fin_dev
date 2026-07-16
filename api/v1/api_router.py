@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from api.v1.endpoints import contracts, employers, payments
+from api.v1.endpoints import contracts, employers, payments, universities, researchers
 
 # Create the main API router for version 1
 api_router = APIRouter()
@@ -9,6 +9,8 @@ api_router = APIRouter()
 api_router.include_router(employers.router)
 api_router.include_router(payments.router)
 api_router.include_router(contracts.router)
+api_router.include_router(universities.router)
+api_router.include_router(researchers.router)
 
 # Future routers can be added here as the system grows:
 # api_router.include_router(deposits.router)

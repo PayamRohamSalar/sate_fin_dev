@@ -624,11 +624,14 @@ def main():
     # 2. Define the pages via the st.Page API.
     dash_page = st.Page(render_dashboard, title="داشبورد اصلی", icon="📊", default=True)
     batch_payments_page = st.Page("views/batch_payments_page.py", title="ثبت دسته‌ای پرداخت", icon="📝")
+    contract_entry_page = st.Page("views/contract_entry_page.py", title="ثبت قرارداد جدید", icon="📄")
+    university_entry_page = st.Page("views/university_entry_page.py", title="ثبت موسسه مجری", icon="🏫")
+    researcher_entry_page = st.Page("views/researcher_entry_page.py", title="ثبت اطلاعات فناور", icon="🧑‍🔬")
 
     # 3. Group and initialize navigation.
     pg = st.navigation({
         "داشبوردهای مدیریتی": [dash_page],
-        "فرم‌های ورود اطلاعات": [batch_payments_page],
+        "فرم‌های ورود اطلاعات": [batch_payments_page, contract_entry_page, university_entry_page, researcher_entry_page],
     })
 
     # 4. Inject global CSS (RTL & Fonts) before rendering the active page.
