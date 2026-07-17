@@ -10,7 +10,7 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
 * { font-family: 'Vazirmatn', sans-serif !important; }
-.block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
+.block-container, .stTextInput, .stNumberInput, .stSelectbox, .stCheckbox, p, div {
     direction: rtl !important;
     text-align: right !important;
 }
@@ -47,44 +47,71 @@ def _fetch_universities():
         return []
 
 
-universities = _fetch_universities()
+fetched_universities = _fetch_universities()
+# Smart mapping: display names in the UI, resolve to national_id on submit.
+university_map = {u["name"]: u["national_id"] for u in fetched_universities}
 
 ACADEMIC_RANKS = ["استاد", "دانشیار", "استادیار", "مربی", "پژوهشگر", "سایر"]
+EDUCATION_LEVELS = ["دکتری", "کارشناسی ارشد", "کارشناسی", "سایر"]
+RESEARCHER_TYPES = ["هیات علمی", "پژوهشگر آزاد", "دانشجو", "سایر"]
+STATUS_OPTIONS = {"فعال": "Active", "غیرفعال": "Inactive"}
 
 with st.form("researcher_entry_form", clear_on_submit=False):
-    st.subheader("۱. اطلاعات فناور")
+    st.subheader("۱. اطلاعات هویتی")
 
-    national_id = st.text_input("🪪 کد ملی فناور:", placeholder="۱۰ رقم", max_chars=10)
-    full_name = st.text_input("👤 نام و نام خانوادگی:")
+    national_code = st.text_input("🪪 کد ملی فناور:", placeholder="۱۰ رقم", max_chars=10)
 
-    if universities:
-        uni_options = {item["national_id"]: f"{item['name']} ({item['national_id']})" for item in universities}
-        university_national_id = st.selectbox(
-            "🏫 موسسه محل فعالیت:",
-            options=list(uni_options.keys()),
-            format_func=lambda nid: uni_options[nid],
-        )
+    col_first, col_last = st.columns(2)
+    with col_first:
+        first_name = st.text_input("👤 نام:")
+    with col_last:
+        last_name = st.text_input("👥 نام خانوادگی:")
+
+    col_mobile, col_email = st.columns(2)
+    with col_mobile:
+        mobile = st.text_input("📱 تلفن همراه (اختیاری):", placeholder="مثال: 09123456789")
+    with col_email:
+        email = st.text_input("✉️ ایمیل (اختیاری):", placeholder="example@mail.com")
+
+    st.markdown("---")
+    st.subheader("۲. اطلاعات علمی و وابستگی سازمانی")
+
+    if university_map:
+        university_name = st.selectbox("🏫 موسسه محل فعالیت:", options=list(university_map.keys()))
     else:
         st.warning("هیچ موسسه‌ای برای انتخاب یافت نشد. ابتدا یک موسسه ثبت کنید.")
-        university_national_id = None
+        university_name = None
 
-    academic_rank = st.selectbox("🎓 مرتبه علمی:", options=ACADEMIC_RANKS)
+    col_rank, col_edu = st.columns(2)
+    with col_rank:
+        academic_rank = st.selectbox("🎓 مرتبه علمی:", options=ACADEMIC_RANKS)
+    with col_edu:
+        education_level = st.selectbox("🎓 سطح تحصیلات:", options=EDUCATION_LEVELS)
+
+    researcher_type = st.selectbox("🏷️ نوع فناور:", options=RESEARCHER_TYPES)
+    status_label = st.selectbox("🟢 وضعیت:", options=list(STATUS_OPTIONS.keys()), index=0)
 
     submitted = st.form_submit_button("✅ ثبت فناور", type="primary")
 
     if submitted:
-        if university_national_id is None:
+        if university_name is None:
             st.error("موسسه محل فعالیت قابل انتخاب نیست.")
-        elif not national_id.strip() or len(national_id.strip()) != 10 or not national_id.strip().isdigit():
+        elif not national_code.strip() or len(national_code.strip()) != 10 or not national_code.strip().isdigit():
             st.error("کد ملی باید دقیقاً ۱۰ رقم باشد.")
-        elif not full_name.strip():
+        elif not first_name.strip() or not last_name.strip():
             st.error("لطفاً نام و نام خانوادگی را وارد کنید.")
         else:
             payload = {
-                "national_id": national_id.strip(),
-                "full_name": full_name.strip(),
-                "university_national_id": university_national_id,
+                "national_code": national_code.strip(),
+                "first_name": first_name.strip(),
+                "last_name": last_name.strip(),
+                "mobile": mobile.strip() or None,
+                "email": email.strip() or None,
                 "academic_rank": academic_rank,
+                "education_level": education_level,
+                "researcher_type": researcher_type,
+                "university_id": university_map[university_name],
+                "status": STATUS_OPTIONS[status_label],
             }
             try:
                 response = requests.post(f"{API_URL}/researchers/", json=payload, timeout=5)
@@ -92,7 +119,7 @@ with st.form("researcher_entry_form", clear_on_submit=False):
                     data = response.json()
                     st.success(
                         f"🎉 فناور با موفقیت ثبت شد.\n"
-                        f"کد ملی: {data.get('national_id')} | "
+                        f"کد ملی: {data.get('national_code')} | "
                         f"نام: {data.get('full_name')} | "
                         f"مرتبه علمی: {data.get('academic_rank')} | "
                         f"موسسه: {data.get('university_id')}"

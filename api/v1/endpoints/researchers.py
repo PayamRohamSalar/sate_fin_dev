@@ -25,16 +25,16 @@ def researcher_lookup(db: Session = Depends(get_db)):
 
 
 @router.post("/", response_model=ResearcherCreated, status_code=201)
-def create_researcher(payload: ResearcherCreate, db: Session = Depends(get_db)):
+def create_researcher(req: ResearcherCreate, db: Session = Depends(get_db)):
     """
     Register a new researcher (فناور).
 
-    Business rule: a unique national_id is enforced before insert (including
-    soft-deleted records). The provided full_name is split into first/last name
-    for the model's required columns.
+    Business rule: a unique national_code is enforced before insert (including
+    soft-deleted records). The model requires full_name, which is built by
+    concatenating first_name and last_name.
     """
     existing = db.query(Researcher).filter(
-        Researcher.national_code == payload.national_id,
+        Researcher.national_code == req.national_code,
     ).first()
     if existing:
         raise HTTPException(
@@ -43,27 +43,29 @@ def create_researcher(payload: ResearcherCreate, db: Session = Depends(get_db)):
         )
 
     university = db.query(University).filter(
-        University.national_id == payload.university_national_id,
+        University.national_id == req.university_id,
         University.is_deleted == False,
     ).first()
     if not university:
         raise HTTPException(
             status_code=404,
-            detail=f"دانشگاه/موسسه‌ای با شناسه ملی '{payload.university_national_id}' یافت نشد.",
+            detail=f"دانشگاه/موسسه‌ای با شناسه ملی '{req.university_id}' یافت نشد.",
         )
 
-    name_parts = payload.full_name.strip().split(maxsplit=1)
-    first_name = name_parts[0]
-    last_name = name_parts[1] if len(name_parts) > 1 else ""
+    full_name = f"{req.first_name.strip()} {req.last_name.strip()}"
 
     researcher = Researcher(
-        national_code=payload.national_id,
-        first_name=first_name,
-        last_name=last_name,
-        full_name=payload.full_name.strip(),
-        academic_rank=payload.academic_rank,
-        university_id=payload.university_national_id,
-        status="Active",
+        national_code=req.national_code,
+        first_name=req.first_name.strip(),
+        last_name=req.last_name.strip(),
+        full_name=full_name,
+        mobile=req.mobile,
+        email=req.email,
+        academic_rank=req.academic_rank,
+        education_level=req.education_level,
+        researcher_type=req.researcher_type,
+        university_id=req.university_id,
+        status=req.status,
         is_deleted=False,
     )
     db.add(researcher)
@@ -81,9 +83,11 @@ def create_researcher(payload: ResearcherCreate, db: Session = Depends(get_db)):
     db.refresh(researcher)
 
     return ResearcherCreated(
-        national_id=researcher.national_code,
+        national_code=researcher.national_code,
         full_name=researcher.full_name,
         university_id=researcher.university_id,
         academic_rank=researcher.academic_rank,
+        education_level=researcher.education_level,
+        researcher_type=researcher.researcher_type,
         status=researcher.status,
     )
