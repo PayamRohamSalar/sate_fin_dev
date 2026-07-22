@@ -4,9 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from core.database import get_db
-from models.contract import Contract
 from models.payment import Payment
-from services.financial_engine import calculate_real_balance, validate_payment_impact
 from schemas.payment_schema import (
     PaymentBatchValidationRequest,
     PaymentBatchValidationResponse,
@@ -14,6 +12,13 @@ from schemas.payment_schema import (
     PaymentBulkCreateResponse,
     PaymentValidationRequest,
     PaymentValidationResponse,
+)
+from services.financial_engine import (
+    calculate_real_balance,
+    lock_active_contract_and_employer,
+    lock_active_contracts,
+    lock_active_employers,
+    validate_payment_impact,
 )
 
 router = APIRouter(
@@ -53,7 +58,8 @@ def validate_payment(
             db=db,
             contract_code=request.contract_tracking_code,
             payment_amount=request.amount,
-            funding_year=request.funding_year
+            funding_year=request.funding_year,
+            lock_rows=True,
         )
         
         # Prepare warning message if balance becomes negative
@@ -108,21 +114,15 @@ def validate_draft_payment(
     - HTTP 200 with balance breakdown when the draft is affordable.
     - HTTP 400 with the remaining balance when funds are insufficient.
     """
-    contract = db.query(Contract).filter(
-        Contract.tracking_code == request.contract_tracking_code,
-        Contract.is_deleted == False,
-    ).first()
-
-    if not contract:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Contract with tracking code '{request.contract_tracking_code}' not found or has been deleted.",
-        )
-
     try:
+        contract, _ = lock_active_contract_and_employer(
+            db, request.contract_tracking_code
+        )
         current_db_balance = calculate_real_balance(
             db, contract.employer_code, request.funding_year
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -158,87 +158,103 @@ def bulk_submit_payments(
     db: Session = Depends(get_db),
 ):
     """
-    Register a batch (cart) of payments inside a single database transaction.
+    Register a payment batch in one pessimistically locked transaction.
 
-    The endpoint iterates through the submitted payments and recalculates a
-    running balance per employer/funding-year dynamically. Each payment reserves
-    part of the available balance so that later payments in the same batch see
-    the reduced balance. If any payment breaches the available balance, the
-    ENTIRE transaction is rolled back and an HTTP 400 identifies the failing row.
+    Active contract and employer rows are locked with PostgreSQL ``FOR UPDATE``
+    before balances are calculated. Locks are acquired in deterministic order
+    and held through all inserts and the commit. Negative balances do not block
+    or roll back registration; they are returned as FR-20 warning messages.
 
-    **Parameters:**
-    - `payments`: List of payment objects to register atomically.
+    Args:
+        request: Validated batch of payments to register atomically.
+        db: Active SQLAlchemy database session.
 
-    **Returns:**
-    - HTTP 201 with the committed count and tracking codes when all succeed.
-    - HTTP 400 (rolled back) identifying the contract/row that failed.
+    Returns:
+        The committed tracking codes and any negative-balance warnings.
+
+    Raises:
+        HTTPException: If identifiers are duplicated, missing, or soft-deleted,
+            or if the database transaction fails.
     """
     tracking_codes = [item.tracking_code for item in request.payments]
+    seen_codes: set[str] = set()
+    duplicate_request_code = None
+    for tracking_code in tracking_codes:
+        if tracking_code in seen_codes:
+            duplicate_request_code = tracking_code
+            break
+        seen_codes.add(tracking_code)
 
-    seen_codes = set()
-    for code in tracking_codes:
-        if code in seen_codes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"خطا: کد رهگیری پرداخت '{code}' "
-                    "قبلاً در سیستم ثبت شده است."
-                ),
-            )
-        seen_codes.add(code)
-
-    existing = (
-        db.query(Payment.tracking_code)
-        .filter(
-            Payment.tracking_code.in_(tracking_codes),
-            Payment.is_deleted == False,
-        )
-        .first()
-    )
-    if existing:
-        duplicate_code = existing[0]
+    if duplicate_request_code is not None:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"خطا: کد رهگیری پرداخت '{duplicate_code}' "
+                f"خطا: کد رهگیری پرداخت '{duplicate_request_code}' "
                 "قبلاً در سیستم ثبت شده است."
             ),
         )
 
-    running_balances: dict = {}
+    running_balances: dict[tuple[str, int], float] = {}
     created_tracking_codes: List[str] = []
+    warning_messages: List[str] = []
 
     try:
+        existing = (
+            db.query(Payment.tracking_code)
+            .filter(
+                Payment.tracking_code.in_(tracking_codes),
+                Payment.is_deleted == False,
+            )
+            .first()
+        )
+        if existing:
+            duplicate_code = existing[0]
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"خطا: کد رهگیری پرداخت '{duplicate_code}' "
+                    "قبلاً در سیستم ثبت شده است."
+                ),
+            )
+
+        contract_codes = [
+            item.contract_tracking_code for item in request.payments
+        ]
+        locked_contracts = lock_active_contracts(db, contract_codes)
+        missing_contract_codes = sorted(
+            set(contract_codes) - set(locked_contracts)
+        )
+        if missing_contract_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Contract '{missing_contract_codes[0]}' not found or "
+                    "has been deleted."
+                ),
+            )
+
+        employer_codes = [
+            contract.employer_code for contract in locked_contracts.values()
+        ]
+        locked_employers = lock_active_employers(db, employer_codes)
+        missing_employer_codes = sorted(
+            set(employer_codes) - set(locked_employers)
+        )
+        if missing_employer_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Employer '{missing_employer_codes[0]}' not found or "
+                    "has been deleted."
+                ),
+            )
+
         for index, item in enumerate(request.payments):
-            contract = db.query(Contract).filter(
-                Contract.tracking_code == item.contract_tracking_code,
-                Contract.is_deleted == False,
-            ).first()
-
-            if not contract:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Row {index + 1} (tracking code '{item.tracking_code}') failed: "
-                        f"contract '{item.contract_tracking_code}' not found or has been deleted."
-                    ),
-                )
-
+            contract = locked_contracts[item.contract_tracking_code]
             balance_key = (contract.employer_code, item.funding_year)
             if balance_key not in running_balances:
                 running_balances[balance_key] = calculate_real_balance(
                     db, contract.employer_code, item.funding_year
-                )
-
-            if running_balances[balance_key] < item.amount:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Row {index + 1} (tracking code '{item.tracking_code}', "
-                        f"contract '{item.contract_tracking_code}') failed: insufficient funds. "
-                        f"Remaining balance is {running_balances[balance_key]:,.0f} Rials, "
-                        f"but the requested amount is {item.amount:,.0f} Rials."
-                    ),
                 )
 
             payment = Payment(
@@ -256,10 +272,16 @@ def bulk_submit_payments(
             db.add(payment)
 
             running_balances[balance_key] -= item.amount
+            if running_balances[balance_key] < 0:
+                warning_messages.append(
+                    f"Row {index + 1} (tracking code '{item.tracking_code}'): "
+                    f"employer '{contract.employer_code}' balance for funding "
+                    f"year {item.funding_year} is negative "
+                    f"({running_balances[balance_key]:,.0f} Rials) after registration."
+                )
             created_tracking_codes.append(item.tracking_code)
 
         db.commit()
-
     except HTTPException:
         db.rollback()
         raise
@@ -271,7 +293,12 @@ def bulk_submit_payments(
         )
 
     return PaymentBulkCreateResponse(
-        message="All payments were registered successfully.",
+        message=(
+            "All payments were registered successfully with balance warnings."
+            if warning_messages
+            else "All payments were registered successfully."
+        ),
         submitted_count=len(created_tracking_codes),
         tracking_codes=created_tracking_codes,
+        warning_messages=warning_messages,
     )

@@ -6,31 +6,23 @@ from datetime import datetime, date
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
-import jdatetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from core.date_helper import parse_strict_jalali_date
 from core.database import engine, Base
 from models.payment import Payment
 from models.contract import Contract
 
 
 def parse_jalali_date(date_str):
-    """Convert Jalali date string (YYYY/MM/DD) to Gregorian date object."""
-    if pd.isna(date_str) or date_str == '' or date_str is None:
+    """Parse a Jalali date strictly and return a Gregorian date."""
+    if pd.isna(date_str) or date_str == "" or date_str is None:
         return None
-    
+
     try:
-        date_str = str(date_str).strip()
-        parts = date_str.split('/')
-        if len(parts) != 3:
-            return None
-        
-        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
-        jalali_date = jdatetime.date(year, month, day)
-        gregorian_date = jalali_date.togregorian()
-        return gregorian_date
-    except (ValueError, AttributeError, IndexError):
+        return parse_strict_jalali_date(str(date_str))
+    except (TypeError, ValueError):
         return None
 
 
@@ -88,7 +80,11 @@ def main():
     print("\n3. Fetching valid contract tracking codes...")
     session = Session(bind=engine)
     try:
-        valid_contracts = set(session.query(Contract.tracking_code).all())
+        valid_contracts = set(
+            session.query(Contract.tracking_code)
+            .filter(Contract.is_deleted == False)
+            .all()
+        )
         valid_contracts = {code[0] for code in valid_contracts}
         print(f"   Found {len(valid_contracts)} valid contracts")
     finally:

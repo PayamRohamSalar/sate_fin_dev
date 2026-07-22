@@ -2,7 +2,6 @@ import pandas as pd
 import sys
 from pathlib import Path
 import io
-import jdatetime
 from decimal import Decimal
 
 # Fix encoding for Windows console
@@ -15,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from core.database import engine, Base
+from core.date_helper import parse_strict_jalali_date
 from models.contract import Contract
 from models.employer import Employer
 from models.university import University
@@ -22,18 +22,14 @@ from models.researchers import Researcher
 
 
 def parse_persian_date(date_str):
-    """Parse Persian date string (e.g., '1400/05/05') to Gregorian date"""
+    """Parse a Jalali date strictly and return a Gregorian date."""
     if pd.isna(date_str) or not date_str:
         return None
-    
+
     try:
-        # Remove any whitespace
-        date_str = str(date_str).strip()
-        # Parse Persian date and convert to Gregorian
-        persian_date = jdatetime.datetime.strptime(date_str, '%Y/%m/%d')
-        return persian_date.togregorian().date()
-    except Exception as e:
-        print(f"  [WARNING] Invalid date format: {date_str} - {e}")
+        return parse_strict_jalali_date(str(date_str))
+    except (TypeError, ValueError) as exc:
+        print(f"  [WARNING] Invalid date format: {date_str} - {exc}")
         return None
 
 
@@ -88,23 +84,31 @@ def import_contracts():
         print("Fetching valid foreign key references...")
         
         valid_employer_codes = set(
-            code for (code,) in session.query(Employer.classification_code).all()
+            code for (code,) in session.query(Employer.classification_code).filter(
+                Employer.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(valid_employer_codes)} valid employer codes")
         
         valid_university_ids = set(
-            uid for (uid,) in session.query(University.national_id).all()
+            uid for (uid,) in session.query(University.national_id).filter(
+                University.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(valid_university_ids)} valid university IDs")
         
         valid_researcher_ids = set(
-            rid for (rid,) in session.query(Researcher.national_code).all()
+            rid for (rid,) in session.query(Researcher.national_code).filter(
+                Researcher.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(valid_researcher_ids)} valid researcher IDs")
         
         # Query existing tracking codes to avoid duplicates
         existing_tracking_codes = set(
-            code for (code,) in session.query(Contract.tracking_code).all()
+            code for (code,) in session.query(Contract.tracking_code).filter(
+                Contract.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(existing_tracking_codes)} existing contracts in database")
         

@@ -140,3 +140,7 @@ class PaymentBulkCreateResponse(BaseModel):
     message: str = Field(..., description="Human readable success message")
     submitted_count: int = Field(..., description="Number of payments committed")
     tracking_codes: List[str] = Field(..., description="Tracking codes of the committed payments")
+    warning_messages: List[str] = Field(
+        default_factory=list,
+        description="Non-blocking FR-20 warnings for negative employer balances",
+    )

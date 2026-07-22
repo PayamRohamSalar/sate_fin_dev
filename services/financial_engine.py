@@ -1,5 +1,7 @@
-import pandas as pd
 from decimal import Decimal
+from typing import Sequence
+
+import pandas as pd
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -8,6 +10,112 @@ from models.deposits import AnnualMandate, DepositReceipt
 from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
+
+
+def lock_active_contracts(
+    db: Session,
+    contract_codes: Sequence[str],
+) -> dict[str, Contract]:
+    """
+    Lock and return active contracts in deterministic tracking-code order.
+
+    PostgreSQL keeps the row-level locks until the surrounding transaction
+    commits or rolls back. Sorting the unique keys gives concurrent payment
+    transactions a consistent lock order and reduces deadlock risk.
+
+    Args:
+        db: Active SQLAlchemy session with an open transaction.
+        contract_codes: Contract tracking codes that participate in the
+            financial operation.
+
+    Returns:
+        A mapping from tracking code to the locked active contract.
+    """
+    unique_codes = sorted(set(contract_codes))
+    if not unique_codes:
+        return {}
+
+    contracts = (
+        db.query(Contract)
+        .filter(
+            Contract.tracking_code.in_(unique_codes),
+            Contract.is_deleted == False,
+        )
+        .order_by(Contract.tracking_code)
+        .with_for_update()
+        .all()
+    )
+    return {contract.tracking_code: contract for contract in contracts}
+
+
+def lock_active_employers(
+    db: Session,
+    employer_codes: Sequence[str],
+) -> dict[str, Employer]:
+    """
+    Lock and return active employers in deterministic classification-code order.
+
+    The employer row is the serialization point for balance-changing operations.
+    Callers must retain the same transaction while calculating balances and
+    inserting payments so concurrent requests cannot validate stale balances.
+
+    Args:
+        db: Active SQLAlchemy session with an open transaction.
+        employer_codes: Employer classification codes to serialize.
+
+    Returns:
+        A mapping from classification code to the locked active employer.
+    """
+    unique_codes = sorted(set(employer_codes))
+    if not unique_codes:
+        return {}
+
+    employers = (
+        db.query(Employer)
+        .filter(
+            Employer.classification_code.in_(unique_codes),
+            Employer.is_deleted == False,
+        )
+        .order_by(Employer.classification_code)
+        .with_for_update()
+        .all()
+    )
+    return {employer.classification_code: employer for employer in employers}
+
+
+def lock_active_contract_and_employer(
+    db: Session,
+    contract_code: str,
+) -> tuple[Contract, Employer]:
+    """
+    Lock one active contract and its active employer for financial processing.
+
+    Args:
+        db: Active SQLAlchemy session with an open transaction.
+        contract_code: Tracking code of the contract to lock.
+
+    Returns:
+        The locked contract and its locked employer.
+
+    Raises:
+        ValueError: If the contract or linked employer is missing or soft-deleted.
+    """
+    contract = lock_active_contracts(db, [contract_code]).get(contract_code)
+    if contract is None:
+        raise ValueError(
+            f"Contract with tracking code '{contract_code}' not found or has been deleted."
+        )
+
+    employer = lock_active_employers(db, [contract.employer_code]).get(
+        contract.employer_code
+    )
+    if employer is None:
+        raise ValueError(
+            f"Employer with classification code '{contract.employer_code}' "
+            "not found or has been deleted."
+        )
+
+    return contract, employer
 
 
 def get_contracts_with_dynamic_status(
@@ -76,69 +184,88 @@ def get_contracts_with_dynamic_status(
 
     return db.execute(statement).all()
 
-def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -> float:
-    """
-    Calculates the real financial balance for a specific employer and funding year.
 
-    Formula: (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
+def calculate_real_balance(
+    db: Session,
+    employer_code: str,
+    funding_year: int,
+    *,
+    lock_employer: bool = False,
+) -> float:
     """
-    
-    # 1. Calculate Total Deposits (Including subsidiaries)
-    # Finding the employer and all its subsidiaries using the parent_code constraint
+    Calculate the real balance for an active employer and funding year.
+
+    Formula: ``(Deposits + Transfers In) - (Payments + Transfers Out)``.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        employer_code: Employer classification code.
+        funding_year: Funding year used by all balance components.
+        lock_employer: When true, acquire a PostgreSQL ``FOR UPDATE`` lock on
+            the active employer row before reading financial aggregates. The
+            caller must keep the transaction open through the related write.
+
+    Returns:
+        The calculated balance in base Rials.
+
+    Raises:
+        ValueError: If ``lock_employer`` is true and the employer is missing or
+            soft-deleted.
+    """
+    if lock_employer and employer_code not in lock_active_employers(
+        db, [employer_code]
+    ):
+        raise ValueError(
+            f"Employer with classification code '{employer_code}' "
+            "not found or has been deleted."
+        )
+
     deposits_query = db.query(func.sum(DepositReceipt.deposit_amount)).join(
         Employer, DepositReceipt.employer_code == Employer.classification_code
     ).filter(
         or_(
             Employer.classification_code == employer_code,
-            Employer.parent_code == employer_code
+            Employer.parent_code == employer_code,
         ),
         DepositReceipt.fiscal_year == funding_year,
         DepositReceipt.is_deleted == False,
-        Employer.is_deleted == False
+        Employer.is_deleted == False,
     ).scalar()
-    
-    total_deposits = deposits_query or Decimal('0.0')
+    total_deposits = deposits_query or Decimal("0.0")
 
-    # 2. Calculate Total Payments based on funding_year (NOT payment_year)
     payments_query = db.query(func.sum(Payment.amount)).join(
         Contract, Payment.contract_tracking_code == Contract.tracking_code
     ).filter(
         Contract.employer_code == employer_code,
         Payment.funding_year == funding_year,
         Payment.is_deleted == False,
-        Contract.is_deleted == False
+        Contract.is_deleted == False,
     ).scalar()
+    total_payments = payments_query or Decimal("0.0")
 
-    total_payments = payments_query or Decimal('0.0')
-
-    # 3. Calculate Transfers Out (funds sent from this employer or its subsidiaries)
     transfers_out_query = db.query(func.sum(CreditTransfer.amount)).join(
         Employer, CreditTransfer.source_employer_code == Employer.classification_code
     ).filter(
         or_(
             Employer.classification_code == employer_code,
-            Employer.parent_code == employer_code
+            Employer.parent_code == employer_code,
         ),
         CreditTransfer.fiscal_year == funding_year,
         CreditTransfer.is_deleted == False,
-        Employer.is_deleted == False
+        Employer.is_deleted == False,
     ).scalar()
-    
-    transfers_out = transfers_out_query or Decimal('0.0')
+    transfers_out = transfers_out_query or Decimal("0.0")
 
-    # 4. Calculate Transfers In (funds received by this employer)
     transfers_in_query = db.query(func.sum(CreditTransfer.amount)).filter(
         CreditTransfer.destination_employer_code == employer_code,
         CreditTransfer.fiscal_year == funding_year,
-        CreditTransfer.is_deleted == False
+        CreditTransfer.is_deleted == False,
     ).scalar()
-    
-    transfers_in = transfers_in_query or Decimal('0.0')
+    transfers_in = transfers_in_query or Decimal("0.0")
 
-    # 5. Calculate Real Balance
     real_balance = total_deposits + transfers_in - transfers_out - total_payments
-    
     return float(real_balance)
+
 
 def get_mandated_amount(db: Session, employer_code: str, fiscal_year: int) -> float:
     """
@@ -286,58 +413,67 @@ def get_all_employers_financials(db: Session) -> pd.DataFrame:
     ]
 
 
-def validate_payment_impact(db: Session, contract_code: str, payment_amount: float, funding_year: int) -> dict:
+def validate_payment_impact(
+    db: Session,
+    contract_code: str,
+    payment_amount: float,
+    funding_year: int,
+    *,
+    lock_rows: bool = False,
+) -> dict:
     """
-    Validates the impact of a payment on the employer's balance.
-    
-    This function implements FR-18, FR-19, FR-20 from the conceptual design:
-    - FR-18: Query the contract to find the linked employer
-    - FR-19: Calculate current balance and project new balance after payment
-    - FR-20: Warn (but do not block) if the balance becomes negative
-    
+    Validate a payment's impact on the linked employer's real balance.
+
+    This function implements FR-18, FR-19, and FR-20. A negative projected
+    balance is reported through ``is_negative`` and never raises an error.
+
     Args:
-        db: Database session
-        contract_code: The contract tracking code
-        payment_amount: The amount to be paid
-        funding_year: The funding year for the payment
-    
+        db: Active SQLAlchemy database session.
+        contract_code: Contract tracking code linked to the payment.
+        payment_amount: Payment amount in base Rials.
+        funding_year: Funding year for the payment.
+        lock_rows: When true, lock the active contract and employer rows for
+            the duration of the caller's transaction.
+
     Returns:
-        dict containing:
-            - employer_code: The employer's classification code
-            - current_balance: Current balance before payment
-            - payment_amount: The payment amount
-            - new_balance: Projected balance after payment
-            - is_negative: Whether the new balance will be negative
-    
+        A dictionary containing employer code, current balance, payment amount,
+        projected balance, and whether the projected balance is negative.
+
     Raises:
-        ValueError: If contract is not found or has been deleted
+        ValueError: If the contract or linked employer is missing or soft-deleted.
     """
-    
-    # Step 1: Find the contract and get the employer_code
-    contract = db.query(Contract).filter(
-        Contract.tracking_code == contract_code,
-        Contract.is_deleted == False
-    ).first()
-    
-    if not contract:
-        raise ValueError(f"Contract with tracking code '{contract_code}' not found or has been deleted.")
-    
+    if lock_rows:
+        contract, _ = lock_active_contract_and_employer(db, contract_code)
+    else:
+        contract = (
+            db.query(Contract)
+            .join(
+                Employer,
+                and_(
+                    Contract.employer_code == Employer.classification_code,
+                    Employer.is_deleted == False,
+                ),
+            )
+            .filter(
+                Contract.tracking_code == contract_code,
+                Contract.is_deleted == False,
+            )
+            .first()
+        )
+
+    if contract is None:
+        raise ValueError(
+            f"Contract with tracking code '{contract_code}' not found or has been deleted."
+        )
+
     employer_code = contract.employer_code
-    
-    # Step 2: Calculate current balance using existing function
     current_balance = calculate_real_balance(db, employer_code, funding_year)
-    
-    # Step 3: Calculate new balance after payment
     new_balance = current_balance - payment_amount
-    
-    # Step 4: Determine if balance becomes negative
-    is_negative = new_balance < 0
-    
-    # Step 5: Return validation result
+
     return {
         "employer_code": employer_code,
         "current_balance": current_balance,
         "payment_amount": payment_amount,
         "new_balance": new_balance,
-        "is_negative": is_negative
+        "is_negative": new_balance < 0,
     }

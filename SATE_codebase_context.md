@@ -5,7 +5,6 @@
     main.py
     SATE_codebase_context.md
     test_engine_cli.py
-    .cursor/
     .pgdata/
         base/
             1/
@@ -43,6 +42,8 @@
                 contracts.py
                 employers.py
                 payments.py
+                researchers.py
+                universities.py
                 __init__.py
     core/
         database.py
@@ -54,6 +55,9 @@
         README.md
         views/
             batch_payments_page.py
+            contract_entry_page.py
+            researcher_entry_page.py
+            university_entry_page.py
     data/
         Archive/
             Payments/
@@ -74,8 +78,11 @@
         contract_schema.py
         employer_schema.py
         payment_schema.py
+        researcher_schema.py
+        university_schema.py
         __init__.py
     scripts/
+        add_contract_attachment_path.py
         append_new_mandates.py
         chart01_total_trend.py
         check_excel.py
@@ -329,7 +336,7 @@ if __name__ == "__main__":
 ------------------------------
 from fastapi import APIRouter
 
-from api.v1.endpoints import contracts, employers, payments
+from api.v1.endpoints import contracts, employers, payments, universities, researchers
 
 # Create the main API router for version 1
 api_router = APIRouter()
@@ -338,6 +345,8 @@ api_router = APIRouter()
 api_router.include_router(employers.router)
 api_router.include_router(payments.router)
 api_router.include_router(contracts.router)
+api_router.include_router(universities.router)
+api_router.include_router(researchers.router)
 
 # Future routers can be added here as the system grows:
 # api_router.include_router(deposits.router)
@@ -351,8 +360,9 @@ api_router.include_router(contracts.router)
 ------------------------------
 from typing import List
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.database import get_db
@@ -360,47 +370,143 @@ from models.contract import Contract
 from models.employer import Employer
 from models.researchers import Researcher
 from models.university import University
-from schemas.contract_schema import ContractSearchResult
+from schemas.contract_schema import ContractCreate, ContractSearchResult
 
-router = APIRouter(
-    prefix="/contracts",
-    tags=["Contracts"]
+router = APIRouter(prefix="/contracts", tags=["Contracts"])
+
+DUPLICATE_CONTRACT_MESSAGE = (
+    "قراردادی با کد رهگیری '{tracking_code}' قبلاً ثبت شده است. "
+    "لطفاً از ارسال مجدد فرم خودداری کنید."
 )
+
+
+def _optional_text(value: str | None) -> str | None:
+    """Normalize optional text values before database persistence."""
+    if value is None:
+        return None
+    normalized_value = value.strip()
+    return normalized_value or None
+
+
+def _get_active_contract_parties(
+    db: Session,
+    payload: ContractCreate,
+) -> tuple[Employer, University, Researcher]:
+    """Load active contract parties and enforce employer business rules."""
+    employer = (
+        db.query(Employer)
+        .filter(
+            Employer.classification_code
+            == payload.employer_classification_code,
+            Employer.is_deleted == False,
+        )
+        .first()
+    )
+    if employer is None:
+        raise HTTPException(
+            status_code=404,
+            detail="کارفرمای انتخاب‌شده یافت نشد یا حذف شده است.",
+        )
+    if employer.employer_type == "Subsidiary":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "خطا: شرکت‌های زیرمجموعه مجاز به انعقاد قرارداد نمی‌باشند. "
+                "قرارداد باید به نام شرکت مادر ثبت شود."
+            ),
+        )
+
+    university = (
+        db.query(University)
+        .filter(
+            University.national_id == payload.university_national_id,
+            University.is_deleted == False,
+        )
+        .first()
+    )
+    if university is None:
+        raise HTTPException(
+            status_code=404,
+            detail="دانشگاه انتخاب‌شده یافت نشد یا حذف شده است.",
+        )
+
+    researcher = (
+        db.query(Researcher)
+        .filter(
+            Researcher.national_code == payload.researcher_national_id,
+            Researcher.is_deleted == False,
+        )
+        .first()
+    )
+    if researcher is None:
+        raise HTTPException(
+            status_code=404,
+            detail="فناور انتخاب‌شده یافت نشد یا حذف شده است.",
+        )
+
+    return employer, university, researcher
+
+
+def _to_search_result(
+    contract: Contract,
+    employer: Employer,
+    university: University,
+    researcher: Researcher,
+) -> ContractSearchResult:
+    """Build the public contract response from persisted entities."""
+    return ContractSearchResult(
+        contract_tracking_code=contract.tracking_code,
+        title=contract.title,
+        employer_name=employer.name,
+        employer_classification_code=employer.classification_code,
+        university_name=university.name,
+        researcher_name=researcher.full_name,
+    )
 
 
 @router.get("/search", response_model=List[ContractSearchResult])
 def search_contracts(
-    q: str = Query(..., min_length=1, description="Search term matched against tracking code or title"),
+    q: str = Query(
+        ...,
+        min_length=1,
+        description="Search term matched against tracking code or title",
+    ),
     db: Session = Depends(get_db),
 ):
-    """
-    Search active contracts for the payment auto-fill flow.
-
-    Matches the query `q` (case-insensitive) against either the contract
-    `tracking_code` or `title`. Only non-deleted contracts are returned, joined
-    with their employer, university, and researcher to provide display names.
-
-    **Parameters:**
-    - `q`: Free-text search term (partial matches supported).
-
-    **Returns:**
-    - A list of matching contracts with denormalized employer, university, and
-      researcher details for frontend auto-fill.
-    """
+    """Search active contracts and active related entities for auto-fill."""
     like_pattern = f"%{q}%"
-
     rows = (
         db.query(
             Contract.tracking_code.label("contract_tracking_code"),
             Contract.title.label("title"),
             Employer.name.label("employer_name"),
-            Employer.classification_code.label("employer_classification_code"),
+            Employer.classification_code.label(
+                "employer_classification_code"
+            ),
             University.name.label("university_name"),
             Researcher.full_name.label("researcher_name"),
         )
-        .outerjoin(Employer, Contract.employer_code == Employer.classification_code)
-        .outerjoin(University, Contract.university_id == University.national_id)
-        .outerjoin(Researcher, Contract.researcher_id == Researcher.national_code)
+        .join(
+            Employer,
+            and_(
+                Contract.employer_code == Employer.classification_code,
+                Employer.is_deleted == False,
+            ),
+        )
+        .join(
+            University,
+            and_(
+                Contract.university_id == University.national_id,
+                University.is_deleted == False,
+            ),
+        )
+        .join(
+            Researcher,
+            and_(
+                Contract.researcher_id == Researcher.national_code,
+                Researcher.is_deleted == False,
+            ),
+        )
         .filter(
             Contract.is_deleted == False,
             or_(
@@ -411,17 +517,76 @@ def search_contracts(
         .all()
     )
 
-    return [
-        ContractSearchResult(
-            contract_tracking_code=row.contract_tracking_code,
-            title=row.title,
-            employer_name=row.employer_name,
-            employer_classification_code=row.employer_classification_code,
-            university_name=row.university_name,
-            researcher_name=row.researcher_name,
+    return [ContractSearchResult(**row._asdict()) for row in rows]
+
+
+@router.post("/", response_model=ContractSearchResult, status_code=201)
+def create_contract(
+    payload: ContractCreate,
+    db: Session = Depends(get_db),
+):
+    """Register a contract and gracefully reject duplicate submissions."""
+    tracking_code = payload.tracking_code.strip()
+    title = payload.title.strip()
+    if not tracking_code or not title:
+        raise HTTPException(
+            status_code=400,
+            detail="کد رهگیری و عنوان قرارداد الزامی هستند.",
         )
-        for row in rows
-    ]
+
+    existing_contract = (
+        db.query(Contract.tracking_code)
+        .filter(
+            Contract.tracking_code == tracking_code,
+            Contract.is_deleted == False,
+        )
+        .first()
+    )
+    if existing_contract is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=DUPLICATE_CONTRACT_MESSAGE.format(
+                tracking_code=tracking_code
+            ),
+        )
+
+    employer, university, researcher = _get_active_contract_parties(db, payload)
+    contract = Contract(
+        tracking_code=tracking_code,
+        employer_code=payload.employer_classification_code,
+        university_id=payload.university_national_id,
+        researcher_id=payload.researcher_national_id,
+        contract_number=_optional_text(payload.contract_number),
+        proposal_id=_optional_text(payload.proposal_id),
+        attachment_path=_optional_text(payload.attachment_path),
+        title=title,
+        total_amount=payload.total_amount,
+        contract_date=payload.contract_date,
+        duration_months=payload.duration_months,
+        status="فعال",
+        is_deleted=False,
+    )
+    db.add(contract)
+
+    try:
+        db.commit()
+        db.refresh(contract)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=DUPLICATE_CONTRACT_MESSAGE.format(
+                tracking_code=tracking_code
+            ),
+        ) from exc
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="خطا در ذخیره قرارداد. لطفاً مجدداً تلاش کنید.",
+        ) from exc
+
+    return _to_search_result(contract, employer, university, researcher)
 
 
 ## File: api\v1\endpoints\employers.py
@@ -494,6 +659,15 @@ def get_employer_balance(
         inquiry_date_jalali=BalanceResponse.get_current_jalali_date()
     )
 
+@router.get("/lookup", summary="Employer lookup for dropdowns")
+def employer_lookup(db: Session = Depends(get_db)):
+    """Return classification_code + name for non-subsidiary employers."""
+    rows = db.query(Employer.classification_code, Employer.name).filter(
+        Employer.employer_type != "Subsidiary",
+        Employer.is_deleted == False,
+    ).order_by(Employer.name).all()
+    return [{"classification_code": code, "name": name} for code, name in rows]
+
 
 ## File: api\v1\endpoints\payments.py
 ------------------------------
@@ -503,9 +677,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from core.database import get_db
-from models.contract import Contract
 from models.payment import Payment
-from services.financial_engine import calculate_real_balance, validate_payment_impact
 from schemas.payment_schema import (
     PaymentBatchValidationRequest,
     PaymentBatchValidationResponse,
@@ -513,6 +685,13 @@ from schemas.payment_schema import (
     PaymentBulkCreateResponse,
     PaymentValidationRequest,
     PaymentValidationResponse,
+)
+from services.financial_engine import (
+    calculate_real_balance,
+    lock_active_contract_and_employer,
+    lock_active_contracts,
+    lock_active_employers,
+    validate_payment_impact,
 )
 
 router = APIRouter(
@@ -552,7 +731,8 @@ def validate_payment(
             db=db,
             contract_code=request.contract_tracking_code,
             payment_amount=request.amount,
-            funding_year=request.funding_year
+            funding_year=request.funding_year,
+            lock_rows=True,
         )
         
         # Prepare warning message if balance becomes negative
@@ -607,21 +787,15 @@ def validate_draft_payment(
     - HTTP 200 with balance breakdown when the draft is affordable.
     - HTTP 400 with the remaining balance when funds are insufficient.
     """
-    contract = db.query(Contract).filter(
-        Contract.tracking_code == request.contract_tracking_code,
-        Contract.is_deleted == False,
-    ).first()
-
-    if not contract:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Contract with tracking code '{request.contract_tracking_code}' not found or has been deleted.",
-        )
-
     try:
+        contract, _ = lock_active_contract_and_employer(
+            db, request.contract_tracking_code
+        )
         current_db_balance = calculate_real_balance(
             db, contract.employer_code, request.funding_year
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         raise HTTPException(
             status_code=500,
@@ -657,87 +831,103 @@ def bulk_submit_payments(
     db: Session = Depends(get_db),
 ):
     """
-    Register a batch (cart) of payments inside a single database transaction.
+    Register a payment batch in one pessimistically locked transaction.
 
-    The endpoint iterates through the submitted payments and recalculates a
-    running balance per employer/funding-year dynamically. Each payment reserves
-    part of the available balance so that later payments in the same batch see
-    the reduced balance. If any payment breaches the available balance, the
-    ENTIRE transaction is rolled back and an HTTP 400 identifies the failing row.
+    Active contract and employer rows are locked with PostgreSQL ``FOR UPDATE``
+    before balances are calculated. Locks are acquired in deterministic order
+    and held through all inserts and the commit. Negative balances do not block
+    or roll back registration; they are returned as FR-20 warning messages.
 
-    **Parameters:**
-    - `payments`: List of payment objects to register atomically.
+    Args:
+        request: Validated batch of payments to register atomically.
+        db: Active SQLAlchemy database session.
 
-    **Returns:**
-    - HTTP 201 with the committed count and tracking codes when all succeed.
-    - HTTP 400 (rolled back) identifying the contract/row that failed.
+    Returns:
+        The committed tracking codes and any negative-balance warnings.
+
+    Raises:
+        HTTPException: If identifiers are duplicated, missing, or soft-deleted,
+            or if the database transaction fails.
     """
     tracking_codes = [item.tracking_code for item in request.payments]
+    seen_codes: set[str] = set()
+    duplicate_request_code = None
+    for tracking_code in tracking_codes:
+        if tracking_code in seen_codes:
+            duplicate_request_code = tracking_code
+            break
+        seen_codes.add(tracking_code)
 
-    seen_codes = set()
-    for code in tracking_codes:
-        if code in seen_codes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"خطا: کد رهگیری پرداخت '{code}' "
-                    "قبلاً در سیستم ثبت شده است."
-                ),
-            )
-        seen_codes.add(code)
-
-    existing = (
-        db.query(Payment.tracking_code)
-        .filter(
-            Payment.tracking_code.in_(tracking_codes),
-            Payment.is_deleted == False,
-        )
-        .first()
-    )
-    if existing:
-        duplicate_code = existing[0]
+    if duplicate_request_code is not None:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"خطا: کد رهگیری پرداخت '{duplicate_code}' "
+                f"خطا: کد رهگیری پرداخت '{duplicate_request_code}' "
                 "قبلاً در سیستم ثبت شده است."
             ),
         )
 
-    running_balances: dict = {}
+    running_balances: dict[tuple[str, int], float] = {}
     created_tracking_codes: List[str] = []
+    warning_messages: List[str] = []
 
     try:
+        existing = (
+            db.query(Payment.tracking_code)
+            .filter(
+                Payment.tracking_code.in_(tracking_codes),
+                Payment.is_deleted == False,
+            )
+            .first()
+        )
+        if existing:
+            duplicate_code = existing[0]
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"خطا: کد رهگیری پرداخت '{duplicate_code}' "
+                    "قبلاً در سیستم ثبت شده است."
+                ),
+            )
+
+        contract_codes = [
+            item.contract_tracking_code for item in request.payments
+        ]
+        locked_contracts = lock_active_contracts(db, contract_codes)
+        missing_contract_codes = sorted(
+            set(contract_codes) - set(locked_contracts)
+        )
+        if missing_contract_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Contract '{missing_contract_codes[0]}' not found or "
+                    "has been deleted."
+                ),
+            )
+
+        employer_codes = [
+            contract.employer_code for contract in locked_contracts.values()
+        ]
+        locked_employers = lock_active_employers(db, employer_codes)
+        missing_employer_codes = sorted(
+            set(employer_codes) - set(locked_employers)
+        )
+        if missing_employer_codes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Employer '{missing_employer_codes[0]}' not found or "
+                    "has been deleted."
+                ),
+            )
+
         for index, item in enumerate(request.payments):
-            contract = db.query(Contract).filter(
-                Contract.tracking_code == item.contract_tracking_code,
-                Contract.is_deleted == False,
-            ).first()
-
-            if not contract:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Row {index + 1} (tracking code '{item.tracking_code}') failed: "
-                        f"contract '{item.contract_tracking_code}' not found or has been deleted."
-                    ),
-                )
-
+            contract = locked_contracts[item.contract_tracking_code]
             balance_key = (contract.employer_code, item.funding_year)
             if balance_key not in running_balances:
                 running_balances[balance_key] = calculate_real_balance(
                     db, contract.employer_code, item.funding_year
-                )
-
-            if running_balances[balance_key] < item.amount:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Row {index + 1} (tracking code '{item.tracking_code}', "
-                        f"contract '{item.contract_tracking_code}') failed: insufficient funds. "
-                        f"Remaining balance is {running_balances[balance_key]:,.0f} Rials, "
-                        f"but the requested amount is {item.amount:,.0f} Rials."
-                    ),
                 )
 
             payment = Payment(
@@ -755,10 +945,16 @@ def bulk_submit_payments(
             db.add(payment)
 
             running_balances[balance_key] -= item.amount
+            if running_balances[balance_key] < 0:
+                warning_messages.append(
+                    f"Row {index + 1} (tracking code '{item.tracking_code}'): "
+                    f"employer '{contract.employer_code}' balance for funding "
+                    f"year {item.funding_year} is negative "
+                    f"({running_balances[balance_key]:,.0f} Rials) after registration."
+                )
             created_tracking_codes.append(item.tracking_code)
 
         db.commit()
-
     except HTTPException:
         db.rollback()
         raise
@@ -770,9 +966,186 @@ def bulk_submit_payments(
         )
 
     return PaymentBulkCreateResponse(
-        message="All payments were registered successfully.",
+        message=(
+            "All payments were registered successfully with balance warnings."
+            if warning_messages
+            else "All payments were registered successfully."
+        ),
         submitted_count=len(created_tracking_codes),
         tracking_codes=created_tracking_codes,
+        warning_messages=warning_messages,
+    )
+
+
+## File: api\v1\endpoints\researchers.py
+------------------------------
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from core.database import get_db
+from models.researchers import Researcher
+from models.university import University
+from schemas.researcher_schema import ResearcherCreate, ResearcherCreated
+
+router = APIRouter(
+    prefix="/researchers",
+    tags=["Researchers"],
+)
+
+
+@router.get("/lookup", summary="Researcher lookup for dropdowns")
+def researcher_lookup(db: Session = Depends(get_db)):
+    """Return national_id + name for active researchers."""
+    rows = db.query(Researcher.national_code, Researcher.full_name).filter(
+        Researcher.is_deleted == False,
+    ).order_by(Researcher.full_name).all()
+    return [{"national_id": nc, "name": name} for nc, name in rows]
+
+
+@router.post("/", response_model=ResearcherCreated, status_code=201)
+def create_researcher(req: ResearcherCreate, db: Session = Depends(get_db)):
+    """
+    Register a new researcher (فناور).
+
+    Business rule: a unique national_code is enforced before insert (including
+    soft-deleted records). The model requires full_name, which is built by
+    concatenating first_name and last_name.
+    """
+    existing = db.query(Researcher).filter(
+        Researcher.national_code == req.national_code,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="خطا: فناور با این کد ملی قبلاً در سیستم ثبت شده است.",
+        )
+
+    university = db.query(University).filter(
+        University.national_id == req.university_id,
+        University.is_deleted == False,
+    ).first()
+    if not university:
+        raise HTTPException(
+            status_code=404,
+            detail=f"دانشگاه/موسسه‌ای با شناسه ملی '{req.university_id}' یافت نشد.",
+        )
+
+    full_name = f"{req.first_name.strip()} {req.last_name.strip()}"
+
+    researcher = Researcher(
+        national_code=req.national_code,
+        first_name=req.first_name.strip(),
+        last_name=req.last_name.strip(),
+        full_name=full_name,
+        mobile=req.mobile,
+        email=req.email,
+        academic_rank=req.academic_rank,
+        education_level=req.education_level,
+        researcher_type=req.researcher_type,
+        university_id=req.university_id,
+        status=req.status,
+        is_deleted=False,
+    )
+    db.add(researcher)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="خطا: فناور با این کد ملی قبلاً در سیستم ثبت شده است.",
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error saving researcher: {e}")
+    db.refresh(researcher)
+
+    return ResearcherCreated(
+        national_code=researcher.national_code,
+        full_name=researcher.full_name,
+        university_id=researcher.university_id,
+        academic_rank=researcher.academic_rank,
+        education_level=researcher.education_level,
+        researcher_type=researcher.researcher_type,
+        status=researcher.status,
+    )
+
+
+## File: api\v1\endpoints\universities.py
+------------------------------
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from core.database import get_db
+from models.university import University
+from schemas.university_schema import UniversityCreate, UniversityCreated
+
+router = APIRouter(
+    prefix="/universities",
+    tags=["Universities"],
+)
+
+
+@router.get("/lookup", summary="University lookup for dropdowns")
+def university_lookup(db: Session = Depends(get_db)):
+    """Return national_id + name for active universities."""
+    rows = db.query(University.national_id, University.name).filter(
+        University.is_deleted == False,
+    ).order_by(University.name).all()
+    return [{"national_id": nid, "name": name} for nid, name in rows]
+
+
+@router.post("/", response_model=UniversityCreated, status_code=201)
+def create_university(payload: UniversityCreate, db: Session = Depends(get_db)):
+    """
+    Register a new university / executing institution.
+
+    Business rule: a unique national_id is enforced before insert (including
+    soft-deleted records) to avoid re-registration conflicts.
+    """
+    existing = db.query(University).filter(
+        University.national_id == payload.national_id,
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="خطا: موسسه‌ای با این شناسه ملی قبلاً در سیستم ثبت شده است.",
+        )
+
+    university = University(
+        national_id=payload.national_id,
+        name=payload.name,
+        province=payload.province,
+        university_type=payload.university_type,
+        status="Active" if payload.is_active else "Inactive",
+        is_deleted=False,
+    )
+    db.add(university)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="خطا: موسسه‌ای با این شناسه ملی قبلاً در سیستم ثبت شده است.",
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error saving university: {e}")
+    db.refresh(university)
+
+    return UniversityCreated(
+        national_id=university.national_id,
+        name=university.name,
+        province=university.province,
+        university_type=university.university_type,
+        status=university.status,
     )
 
 
@@ -1437,11 +1810,14 @@ def main():
     # 2. Define the pages via the st.Page API.
     dash_page = st.Page(render_dashboard, title="داشبورد اصلی", icon="📊", default=True)
     batch_payments_page = st.Page("views/batch_payments_page.py", title="ثبت دسته‌ای پرداخت", icon="📝")
+    contract_entry_page = st.Page("views/contract_entry_page.py", title="ثبت قرارداد جدید", icon="📄")
+    university_entry_page = st.Page("views/university_entry_page.py", title="ثبت موسسه مجری", icon="🏫")
+    researcher_entry_page = st.Page("views/researcher_entry_page.py", title="ثبت اطلاعات فناور", icon="🧑‍🔬")
 
     # 3. Group and initialize navigation.
     pg = st.navigation({
         "داشبوردهای مدیریتی": [dash_page],
-        "فرم‌های ورود اطلاعات": [batch_payments_page],
+        "فرم‌های ورود اطلاعات": [batch_payments_page, contract_entry_page, university_entry_page, researcher_entry_page],
     })
 
     # 4. Inject global CSS (RTL & Fonts) before rendering the active page.
@@ -2354,6 +2730,575 @@ if st.session_state.payment_cart:
 else:
     st.info("لیست پیش‌نویس در حال حاضر خالی است. ردیف‌های پرداخت را از بخش بالا اضافه کنید.")
 
+## File: dashboard\views\contract_entry_page.py
+------------------------------
+"""Render the Phase 4 contract registration form."""
+
+import re
+from pathlib import Path
+from uuid import uuid4
+
+import jdatetime
+import requests
+import streamlit as st
+
+API_URL = "http://127.0.0.1:8000/api/v1"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONTRACT_ARCHIVE_DIR = PROJECT_ROOT / "data" / "Archive" / "Contracts"
+ALLOWED_ATTACHMENT_TYPES = {"pdf", "jpg", "jpeg", "png"}
+FORM_KEY = "contract_entry_form"
+FORM_WIDGET_KEYS = (
+    "contract_employer",
+    "contract_university",
+    "contract_researcher",
+    "contract_tracking_code",
+    "contract_number",
+    "contract_proposal_id",
+    "contract_title",
+    "contract_total_amount",
+    "contract_duration_months",
+    "contract_date",
+    "contract_attachment",
+)
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    * { font-family: 'Vazirmatn', sans-serif !important; }
+    .block-container, .stTextInput, .stNumberInput, .stSelectbox,
+    .stDateInput, .stFileUploader, p, div {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    [data-testid="stSidebarNav"] span {
+        direction: rtl !important;
+        text-align: right !important;
+        font-size: 1.05rem !important;
+    }
+    div[data-testid="InputInstructions"] { display: none !important; }
+    h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
+    h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
+    hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("📄 فرم ثبت قرارداد جدید")
+
+
+def _safe_lookup(path: str) -> list[dict]:
+    """Fetch a lookup list and display a localized error when unavailable."""
+    try:
+        response = requests.get(f"{API_URL}{path}", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        st.error(f"خطا در دریافت اطلاعات ({path}): {response.status_code}")
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+            "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+        )
+    except requests.exceptions.Timeout:
+        st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+    except Exception as exc:
+        st.error(f"خطای پیش‌بینی‌نشده در دریافت اطلاعات: {exc}")
+    return []
+
+
+def _format_option(item: dict, value_key: str) -> str:
+    """Format lookup entries as a human-readable code and name pair."""
+    return f"{item[value_key]} - {item['name']}"
+
+
+def _optional_text(value: str) -> str | None:
+    """Return stripped optional form text or ``None`` when empty."""
+    normalized_value = value.strip()
+    return normalized_value or None
+
+
+def _parse_jalali_date(value: str) -> str:
+    """Parse a strict Jalali date and return its Gregorian ISO representation."""
+    date_parts = re.split(r"[/-]", value.strip())
+    if len(date_parts) != 3 or any(not part.isdigit() for part in date_parts):
+        raise ValueError("Invalid Jalali date format")
+
+    year, month, day = (int(part) for part in date_parts)
+    jalali_date = jdatetime.date(year, month, day)
+    return jalali_date.togregorian().isoformat()
+
+
+def _safe_filename(original_name: str) -> str:
+    """Create a collision-resistant filename without unsafe path characters."""
+    original_path = Path(original_name)
+    extension = original_path.suffix.lower()
+    sanitized_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", original_path.stem).strip("_")
+    safe_stem = sanitized_stem[:80] or "contract"
+    return f"{safe_stem}_{uuid4().hex}{extension}"
+
+
+def _save_attachment(uploaded_file) -> Path | None:
+    """Save an uploaded contract document and return its project-relative path."""
+    if uploaded_file is None:
+        return None
+
+    extension = Path(uploaded_file.name).suffix.lower().lstrip(".")
+    if extension not in ALLOWED_ATTACHMENT_TYPES:
+        raise ValueError("نوع فایل نامعتبر است. فقط PDF، JPG و PNG مجاز هستند.")
+
+    CONTRACT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    destination = CONTRACT_ARCHIVE_DIR / _safe_filename(uploaded_file.name)
+    destination.write_bytes(uploaded_file.getvalue())
+    return destination.relative_to(PROJECT_ROOT)
+
+
+def _delete_attachment(relative_path: Path | None) -> None:
+    """Remove a newly saved attachment after a failed contract submission."""
+    if relative_path is None:
+        return
+    absolute_path = (PROJECT_ROOT / relative_path).resolve()
+    archive_root = CONTRACT_ARCHIVE_DIR.resolve()
+    if archive_root not in absolute_path.parents:
+        return
+    absolute_path.unlink(missing_ok=True)
+
+
+def _schedule_form_reset() -> None:
+    """Schedule widget cleanup for the next Streamlit render cycle."""
+    st.session_state.contract_form_reset_pending = True
+    st.rerun()
+
+
+def _apply_pending_form_reset() -> None:
+    """Clear contract widget state before the widgets are recreated."""
+    if not st.session_state.pop("contract_form_reset_pending", False):
+        return
+    for widget_key in FORM_WIDGET_KEYS:
+        st.session_state.pop(widget_key, None)
+
+
+def _response_detail(response: requests.Response) -> str:
+    """Extract an API error detail while tolerating non-JSON responses."""
+    try:
+        return response.json().get("detail", "خطای ناشناخته.")
+    except ValueError:
+        return "خطای ناشناخته."
+
+
+_apply_pending_form_reset()
+
+employers = _safe_lookup("/employers/lookup")
+universities = _safe_lookup("/universities/lookup")
+researchers = _safe_lookup("/researchers/lookup")
+
+if not employers or not universities or not researchers:
+    st.warning(
+        "برای ادامه، ابتدا باید حداقل یک کارفرما (غیر زیرمجموعه)، "
+        "یک دانشگاه و یک فناور در سیستم موجود باشد."
+    )
+    st.stop()
+
+success_message = st.session_state.pop("contract_success_message", None)
+if success_message:
+    st.success(success_message)
+    st.toast("✅ قرارداد جدید ثبت شد.", icon="📄")
+
+employer_options = {
+    item["classification_code"]: _format_option(item, "classification_code")
+    for item in employers
+}
+university_options = {
+    item["national_id"]: _format_option(item, "national_id")
+    for item in universities
+}
+researcher_options = {
+    item["national_id"]: _format_option(item, "national_id")
+    for item in researchers
+}
+
+with st.form(FORM_KEY, clear_on_submit=False):
+    st.subheader("۱. اطلاعات طرف‌های قرارداد")
+    employer_choice = st.selectbox(
+        "🏢 کارفرما (شرکت مادر):",
+        options=list(employer_options),
+        format_func=employer_options.get,
+        key="contract_employer",
+    )
+    university_choice = st.selectbox(
+        "🎓 مجری (دانشگاه/موسسه):",
+        options=list(university_options),
+        format_func=university_options.get,
+        key="contract_university",
+    )
+    researcher_choice = st.selectbox(
+        "🧑‍💻 فناور (مجری پروژه):",
+        options=list(researcher_options),
+        format_func=researcher_options.get,
+        key="contract_researcher",
+    )
+
+    st.markdown("---")
+    st.subheader("۲. مشخصات قرارداد")
+    tracking_code = st.text_input(
+        "🔖 کد رهگیری قرارداد:", key="contract_tracking_code"
+    )
+
+    identifier_col, proposal_col = st.columns(2)
+    with identifier_col:
+        contract_number = st.text_input(
+            "📑 شماره قرارداد:", key="contract_number"
+        )
+    with proposal_col:
+        proposal_id = st.text_input(
+            "🧾 شناسه پیشنهاده:", key="contract_proposal_id"
+        )
+
+    title = st.text_input("📝 عنوان قرارداد:", key="contract_title")
+    amount_col, duration_col = st.columns(2)
+    with amount_col:
+        total_amount = st.number_input(
+            "💰 مبلغ کل قرارداد (ریال):",
+            min_value=0.0,
+            step=1_000_000.0,
+            format="%.2f",
+            key="contract_total_amount",
+        )
+    with duration_col:
+        duration_months = st.number_input(
+            "⏳ مدت قرارداد (ماه):",
+            min_value=1,
+            step=1,
+            value=12,
+            key="contract_duration_months",
+        )
+
+    contract_date_str = st.text_input(
+        "📅 تاریخ انعقاد قرارداد (شمسی):",
+        placeholder="مثال: 1403/05/12",
+        key="contract_date",
+    )
+    attachment = st.file_uploader(
+        "📎 فایل قرارداد (PDF/JPG/PNG):",
+        type=sorted(ALLOWED_ATTACHMENT_TYPES),
+        key="contract_attachment",
+    )
+    submitted = st.form_submit_button("✅ ثبت قرارداد", type="primary")
+
+if submitted:
+    if not tracking_code.strip() or not title.strip():
+        st.error("لطفاً کد رهگیری و عنوان قرارداد را تکمیل کنید.")
+    elif total_amount <= 0:
+        st.error("مبلغ قرارداد باید بیشتر از صفر باشد.")
+    else:
+        try:
+            contract_date_iso = _parse_jalali_date(contract_date_str)
+        except (TypeError, ValueError, OverflowError):
+            st.error("فرمت یا مقدار تاریخ نامعتبر است. تاریخ را به صورت YYYY/MM/DD وارد کنید.")
+        else:
+            attachment_path = None
+            try:
+                attachment_path = _save_attachment(attachment)
+                payload = {
+                    "tracking_code": tracking_code.strip(),
+                    "employer_classification_code": employer_choice,
+                    "university_national_id": university_choice,
+                    "researcher_national_id": researcher_choice,
+                    "contract_number": _optional_text(contract_number),
+                    "proposal_id": _optional_text(proposal_id),
+                    "attachment_path": (
+                        attachment_path.as_posix() if attachment_path else None
+                    ),
+                    "title": title.strip(),
+                    "total_amount": float(total_amount),
+                    "contract_date": contract_date_iso,
+                    "duration_months": int(duration_months),
+                }
+                response = requests.post(
+                    f"{API_URL}/contracts/", json=payload, timeout=10
+                )
+                if response.status_code == 201:
+                    data = response.json()
+                    st.session_state.contract_success_message = (
+                        "🎉 قرارداد با موفقیت ثبت شد. "
+                        f"کد: {data.get('contract_tracking_code')} | "
+                        f"کارفرما: {data.get('employer_name')} | "
+                        f"دانشگاه: {data.get('university_name')} | "
+                        f"فناور: {data.get('researcher_name')}"
+                    )
+                    _schedule_form_reset()
+                else:
+                    _delete_attachment(attachment_path)
+                    st.error(f"❌ خطا در ثبت قرارداد: {_response_detail(response)}")
+            except ValueError as exc:
+                _delete_attachment(attachment_path)
+                st.error(str(exc))
+            except requests.exceptions.ConnectionError:
+                _delete_attachment(attachment_path)
+                st.error(
+                    "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+                    "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+                )
+            except requests.exceptions.Timeout:
+                _delete_attachment(attachment_path)
+                st.error("خطا: پاسخ سرور بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+            except OSError as exc:
+                _delete_attachment(attachment_path)
+                st.error(f"خطا در ذخیره فایل قرارداد: {exc}")
+            except Exception as exc:
+                _delete_attachment(attachment_path)
+                st.error(f"خطا در ارسال اطلاعات به سرور: {exc}")
+
+
+## File: dashboard\views\researcher_entry_page.py
+------------------------------
+# File: views/researcher_entry_page.py
+"""Phase 4 - New Researcher (فناور) registration form."""
+import streamlit as st
+import requests
+
+API_URL = "http://127.0.0.1:8000/api/v1"
+
+# ─── Aggressive RTL override + compact Persian theme ───
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+* { font-family: 'Vazirmatn', sans-serif !important; }
+.block-container, .stTextInput, .stNumberInput, .stSelectbox, .stCheckbox, p, div {
+    direction: rtl !important;
+    text-align: right !important;
+}
+[data-testid="stSidebarNav"] span {
+    direction: rtl !important;
+    text-align: right !important;
+    font-size: 1.05rem !important;
+}
+h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
+h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
+hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🧑‍🔬 فرم ثبت اطلاعات فناور")
+
+
+def _fetch_universities():
+    """Fetch universities for the dropdown; returns list or [] with friendly error."""
+    try:
+        resp = requests.get(f"{API_URL}/universities/lookup", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+        st.error(f"خطا در دریافت لیست موسسات: {resp.status_code}")
+        return []
+    except requests.exceptions.ConnectionError:
+        st.error("خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است.")
+        return []
+    except requests.exceptions.Timeout:
+        st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+        return []
+    except Exception as e:
+        st.error(f"خطای پیش‌بینی‌نشده در دریافت موسسات: {e}")
+        return []
+
+
+fetched_universities = _fetch_universities()
+# Smart mapping: display names in the UI, resolve to national_id on submit.
+university_map = {u["name"]: u["national_id"] for u in fetched_universities}
+
+ACADEMIC_RANKS = ["استاد", "دانشیار", "استادیار", "مربی", "پژوهشگر", "سایر"]
+EDUCATION_LEVELS = ["دکتری", "کارشناسی ارشد", "کارشناسی", "سایر"]
+RESEARCHER_TYPES = ["هیات علمی", "پژوهشگر آزاد", "دانشجو", "سایر"]
+STATUS_OPTIONS = {"فعال": "Active", "غیرفعال": "Inactive"}
+
+with st.form("researcher_entry_form", clear_on_submit=False):
+    st.subheader("۱. اطلاعات هویتی")
+
+    national_code = st.text_input("🪪 کد ملی فناور:", placeholder="۱۰ رقم", max_chars=10)
+
+    col_first, col_last = st.columns(2)
+    with col_first:
+        first_name = st.text_input("👤 نام:")
+    with col_last:
+        last_name = st.text_input("👥 نام خانوادگی:")
+
+    col_mobile, col_email = st.columns(2)
+    with col_mobile:
+        mobile = st.text_input("📱 تلفن همراه (اختیاری):", placeholder="مثال: 09123456789")
+    with col_email:
+        email = st.text_input("✉️ ایمیل (اختیاری):", placeholder="example@mail.com")
+
+    st.markdown("---")
+    st.subheader("۲. اطلاعات علمی و وابستگی سازمانی")
+
+    if university_map:
+        university_name = st.selectbox("🏫 موسسه محل فعالیت:", options=list(university_map.keys()))
+    else:
+        st.warning("هیچ موسسه‌ای برای انتخاب یافت نشد. ابتدا یک موسسه ثبت کنید.")
+        university_name = None
+
+    col_rank, col_edu = st.columns(2)
+    with col_rank:
+        academic_rank = st.selectbox("🎓 مرتبه علمی:", options=ACADEMIC_RANKS)
+    with col_edu:
+        education_level = st.selectbox("🎓 سطح تحصیلات:", options=EDUCATION_LEVELS)
+
+    researcher_type = st.selectbox("🏷️ نوع فناور:", options=RESEARCHER_TYPES)
+    status_label = st.selectbox("🟢 وضعیت:", options=list(STATUS_OPTIONS.keys()), index=0)
+
+    submitted = st.form_submit_button("✅ ثبت فناور", type="primary")
+
+    if submitted:
+        if university_name is None:
+            st.error("موسسه محل فعالیت قابل انتخاب نیست.")
+        elif not national_code.strip() or len(national_code.strip()) != 10 or not national_code.strip().isdigit():
+            st.error("کد ملی باید دقیقاً ۱۰ رقم باشد.")
+        elif not first_name.strip() or not last_name.strip():
+            st.error("لطفاً نام و نام خانوادگی را وارد کنید.")
+        else:
+            payload = {
+                "national_code": national_code.strip(),
+                "first_name": first_name.strip(),
+                "last_name": last_name.strip(),
+                "mobile": mobile.strip() or None,
+                "email": email.strip() or None,
+                "academic_rank": academic_rank,
+                "education_level": education_level,
+                "researcher_type": researcher_type,
+                "university_id": university_map[university_name],
+                "status": STATUS_OPTIONS[status_label],
+            }
+            try:
+                response = requests.post(f"{API_URL}/researchers/", json=payload, timeout=5)
+                if response.status_code == 201:
+                    data = response.json()
+                    st.success(
+                        f"🎉 فناور با موفقیت ثبت شد.\n"
+                        f"کد ملی: {data.get('national_code')} | "
+                        f"نام: {data.get('full_name')} | "
+                        f"مرتبه علمی: {data.get('academic_rank')} | "
+                        f"موسسه: {data.get('university_id')}"
+                    )
+                    st.toast("✅ فناور جدید ثبت شد.", icon="🧑‍🔬")
+                else:
+                    detail = "خطای ناشناخته."
+                    try:
+                        detail = response.json().get("detail", detail)
+                    except ValueError:
+                        pass
+                    st.error(f"❌ خطا در ثبت فناور: {detail}")
+            except requests.exceptions.ConnectionError:
+                st.error("خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است.")
+            except requests.exceptions.Timeout:
+                st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+            except Exception as e:
+                st.error(f"خطا در ارسال اطلاعات به سرور: {e}")
+
+
+## File: dashboard\views\university_entry_page.py
+------------------------------
+# File: views/university_entry_page.py
+"""Phase 4 - New University / Executing Institution registration form."""
+import streamlit as st
+import requests
+
+API_URL = "http://127.0.0.1:8000/api/v1"
+
+# ─── Aggressive RTL override + compact Persian theme ───
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+* { font-family: 'Vazirmatn', sans-serif !important; }
+.block-container, .stTextInput, .stNumberInput, .stSelectbox, .stCheckbox, p, div {
+    direction: rtl !important;
+    text-align: right !important;
+}
+[data-testid="stSidebarNav"] span {
+    direction: rtl !important;
+    text-align: right !important;
+    font-size: 1.05rem !important;
+}
+h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
+h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
+hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🏫 فرم ثبت موسسه مجری جدید")
+
+IRAN_PROVINCES = [
+    "تهران", "اصفهان", "فارس", "خراسان رضوی", "آذربایجان شرقی", "مازندران", "گیلان",
+    "کرمان", "یزد", "البرز", "قم", "سمنان", "هرمزگان", "بوشهر", "سیستان و بلوچستان",
+    "لرستان", "همدان", "کردستان", "کرمانشاه", "ایلام", "خوزستان", "چهارمحال و بختیاری",
+    "کهگیلویه و بویراحمد", "گلستان", "آذربایجان غربی", "اردبیل", "زنجان", "قزوین",
+    "مرکزی", "خراسان شمالی", "خراسان جنوبی", "سایر",
+]
+
+UNIVERSITY_TYPES = [
+    "دانشگاه دولتی",
+    "دانشگاه آزاد",
+    "دانشگاه غیرانتفاعی",
+    "پژوهشگاه",
+    "پارک علم و فناوری",
+    "شرکت دانش بنیان",
+    "موسسه آموزش عالی",
+]
+
+with st.form("university_entry_form", clear_on_submit=False):
+    st.subheader("۱. اطلاعات موسسه")
+
+    national_id = st.text_input("🪪 شناسه ملی موسسه:", placeholder="مثال: 14001234567")
+    name = st.text_input("🏛️ نام کامل موسسه/دانشگاه:")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        province = st.selectbox("🗺️ استان محل استقرار:", options=IRAN_PROVINCES)
+    with col2:
+        university_type = st.selectbox("🏷️ نوع موسسه:", options=UNIVERSITY_TYPES)
+
+    is_active = st.checkbox("✅ وضعیت فعالیت: فعال / غیرفعال", value=True,
+                            help="تیک خورده = فعال، بدون تیک = غیرفعال")
+
+    submitted = st.form_submit_button("✅ ثبت موسسه", type="primary")
+
+    if submitted:
+        if not national_id.strip() or not name.strip():
+            st.error("لطفاً شناسه ملی و نام موسسه را تکمیل کنید.")
+        else:
+            payload = {
+                "national_id": national_id.strip(),
+                "name": name.strip(),
+                "province": province,
+                "university_type": university_type,
+                "is_active": is_active,
+            }
+            try:
+                response = requests.post(f"{API_URL}/universities/", json=payload, timeout=5)
+                if response.status_code == 201:
+                    data = response.json()
+                    st.success(
+                        f"🎉 موسسه با موفقیت ثبت شد.\n"
+                        f"شناسه ملی: {data.get('national_id')} | "
+                        f"نام: {data.get('name')} | "
+                        f"نوع: {data.get('university_type')} | "
+                        f"استان: {data.get('province')} | "
+                        f"وضعیت: {data.get('status')}"
+                    )
+                    st.toast("✅ موسسه جدید ثبت شد.", icon="🏫")
+                else:
+                    detail = "خطای ناشناخته."
+                    try:
+                        detail = response.json().get("detail", detail)
+                    except ValueError:
+                        pass
+                    st.error(f"❌ خطا در ثبت موسسه: {detail}")
+            except requests.exceptions.ConnectionError:
+                st.error("خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است.")
+            except requests.exceptions.Timeout:
+                st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+            except Exception as e:
+                st.error(f"خطا در ارسال اطلاعات به سرور: {e}")
+
+
 ## File: Docs\Phase1_Complete.md
 ------------------------------
 # سند جامع فاز اول توسعه سامانه مالی ساتع (SATE\_Fin\_Dev)
@@ -2693,25 +3638,41 @@ The implementation is clean, well-documented, and ready for immediate use by the
 
 ## File: models\contract.py
 ------------------------------
-from sqlalchemy import Column, String, ForeignKey, Date, Numeric, Integer, Text
+from sqlalchemy import Column, Date, ForeignKey, Integer, Numeric, String, Text
+
 from core.database import Base
 from models.employer import SoftDeleteMixin
 
 
 class Contract(SoftDeleteMixin, Base):
-    __tablename__ = 'contracts'
+    """Represent a research contract registered in the financial system."""
+
+    __tablename__ = "contracts"
 
     tracking_code = Column(String(50), primary_key=True)
-    employer_code = Column(String(20), ForeignKey('employers.classification_code'), nullable=False)
-    university_id = Column(String(20), ForeignKey('universities.national_id'), nullable=False)
-    researcher_id = Column(String(10), ForeignKey('researchers.national_code'), nullable=False)
-    proposal_id = Column(String(50), nullable=True)  # Future FK
+    employer_code = Column(
+        String(20),
+        ForeignKey("employers.classification_code"),
+        nullable=False,
+    )
+    university_id = Column(
+        String(20),
+        ForeignKey("universities.national_id"),
+        nullable=False,
+    )
+    researcher_id = Column(
+        String(10),
+        ForeignKey("researchers.national_code"),
+        nullable=False,
+    )
+    proposal_id = Column(String(50), nullable=True)
     contract_number = Column(String(100), nullable=True)
+    attachment_path = Column(String(255), nullable=True)
     contract_date = Column(Date, nullable=True)
-    total_amount = Column(Numeric(22, 0), nullable=False)  # Base Rials
+    total_amount = Column(Numeric(22, 0), nullable=False)
     title = Column(Text, nullable=False)
     duration_months = Column(Integer, nullable=True)
-    status = Column(String(50), default='Active')
+    status = Column(String(50), default="Active")
 
 
 ## File: models\deposits.py
@@ -2922,33 +3883,96 @@ class University(SoftDeleteMixin, Base):
 
 ## File: schemas\contract_schema.py
 ------------------------------
+from datetime import date
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
 
 class ContractSearchResult(BaseModel):
-    """
-    Single contract match returned by the contract search (auto-fill) endpoint.
-    """
-    contract_tracking_code: str = Field(..., description="The contract tracking code")
+    """Represent one active contract returned to API consumers."""
+
+    contract_tracking_code: str = Field(
+        ..., description="The contract tracking code"
+    )
     title: str = Field(..., description="The contract title")
-    employer_name: Optional[str] = Field(None, description="Name of the linked employer")
+    employer_name: Optional[str] = Field(
+        None, description="Name of the linked employer"
+    )
     employer_classification_code: Optional[str] = Field(
         None, description="Classification code of the linked employer"
     )
-    university_name: Optional[str] = Field(None, description="Name of the executing university")
-    researcher_name: Optional[str] = Field(None, description="Full name of the researcher")
+    university_name: Optional[str] = Field(
+        None, description="Name of the executing university"
+    )
+    researcher_name: Optional[str] = Field(
+        None, description="Full name of the researcher"
+    )
 
     class Config:
         json_schema_extra = {
             "example": {
                 "contract_tracking_code": "CNT-1403-001",
-                "title": "\u067e\u0631\u0648\u0698\u0647 \u067e\u0698\u0648\u0647\u0634\u06cc \u0646\u0645\u0648\u0646\u0647",
-                "employer_name": "\u0648\u0632\u0627\u0631\u062a \u0646\u0645\u0648\u0646\u0647",
+                "title": "پروژه پژوهشی نمونه",
+                "employer_name": "وزارت نمونه",
                 "employer_classification_code": "EMP001",
-                "university_name": "\u062f\u0627\u0646\u0634\u06af\u0627\u0647 \u0646\u0645\u0648\u0646\u0647",
-                "researcher_name": "\u0639\u0644\u06cc \u0631\u0636\u0627\u06cc\u06cc",
+                "university_name": "دانشگاه نمونه",
+                "researcher_name": "علی رضایی",
+            }
+        }
+
+
+class ContractCreate(BaseModel):
+    """Define the payload accepted when registering a new contract."""
+
+    tracking_code: str = Field(
+        ..., min_length=1, description="The contract tracking code (primary key)"
+    )
+    employer_classification_code: str = Field(
+        ..., description="Classification code of the contracting employer"
+    )
+    university_national_id: str = Field(
+        ..., description="National ID of the executing university"
+    )
+    researcher_national_id: str = Field(
+        ..., description="National code of the lead researcher"
+    )
+    contract_number: Optional[str] = Field(
+        None, description="Operational contract number"
+    )
+    proposal_id: Optional[str] = Field(
+        None, description="Identifier of the linked proposal"
+    )
+    attachment_path: Optional[str] = Field(
+        None, description="Local path of the archived contract document"
+    )
+    title: str = Field(
+        ..., min_length=1, description="Contract or project title"
+    )
+    total_amount: float = Field(
+        ..., gt=0, description="Total contract amount in Rials"
+    )
+    contract_date: date = Field(
+        ..., description="Contract date in Gregorian ISO format"
+    )
+    duration_months: int = Field(
+        ..., gt=0, description="Contract duration in months"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "tracking_code": "CNT-1403-002",
+                "employer_classification_code": "EMP001",
+                "university_national_id": "UNI001",
+                "researcher_national_id": "1234567890",
+                "contract_number": "1403/CON/002",
+                "proposal_id": "PRP-1403-002",
+                "attachment_path": "data/Archive/Contracts/example.pdf",
+                "title": "پروژه تحقیقاتی نمونه",
+                "total_amount": 1000000000.0,
+                "contract_date": "2024-03-20",
+                "duration_months": 12,
             }
         }
 
@@ -3141,10 +4165,148 @@ class PaymentBulkCreateResponse(BaseModel):
     message: str = Field(..., description="Human readable success message")
     submitted_count: int = Field(..., description="Number of payments committed")
     tracking_codes: List[str] = Field(..., description="Tracking codes of the committed payments")
+    warning_messages: List[str] = Field(
+        default_factory=list,
+        description="Non-blocking FR-20 warnings for negative employer balances",
+    )
+
+
+## File: schemas\researcher_schema.py
+------------------------------
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class ResearcherCreate(BaseModel):
+    """Payload for registering a new researcher (فناور), aligned to models/researchers.py."""
+    national_code: str = Field(..., min_length=10, max_length=10, description="National code of the researcher (10 digits)")
+    first_name: str = Field(..., description="First name of the researcher")
+    last_name: str = Field(..., description="Last name of the researcher")
+    mobile: Optional[str] = Field(None, description="Mobile phone number")
+    email: Optional[str] = Field(None, description="Email address")
+    academic_rank: Optional[str] = Field(None, description="Academic rank")
+    education_level: Optional[str] = Field(None, description="Education level")
+    researcher_type: Optional[str] = Field(None, description="Researcher type")
+    university_id: str = Field(..., description="National ID of the affiliated university/institution")
+    status: str = Field("Active", description="Status: 'Active' or 'Inactive'")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "national_code": "1234567890",
+                "first_name": "علی",
+                "last_name": "رضایی",
+                "mobile": "09123456789",
+                "email": "ali@example.com",
+                "academic_rank": "استادیار",
+                "education_level": "دکتری",
+                "researcher_type": "هیات علمی",
+                "university_id": "14001234567",
+                "status": "Active",
+            }
+        }
+
+
+class ResearcherCreated(BaseModel):
+    """Confirmation returned after a researcher is created."""
+    national_code: str
+    full_name: str
+    university_id: str
+    academic_rank: Optional[str] = None
+    education_level: Optional[str] = None
+    researcher_type: Optional[str] = None
+    status: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "national_code": "1234567890",
+                "full_name": "علی رضایی",
+                "university_id": "14001234567",
+                "academic_rank": "استادیار",
+                "education_level": "دکتری",
+                "researcher_type": "هیات علمی",
+                "status": "Active",
+            }
+        }
+
+
+## File: schemas\university_schema.py
+------------------------------
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+class UniversityCreate(BaseModel):
+    """Payload for registering a new university / executing institution."""
+    national_id: str = Field(..., min_length=1, max_length=20, description="National ID of the institution")
+    name: str = Field(..., description="Full name of the institution")
+    province: str = Field(..., description="Province where the institution is located")
+    university_type: str = Field(..., description="Type of the institution")
+    is_active: bool = Field(True, description="Active status (True = Active, False = Inactive)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "national_id": "14001234567",
+                "name": "دانشگاه نمونه",
+                "province": "تهران",
+                "university_type": "دانشگاه دولتی",
+                "is_active": True,
+            }
+        }
+
+
+class UniversityCreated(BaseModel):
+    """Confirmation returned after a university is created."""
+    national_id: str
+    name: str
+    province: str
+    university_type: str
+    status: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "national_id": "14001234567",
+                "name": "دانشگاه نمونه",
+                "province": "تهران",
+                "university_type": "دانشگاه دولتی",
+                "status": "Active",
+            }
+        }
 
 
 ## File: schemas\__init__.py
 ------------------------------
+
+
+## File: scripts\add_contract_attachment_path.py
+------------------------------
+"""Add contract attachment storage to an existing PostgreSQL database."""
+
+from sqlalchemy import text
+
+from core.database import engine
+
+
+def add_contract_attachment_path() -> None:
+    """Add the nullable attachment path column idempotently."""
+    statement = text(
+        """
+        ALTER TABLE contracts
+        ADD COLUMN IF NOT EXISTS attachment_path VARCHAR(255) NULL
+        """
+    )
+    with engine.begin() as connection:
+        connection.execute(statement)
+
+
+if __name__ == "__main__":
+    add_contract_attachment_path()
+    print("Contract attachment_path column is ready.")
 
 
 ## File: scripts\append_new_mandates.py
@@ -5330,8 +6492,10 @@ session.close()
 
 ## File: services\financial_engine.py
 ------------------------------
-import pandas as pd
 from decimal import Decimal
+from typing import Sequence
+
+import pandas as pd
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -5340,6 +6504,112 @@ from models.deposits import AnnualMandate, DepositReceipt
 from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
+
+
+def lock_active_contracts(
+    db: Session,
+    contract_codes: Sequence[str],
+) -> dict[str, Contract]:
+    """
+    Lock and return active contracts in deterministic tracking-code order.
+
+    PostgreSQL keeps the row-level locks until the surrounding transaction
+    commits or rolls back. Sorting the unique keys gives concurrent payment
+    transactions a consistent lock order and reduces deadlock risk.
+
+    Args:
+        db: Active SQLAlchemy session with an open transaction.
+        contract_codes: Contract tracking codes that participate in the
+            financial operation.
+
+    Returns:
+        A mapping from tracking code to the locked active contract.
+    """
+    unique_codes = sorted(set(contract_codes))
+    if not unique_codes:
+        return {}
+
+    contracts = (
+        db.query(Contract)
+        .filter(
+            Contract.tracking_code.in_(unique_codes),
+            Contract.is_deleted == False,
+        )
+        .order_by(Contract.tracking_code)
+        .with_for_update()
+        .all()
+    )
+    return {contract.tracking_code: contract for contract in contracts}
+
+
+def lock_active_employers(
+    db: Session,
+    employer_codes: Sequence[str],
+) -> dict[str, Employer]:
+    """
+    Lock and return active employers in deterministic classification-code order.
+
+    The employer row is the serialization point for balance-changing operations.
+    Callers must retain the same transaction while calculating balances and
+    inserting payments so concurrent requests cannot validate stale balances.
+
+    Args:
+        db: Active SQLAlchemy session with an open transaction.
+        employer_codes: Employer classification codes to serialize.
+
+    Returns:
+        A mapping from classification code to the locked active employer.
+    """
+    unique_codes = sorted(set(employer_codes))
+    if not unique_codes:
+        return {}
+
+    employers = (
+        db.query(Employer)
+        .filter(
+            Employer.classification_code.in_(unique_codes),
+            Employer.is_deleted == False,
+        )
+        .order_by(Employer.classification_code)
+        .with_for_update()
+        .all()
+    )
+    return {employer.classification_code: employer for employer in employers}
+
+
+def lock_active_contract_and_employer(
+    db: Session,
+    contract_code: str,
+) -> tuple[Contract, Employer]:
+    """
+    Lock one active contract and its active employer for financial processing.
+
+    Args:
+        db: Active SQLAlchemy session with an open transaction.
+        contract_code: Tracking code of the contract to lock.
+
+    Returns:
+        The locked contract and its locked employer.
+
+    Raises:
+        ValueError: If the contract or linked employer is missing or soft-deleted.
+    """
+    contract = lock_active_contracts(db, [contract_code]).get(contract_code)
+    if contract is None:
+        raise ValueError(
+            f"Contract with tracking code '{contract_code}' not found or has been deleted."
+        )
+
+    employer = lock_active_employers(db, [contract.employer_code]).get(
+        contract.employer_code
+    )
+    if employer is None:
+        raise ValueError(
+            f"Employer with classification code '{contract.employer_code}' "
+            "not found or has been deleted."
+        )
+
+    return contract, employer
 
 
 def get_contracts_with_dynamic_status(
@@ -5408,69 +6678,88 @@ def get_contracts_with_dynamic_status(
 
     return db.execute(statement).all()
 
-def calculate_real_balance(db: Session, employer_code: str, funding_year: int) -> float:
-    """
-    Calculates the real financial balance for a specific employer and funding year.
 
-    Formula: (Total Deposits + Transfers In) - (Total Payments + Transfers Out)
+def calculate_real_balance(
+    db: Session,
+    employer_code: str,
+    funding_year: int,
+    *,
+    lock_employer: bool = False,
+) -> float:
     """
-    
-    # 1. Calculate Total Deposits (Including subsidiaries)
-    # Finding the employer and all its subsidiaries using the parent_code constraint
+    Calculate the real balance for an active employer and funding year.
+
+    Formula: ``(Deposits + Transfers In) - (Payments + Transfers Out)``.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        employer_code: Employer classification code.
+        funding_year: Funding year used by all balance components.
+        lock_employer: When true, acquire a PostgreSQL ``FOR UPDATE`` lock on
+            the active employer row before reading financial aggregates. The
+            caller must keep the transaction open through the related write.
+
+    Returns:
+        The calculated balance in base Rials.
+
+    Raises:
+        ValueError: If ``lock_employer`` is true and the employer is missing or
+            soft-deleted.
+    """
+    if lock_employer and employer_code not in lock_active_employers(
+        db, [employer_code]
+    ):
+        raise ValueError(
+            f"Employer with classification code '{employer_code}' "
+            "not found or has been deleted."
+        )
+
     deposits_query = db.query(func.sum(DepositReceipt.deposit_amount)).join(
         Employer, DepositReceipt.employer_code == Employer.classification_code
     ).filter(
         or_(
             Employer.classification_code == employer_code,
-            Employer.parent_code == employer_code
+            Employer.parent_code == employer_code,
         ),
         DepositReceipt.fiscal_year == funding_year,
         DepositReceipt.is_deleted == False,
-        Employer.is_deleted == False
+        Employer.is_deleted == False,
     ).scalar()
-    
-    total_deposits = deposits_query or Decimal('0.0')
+    total_deposits = deposits_query or Decimal("0.0")
 
-    # 2. Calculate Total Payments based on funding_year (NOT payment_year)
     payments_query = db.query(func.sum(Payment.amount)).join(
         Contract, Payment.contract_tracking_code == Contract.tracking_code
     ).filter(
         Contract.employer_code == employer_code,
         Payment.funding_year == funding_year,
         Payment.is_deleted == False,
-        Contract.is_deleted == False
+        Contract.is_deleted == False,
     ).scalar()
+    total_payments = payments_query or Decimal("0.0")
 
-    total_payments = payments_query or Decimal('0.0')
-
-    # 3. Calculate Transfers Out (funds sent from this employer or its subsidiaries)
     transfers_out_query = db.query(func.sum(CreditTransfer.amount)).join(
         Employer, CreditTransfer.source_employer_code == Employer.classification_code
     ).filter(
         or_(
             Employer.classification_code == employer_code,
-            Employer.parent_code == employer_code
+            Employer.parent_code == employer_code,
         ),
         CreditTransfer.fiscal_year == funding_year,
         CreditTransfer.is_deleted == False,
-        Employer.is_deleted == False
+        Employer.is_deleted == False,
     ).scalar()
-    
-    transfers_out = transfers_out_query or Decimal('0.0')
+    transfers_out = transfers_out_query or Decimal("0.0")
 
-    # 4. Calculate Transfers In (funds received by this employer)
     transfers_in_query = db.query(func.sum(CreditTransfer.amount)).filter(
         CreditTransfer.destination_employer_code == employer_code,
         CreditTransfer.fiscal_year == funding_year,
-        CreditTransfer.is_deleted == False
+        CreditTransfer.is_deleted == False,
     ).scalar()
-    
-    transfers_in = transfers_in_query or Decimal('0.0')
+    transfers_in = transfers_in_query or Decimal("0.0")
 
-    # 5. Calculate Real Balance
     real_balance = total_deposits + transfers_in - transfers_out - total_payments
-    
     return float(real_balance)
+
 
 def get_mandated_amount(db: Session, employer_code: str, fiscal_year: int) -> float:
     """
@@ -5618,60 +6907,69 @@ def get_all_employers_financials(db: Session) -> pd.DataFrame:
     ]
 
 
-def validate_payment_impact(db: Session, contract_code: str, payment_amount: float, funding_year: int) -> dict:
+def validate_payment_impact(
+    db: Session,
+    contract_code: str,
+    payment_amount: float,
+    funding_year: int,
+    *,
+    lock_rows: bool = False,
+) -> dict:
     """
-    Validates the impact of a payment on the employer's balance.
-    
-    This function implements FR-18, FR-19, FR-20 from the conceptual design:
-    - FR-18: Query the contract to find the linked employer
-    - FR-19: Calculate current balance and project new balance after payment
-    - FR-20: Warn (but do not block) if the balance becomes negative
-    
+    Validate a payment's impact on the linked employer's real balance.
+
+    This function implements FR-18, FR-19, and FR-20. A negative projected
+    balance is reported through ``is_negative`` and never raises an error.
+
     Args:
-        db: Database session
-        contract_code: The contract tracking code
-        payment_amount: The amount to be paid
-        funding_year: The funding year for the payment
-    
+        db: Active SQLAlchemy database session.
+        contract_code: Contract tracking code linked to the payment.
+        payment_amount: Payment amount in base Rials.
+        funding_year: Funding year for the payment.
+        lock_rows: When true, lock the active contract and employer rows for
+            the duration of the caller's transaction.
+
     Returns:
-        dict containing:
-            - employer_code: The employer's classification code
-            - current_balance: Current balance before payment
-            - payment_amount: The payment amount
-            - new_balance: Projected balance after payment
-            - is_negative: Whether the new balance will be negative
-    
+        A dictionary containing employer code, current balance, payment amount,
+        projected balance, and whether the projected balance is negative.
+
     Raises:
-        ValueError: If contract is not found or has been deleted
+        ValueError: If the contract or linked employer is missing or soft-deleted.
     """
-    
-    # Step 1: Find the contract and get the employer_code
-    contract = db.query(Contract).filter(
-        Contract.tracking_code == contract_code,
-        Contract.is_deleted == False
-    ).first()
-    
-    if not contract:
-        raise ValueError(f"Contract with tracking code '{contract_code}' not found or has been deleted.")
-    
+    if lock_rows:
+        contract, _ = lock_active_contract_and_employer(db, contract_code)
+    else:
+        contract = (
+            db.query(Contract)
+            .join(
+                Employer,
+                and_(
+                    Contract.employer_code == Employer.classification_code,
+                    Employer.is_deleted == False,
+                ),
+            )
+            .filter(
+                Contract.tracking_code == contract_code,
+                Contract.is_deleted == False,
+            )
+            .first()
+        )
+
+    if contract is None:
+        raise ValueError(
+            f"Contract with tracking code '{contract_code}' not found or has been deleted."
+        )
+
     employer_code = contract.employer_code
-    
-    # Step 2: Calculate current balance using existing function
     current_balance = calculate_real_balance(db, employer_code, funding_year)
-    
-    # Step 3: Calculate new balance after payment
     new_balance = current_balance - payment_amount
-    
-    # Step 4: Determine if balance becomes negative
-    is_negative = new_balance < 0
-    
-    # Step 5: Return validation result
+
     return {
         "employer_code": employer_code,
         "current_balance": current_balance,
         "payment_amount": payment_amount,
         "new_balance": new_balance,
-        "is_negative": is_negative
+        "is_negative": new_balance < 0,
     }
 
 
