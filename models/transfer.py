@@ -1,65 +1,83 @@
+"""Credit Transfer model for the SATE financial system.
+
+Junction table allocating unspent funds from one employer to a specific
+contract, typically routed through the central Secretariat, without altering
+the core deposit/payment tables.
 """
-Credit Transfer Model
-Junction table for allocating unspent funds from employers to specific contracts
-"""
 
-from sqlalchemy import Column, Integer, String, Numeric, Text, ForeignKey
-from core.database import Base
-from models.employer import SoftDeleteMixin
+from sqlalchemy import Column, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy.orm import relationship
+
+from core.database import Base, SoftDeleteMixin
 
 
-class CreditTransfer(Base, SoftDeleteMixin):
-    """
-    Credit Transfer model - tracks fund transfers between employers.
+class CreditTransfer(SoftDeleteMixin, Base):
+    """Track fund transfers between employers.
+
     Allows allocation of unspent funds from various employers to contracts
-    managed by a central Secretariat without altering core deposit/payment tables.
+    managed by a central Secretariat without altering the core deposit/payment
+    tables.
+
+    Attributes
+    ----------
+    id : int
+        Auto-incrementing surrogate primary key.
+    source_employer_code : str
+        Employer the funds originate from (FK to ``employers.classification_code``).
+    destination_employer_code : str
+        Employer the funds are transferred to (FK to ``employers``); defaults to
+        the Secretariat.
+    broker_name : str or None
+        Optional broker facilitating the transfer.
+    fiscal_year : int
+        Fiscal year the transferred funds originated from.
+    amount : Decimal
+        Transfer amount in Rials.
+    contract_tracking_code : str
+        Contract receiving the transferred funds (FK to ``contracts.tracking_code``).
+    documentation : str or None
+        Supporting documentation or free-text notes.
     """
-    __tablename__ = 'credit_transfers'
-    
+
+    __tablename__ = "credit_transfers"
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
-    # Source employer (where funds come from)
+
     source_employer_code = Column(
-        String,
-        ForeignKey('employers.classification_code'),
+        String(20),
+        ForeignKey("employers.classification_code"),
         nullable=False,
-        index=True
+        index=True,
     )
-    
-    # Destination employer (where funds go to, default is Secretariat)
+
     destination_employer_code = Column(
-        String,
-        ForeignKey('employers.classification_code'),
+        String(20),
+        ForeignKey("employers.classification_code"),
         nullable=False,
-        default='128342',
-        index=True
+        default="128342",
+        index=True,
     )
-    
-    # Optional broker facilitating the transfer
-    broker_name = Column(String, nullable=True)
-    
-    # Fiscal year the funds originated from
+
+    broker_name = Column(String(100), nullable=True)
+
     fiscal_year = Column(Integer, nullable=False, index=True)
-    
-    # Transfer amount in Rials
+
     amount = Column(Numeric(22, 0), nullable=False)
-    
-    # Contract receiving the transferred funds
+
     contract_tracking_code = Column(
-        String,
-        ForeignKey('contracts.tracking_code'),
+        String(50),
+        ForeignKey("contracts.tracking_code"),
         nullable=False,
-        index=True
+        index=True,
     )
-    
-    # Supporting documentation or notes
+
+    contract = relationship("Contract", backref="credit_transfers")
+
     documentation = Column(Text, nullable=True)
-    
+
     def __repr__(self):
         return (
-            f"<CreditTransfer(id={self.id}, "
-            f"from={self.source_employer_code}, "
-            f"to={self.destination_employer_code}, "
-            f"amount={self.amount}, "
+            f"<CreditTransfer(id={self.id}, from={self.source_employer_code}, "
+            f"to={self.destination_employer_code}, amount={self.amount}, "
             f"year={self.fiscal_year})>"
         )

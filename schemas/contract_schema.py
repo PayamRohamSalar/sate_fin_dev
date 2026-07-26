@@ -38,25 +38,39 @@ class ContractSearchResult(BaseModel):
 
 
 class ContractCreate(BaseModel):
-    """Define the payload accepted when registering a new contract."""
+    """Define the payload accepted when registering a new contract.
+
+    Field length limits mirror the ``contracts`` table column definitions so
+    that oversized input is rejected with a clear 422 validation error instead
+    of silently failing as a database ``DataError`` at insert time.
+    """
 
     tracking_code: str = Field(
-        ..., min_length=1, description="The contract tracking code (primary key)"
+        ...,
+        min_length=1,
+        max_length=50,
+        description="The contract tracking code (primary key)",
     )
     employer_classification_code: str = Field(
-        ..., description="Classification code of the contracting employer"
+        ...,
+        max_length=20,
+        description="Classification code of the contracting employer",
     )
     university_national_id: str = Field(
-        ..., description="National ID of the executing university"
+        ...,
+        max_length=20,
+        description="National ID of the executing university",
     )
     researcher_national_id: str = Field(
-        ..., description="National code of the lead researcher"
+        ...,
+        max_length=10,
+        description="National code of the lead researcher",
     )
     contract_number: Optional[str] = Field(
         None, description="Operational contract number"
     )
     proposal_id: Optional[str] = Field(
-        None, description="Identifier of the linked proposal"
+        None, max_length=50, description="Identifier of the linked proposal"
     )
     attachment_path: Optional[str] = Field(
         None, description="Local path of the archived contract document"
@@ -64,8 +78,14 @@ class ContractCreate(BaseModel):
     title: str = Field(
         ..., min_length=1, description="Contract or project title"
     )
-    total_amount: float = Field(
-        ..., gt=0, description="Total contract amount in Rials"
+    total_amount: int = Field(
+        ...,
+        gt=0,
+        description=(
+            "Total contract amount in whole Rials. Integer to match the "
+            "database's zero-decimal Numeric(22, 0) column and reject "
+            "fractional amounts instead of silently truncating them."
+        ),
     )
     contract_date: date = Field(
         ..., description="Contract date in Gregorian ISO format"
@@ -85,7 +105,7 @@ class ContractCreate(BaseModel):
                 "proposal_id": "PRP-1403-002",
                 "attachment_path": "data/Archive/Contracts/example.pdf",
                 "title": "پروژه تحقیقاتی نمونه",
-                "total_amount": 1000000000.0,
+                "total_amount": 1000000000,
                 "contract_date": "2024-03-20",
                 "duration_months": 12,
             }

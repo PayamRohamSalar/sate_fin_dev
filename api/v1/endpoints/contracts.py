@@ -5,7 +5,12 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_
-from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import (
+    DataError,
+    IntegrityError,
+    OperationalError,
+    SQLAlchemyError,
+)
 from sqlalchemy.orm import Session
 
 from core.database import get_db
@@ -24,6 +29,9 @@ CONTRACT_DATA_MISMATCH_MESSAGE = (
 )
 CONTRACT_DATA_FORMAT_MESSAGE = (
     "نوع یا طول داده‌های ارسالی نامعتبر است (مثلا فرمت تاریخ یا مبالغ)."
+)
+CONTRACT_CONNECTION_ERROR_MESSAGE = (
+    "خطا در ارتباط با پایگاه داده. لطفاً چند لحظه دیگر دوباره تلاش کنید."
 )
 ALLOWED_CONTRACT_EMPLOYER_TYPES = {"Mother", "Independent"}
 
@@ -88,6 +96,28 @@ def _raise_contract_persistence_error(
     raise HTTPException(
         status_code=400,
         detail=CONTRACT_DATA_MISMATCH_MESSAGE,
+    ) from error
+
+
+def _raise_contract_connection_error(
+    error: Exception,
+    tracking_code: str,
+) -> None:
+    """Log a database connectivity failure and return a retryable 503 error.
+
+    Handles both SQLAlchemy's wrapped ``OperationalError`` and a raw
+    ``ConnectionResetError`` that may surface if the connection drops before
+    the driver wraps it, so a mid-request network failure never escapes as an
+    unhandled exception.
+    """
+    logger.error(
+        "Database connection failure while persisting contract '%s': %s",
+        tracking_code,
+        error,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail=CONTRACT_CONNECTION_ERROR_MESSAGE,
     ) from error
 
 
@@ -244,7 +274,11 @@ def create_contract(
     payload: ContractCreate,
     db: Session = Depends(get_db),
 ):
-    """Register a contract and gracefully reject duplicate submissions."""
+    """Register a contract, keeping the full lookup-and-write flow inside one
+    transaction-safe try/except so any failure — validation, persistence, or
+    a dropped database connection — rolls back cleanly and returns a proper
+    HTTP error instead of an unhandled exception.
+    """
     tracking_code = payload.tracking_code.strip()
     title = payload.title.strip()
     if not tracking_code or not title:
@@ -253,49 +287,57 @@ def create_contract(
             detail="کد رهگیری و عنوان قرارداد الزامی هستند.",
         )
 
-    existing_contract = (
-        db.query(Contract.tracking_code)
-        .filter(
-            Contract.tracking_code == tracking_code,
-            Contract.is_deleted == False,
-        )
-        .first()
-    )
-    if existing_contract is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=DUPLICATE_CONTRACT_MESSAGE.format(
-                tracking_code=tracking_code
-            ),
-        )
-
-    employer, university, researcher = _get_active_contract_parties(db, payload)
-    contract_date: date = payload.contract_date
-    contract = Contract(
-        tracking_code=tracking_code,
-        employer_code=payload.employer_classification_code,
-        university_id=payload.university_national_id,
-        researcher_id=payload.researcher_national_id,
-        contract_number=_optional_text(payload.contract_number),
-        proposal_id=_optional_text(payload.proposal_id),
-        attachment_path=_optional_text(payload.attachment_path),
-        title=title,
-        total_amount=payload.total_amount,
-        contract_date=contract_date,
-        duration_months=payload.duration_months,
-        status="فعال",
-        is_deleted=False,
-    )
     try:
+        existing_contract = (
+            db.query(Contract.tracking_code)
+            .filter(
+                Contract.tracking_code == tracking_code,
+                Contract.is_deleted == False,
+            )
+            .first()
+        )
+        if existing_contract is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=DUPLICATE_CONTRACT_MESSAGE.format(
+                    tracking_code=tracking_code
+                ),
+            )
+
+        employer, university, researcher = _get_active_contract_parties(
+            db, payload
+        )
+        contract_date: date = payload.contract_date
+        contract = Contract(
+            tracking_code=tracking_code,
+            employer_code=payload.employer_classification_code,
+            university_id=payload.university_national_id,
+            researcher_id=payload.researcher_national_id,
+            contract_number=_optional_text(payload.contract_number),
+            proposal_id=_optional_text(payload.proposal_id),
+            attachment_path=_optional_text(payload.attachment_path),
+            title=title,
+            total_amount=payload.total_amount,
+            contract_date=contract_date,
+            duration_months=payload.duration_months,
+            status="فعال",
+            is_deleted=False,
+        )
         db.add(contract)
         db.commit()
         db.refresh(contract)
+    except HTTPException:
+        db.rollback()
+        raise
     except IntegrityError as exc:
         db.rollback()
         _raise_contract_persistence_error(exc, tracking_code)
     except DataError as exc:
         db.rollback()
         _raise_contract_persistence_error(exc, tracking_code)
+    except (OperationalError, ConnectionResetError) as exc:
+        db.rollback()
+        _raise_contract_connection_error(exc, tracking_code)
     except SQLAlchemyError as exc:
         db.rollback()
         _raise_unexpected_contract_error(exc, tracking_code)

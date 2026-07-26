@@ -27,6 +27,7 @@ python3 scripts/import_credit_transfers.py
 ## Run Server
 python -m streamlit run dashboard/app.py
 python -m uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --port 8000
 
 python -m streamlit run dashboard/app_v2.py
 
@@ -46,3 +47,4 @@ python generate_context.py
 python3 test_engine_cli.py
 # Text on database
 python3 scripts/example_1.py
+python scripts/add_contract_attachment_path.py
