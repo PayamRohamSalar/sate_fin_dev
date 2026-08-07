@@ -110,3 +110,128 @@ class ContractCreate(BaseModel):
                 "duration_months": 12,
             }
         }
+
+
+class ContractUpdate(BaseModel):
+    """Define the payload accepted when updating an existing contract.
+
+    Mirrors :class:`ContractCreate` except ``tracking_code`` is omitted —
+    the primary key is supplied via the URL path and is never changed by an
+    update. Field length limits mirror the ``contracts`` table column
+    definitions for the same reason as :class:`ContractCreate`.
+    """
+
+    employer_classification_code: str = Field(
+        ...,
+        max_length=20,
+        description="Classification code of the contracting employer",
+    )
+    university_national_id: str = Field(
+        ...,
+        max_length=20,
+        description="National ID of the executing university",
+    )
+    researcher_national_id: str = Field(
+        ...,
+        max_length=10,
+        description="National code of the lead researcher",
+    )
+    contract_number: Optional[str] = Field(
+        None, description="Operational contract number"
+    )
+    proposal_id: Optional[str] = Field(
+        None, max_length=50, description="Identifier of the linked proposal"
+    )
+    attachment_path: Optional[str] = Field(
+        None, description="Local path of the archived contract document"
+    )
+    title: str = Field(
+        ..., min_length=1, description="Contract or project title"
+    )
+    total_amount: int = Field(
+        ...,
+        gt=0,
+        description=(
+            "Total contract amount in whole Rials. Integer to match the "
+            "database's zero-decimal Numeric(22, 0) column and reject "
+            "fractional amounts instead of silently truncating them."
+        ),
+    )
+    contract_date: date = Field(
+        ..., description="Contract date in Gregorian ISO format"
+    )
+    duration_months: int = Field(
+        ..., gt=0, description="Contract duration in months"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "employer_classification_code": "EMP001",
+                "university_national_id": "UNI001",
+                "researcher_national_id": "1234567890",
+                "contract_number": "1403/CON/002",
+                "proposal_id": "PRP-1403-002",
+                "attachment_path": "data/Archive/Contracts/example.pdf",
+                "title": "پروژه تحقیقاتی نمونه (ویرایش‌شده)",
+                "total_amount": 1200000000,
+                "contract_date": "2024-03-20",
+                "duration_months": 12,
+            }
+        }
+
+
+class ContractDetail(BaseModel):
+    """Full contract record returned to populate the edit form.
+
+    Unlike :class:`ContractSearchResult` (which carries display names for
+    auto-fill confirmation), this exposes the raw foreign-key codes so the
+    frontend can pre-select the correct option in each dropdown.
+    """
+
+    tracking_code: str = Field(..., description="The contract tracking code")
+    employer_classification_code: str = Field(
+        ..., description="Classification code of the contracting employer"
+    )
+    university_national_id: str = Field(
+        ..., description="National ID of the executing university"
+    )
+    researcher_national_id: str = Field(
+        ..., description="National code of the lead researcher"
+    )
+    contract_number: Optional[str] = Field(
+        None, description="Operational contract number"
+    )
+    proposal_id: Optional[str] = Field(
+        None, description="Identifier of the linked proposal"
+    )
+    attachment_path: Optional[str] = Field(
+        None, description="Local path of the archived contract document"
+    )
+    title: str = Field(..., description="Contract or project title")
+    total_amount: int = Field(..., description="Total contract amount in whole Rials")
+    contract_date: Optional[date] = Field(
+        None, description="Contract date in Gregorian ISO format"
+    )
+    duration_months: Optional[int] = Field(
+        None, description="Contract duration in months"
+    )
+    status: str = Field(..., description="Current contract status")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "tracking_code": "CNT-1403-002",
+                "employer_classification_code": "EMP001",
+                "university_national_id": "UNI001",
+                "researcher_national_id": "1234567890",
+                "contract_number": "1403/CON/002",
+                "proposal_id": "PRP-1403-002",
+                "attachment_path": "data/Archive/Contracts/example.pdf",
+                "title": "پروژه تحقیقاتی نمونه",
+                "total_amount": 1000000000,
+                "contract_date": "2024-03-20",
+                "duration_months": 12,
+                "status": "فعال",
+            }
+        }

@@ -18,7 +18,12 @@ from models.contract import Contract
 from models.employer import Employer
 from models.researchers import Researcher
 from models.university import University
-from schemas.contract_schema import ContractCreate, ContractSearchResult
+from schemas.contract_schema import (
+    ContractCreate,
+    ContractDetail,
+    ContractSearchResult,
+    ContractUpdate,
+)
 
 router = APIRouter(prefix="/contracts", tags=["Contracts"])
 logger = logging.getLogger(__name__)
@@ -140,9 +145,14 @@ def _raise_unexpected_contract_error(
 
 def _get_active_contract_parties(
     db: Session,
-    payload: ContractCreate,
+    payload: ContractCreate | ContractUpdate,
 ) -> tuple[Employer, University, Researcher]:
-    """Load active contract parties and enforce employer business rules."""
+    """Load active contract parties and enforce employer business rules.
+
+    Shared by both contract creation and contract update, since
+    ``ContractCreate`` and ``ContractUpdate`` expose identical
+    employer/university/researcher fields.
+    """
     employer = (
         db.query(Employer)
         .filter(
@@ -324,6 +334,112 @@ def create_contract(
             is_deleted=False,
         )
         db.add(contract)
+        db.commit()
+        db.refresh(contract)
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError as exc:
+        db.rollback()
+        _raise_contract_persistence_error(exc, tracking_code)
+    except DataError as exc:
+        db.rollback()
+        _raise_contract_persistence_error(exc, tracking_code)
+    except (OperationalError, ConnectionResetError) as exc:
+        db.rollback()
+        _raise_contract_connection_error(exc, tracking_code)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        _raise_unexpected_contract_error(exc, tracking_code)
+    except Exception as exc:
+        db.rollback()
+        _raise_unexpected_contract_error(exc, tracking_code)
+
+    return _to_search_result(contract, employer, university, researcher)
+
+
+CONTRACT_NOT_FOUND_MESSAGE = "قرارداد یافت نشد یا حذف شده است."
+
+
+def _get_active_contract_or_404(db: Session, tracking_code: str) -> Contract:
+    """Fetch a non-soft-deleted contract by tracking code or raise a 404."""
+    contract = (
+        db.query(Contract)
+        .filter(
+            Contract.tracking_code == tracking_code,
+            Contract.is_deleted == False,
+        )
+        .first()
+    )
+    if contract is None:
+        raise HTTPException(status_code=404, detail=CONTRACT_NOT_FOUND_MESSAGE)
+    return contract
+
+
+def _to_detail(contract: Contract) -> ContractDetail:
+    """Build the full-detail response used to populate the edit form."""
+    return ContractDetail(
+        tracking_code=contract.tracking_code,
+        employer_classification_code=contract.employer_code,
+        university_national_id=contract.university_id,
+        researcher_national_id=contract.researcher_id,
+        contract_number=contract.contract_number,
+        proposal_id=contract.proposal_id,
+        attachment_path=contract.attachment_path,
+        title=contract.title,
+        total_amount=int(contract.total_amount),
+        contract_date=contract.contract_date,
+        duration_months=contract.duration_months,
+        status=contract.status,
+    )
+
+
+@router.get("/{tracking_code}", response_model=ContractDetail)
+def get_contract(
+    tracking_code: str,
+    db: Session = Depends(get_db),
+):
+    """Fetch the full details of a single active contract for editing."""
+    contract = _get_active_contract_or_404(db, tracking_code)
+    return _to_detail(contract)
+
+
+@router.put("/{tracking_code}", response_model=ContractSearchResult)
+def update_contract(
+    tracking_code: str,
+    payload: ContractUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update an existing active contract's editable fields.
+
+    Reuses the same party-resolution/business-rule check, optional-text
+    normalization, and layered error handling as :func:`create_contract` so
+    an update is validated exactly as strictly as a fresh registration.
+    """
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(
+            status_code=400,
+            detail="عنوان قرارداد الزامی است.",
+        )
+
+    try:
+        contract = _get_active_contract_or_404(db, tracking_code)
+        employer, university, researcher = _get_active_contract_parties(
+            db, payload
+        )
+
+        contract.employer_code = payload.employer_classification_code
+        contract.university_id = payload.university_national_id
+        contract.researcher_id = payload.researcher_national_id
+        contract.contract_number = _optional_text(payload.contract_number)
+        contract.proposal_id = _optional_text(payload.proposal_id)
+        contract.attachment_path = _optional_text(payload.attachment_path)
+        contract.title = title
+        contract.total_amount = payload.total_amount
+        contract.contract_date = payload.contract_date
+        contract.duration_months = payload.duration_months
+
         db.commit()
         db.refresh(contract)
     except HTTPException:

@@ -1,177 +1,424 @@
-# File: pages/batch_payments_page.py
-import streamlit as st
-import requests
-import pandas as pd
-from datetime import datetime
+"""Render the database-backed batch payment (draft/finalize) form.
 
-# Backend API Base URL
+Every draft is persisted to the ``payments`` table the moment it is added
+(``POST /payments/draft``), so the list survives a browser reload. Funds
+are reserved against the employer's real balance as soon as a draft is
+created — the backend hard-blocks (HTTP 400) any payment that would take
+the balance negative, superseding the old FR-18/19/20 warning-only rule.
+"""
+
+import io
+
+import pandas as pd
+import requests
+import streamlit as st
+
 API_URL = "http://127.0.0.1:8000/api/v1"
 
-# ─── Aggressive RTL override + compact Persian theme ───
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
-* { font-family: 'Vazirmatn', sans-serif !important; }
-/* Force RTL on main containers and text inputs */
-.block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
-    direction: rtl !important;
-    text-align: right !important;
-}
-/* Fix sidebar text alignment */
-[data-testid="stSidebarNav"] span {
-    direction: rtl !important;
-    text-align: right !important;
-    font-size: 1.05rem !important;
-}
-/* Compact headers and rules so all sections fit without excessive scrolling */
-h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
-h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
-hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
-.stBlock, .stVerticalBlock, [data-testid="stVerticalBlock"] > div {
-    margin-top: 0.1rem !important;
-    margin-bottom: 0.1rem !important;
-}
-</style>
-""", unsafe_allow_html=True)
+# Exact Persian headers/order required for both the on-screen drafts table
+# and the finalized-batch Excel export.
+DRAFT_TABLE_COLUMNS = [
+    "کد رهگیری پرداخت",
+    "کد قرارداد",
+    "متقاضی",
+    "دانشگاه یا موسسه مجری",
+    "عنوان قرارداد",
+    "مبلغ قرارداد (ریال)",
+    "مبلغ پرداختی (ریال)",
+    "پرداخت از محل سال مالی",
+    "مانده متقاضی (ریال)",
+]
+NUMERIC_TABLE_COLUMNS = [
+    "مبلغ قرارداد (ریال)",
+    "مبلغ پرداختی (ریال)",
+    "مانده متقاضی (ریال)",
+]
 
+# Widgets cleared after a successful "Add to Batch" — everything about the
+# row just added, but not the global series/payment-year config.
+ROW_RESET_KEYS = (
+    "batch_search_query",
+    "batch_contract_choice",
+    "batch_pay_tracking_code",
+    "batch_amount",
+    "batch_funding_year",
+)
+
+FINALIZE_STATE_KEY = "batch_finalize_state"
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@100..900&display=swap');
+    * { font-family: 'Vazirmatn', sans-serif !important; }
+    .block-container, .stTextInput, .stNumberInput, .stSelectbox, p, div {
+        direction: rtl !important;
+        text-align: right !important;
+    }
+    [data-testid="stSidebarNav"] span {
+        direction: rtl !important;
+        text-align: right !important;
+        font-size: 1.05rem !important;
+    }
+    h1 { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; padding: 0 !important; }
+    h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.15rem !important; padding: 0 !important; }
+    hr { margin-top: 0.25rem !important; margin-bottom: 0.25rem !important; }
+    .stBlock, .stVerticalBlock, [data-testid="stVerticalBlock"] > div {
+        margin-top: 0.1rem !important;
+        margin-bottom: 0.1rem !important;
+    }
+    div[data-testid="stDataFrame"] * { direction: rtl !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("📂 فرم ثبت دسته‌ای لیست پرداخت (کارتابل صندوق عتف)")
 
-# 1. Initialize Temporary Cart in Session State
-if "payment_cart" not in st.session_state:
-    st.session_state.payment_cart = []
 
-# 2. Top Bar: Global Batch Configuration
+def _format_rials(value) -> str:
+    """Format a Rial amount with thousand separators, or '-' when absent."""
+    if value is None:
+        return "-"
+    return f"{value:,.0f}"
+
+
+def _response_detail(response: requests.Response) -> str:
+    """Extract a user-facing API error detail from JSON or text responses."""
+    try:
+        response_data = response.json()
+    except ValueError:
+        response_data = None
+
+    if isinstance(response_data, dict):
+        detail = response_data.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail
+        if isinstance(detail, list):
+            messages = [
+                item.get("msg", str(item)) if isinstance(item, dict) else str(item)
+                for item in detail
+            ]
+            return " ".join(messages)
+    elif isinstance(response_data, str) and response_data.strip():
+        return response_data
+
+    return f"خطا در پردازش درخواست (کد وضعیت: {response.status_code})."
+
+
+def _fetch_drafts(series: str) -> list[dict] | None:
+    """Fetch active drafts for a series, handling connection errors gracefully."""
+    try:
+        response = requests.get(
+            f"{API_URL}/payments/drafts", params={"series": series}, timeout=5
+        )
+        if response.status_code == 200:
+            return response.json()
+        st.error(f"❌ خطا در دریافت لیست پیش‌نویس‌ها: {_response_detail(response)}")
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+            "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+        )
+    except requests.exceptions.Timeout:
+        st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+    except Exception as exc:
+        st.error(f"خطای پیش‌بینی‌نشده در دریافت لیست پیش‌نویس‌ها: {exc}")
+    return None
+
+
+def _to_persian_row(item: dict) -> dict:
+    """Map one enriched payment record onto the exact required headers."""
+    return {
+        "کد رهگیری پرداخت": item["tracking_code"],
+        "کد قرارداد": item["contract_tracking_code"],
+        "متقاضی": item.get("employer_name") or "-",
+        "دانشگاه یا موسسه مجری": item.get("university_name") or "-",
+        "عنوان قرارداد": item.get("contract_title") or "-",
+        "مبلغ قرارداد (ریال)": item.get("contract_total_amount"),
+        "مبلغ پرداختی (ریال)": item["amount"],
+        "پرداخت از محل سال مالی": item["funding_year"],
+        "مانده متقاضی (ریال)": item.get("employer_balance_after"),
+    }
+
+
+def _build_dataframe(items: list[dict]) -> pd.DataFrame:
+    """Build the exact-header DataFrame shared by the table and the export."""
+    rows = [_to_persian_row(item) for item in items]
+    return pd.DataFrame(rows, columns=DRAFT_TABLE_COLUMNS)
+
+
+def _display_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Comma-format numeric columns for on-screen display (raw numbers stay in the Excel export)."""
+    display_df = df.copy()
+    for column in NUMERIC_TABLE_COLUMNS:
+        display_df[column] = display_df[column].apply(_format_rials)
+    return display_df
+
+
+def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Convert the drafts/finalized DataFrame to an in-memory Excel file."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Payments")
+    output.seek(0)
+    return output.getvalue()
+
+
+def _apply_pending_row_reset() -> None:
+    """Clear the just-added row's widget state before the widgets are recreated."""
+    if not st.session_state.pop("batch_row_reset_pending", False):
+        return
+    for widget_key in ROW_RESET_KEYS:
+        st.session_state.pop(widget_key, None)
+
+
+def _schedule_row_reset() -> None:
+    st.session_state.batch_row_reset_pending = True
+    st.rerun()
+
+
+_apply_pending_row_reset()
+
+# st.success() is an ephemeral inline element cleared by an immediately
+# following st.rerun() — unlike st.toast(), it does not survive into the
+# next run. Both the "row added" balance message and the finalize message
+# are therefore stashed in session_state and rendered once, here, right
+# after the rerun that follows a successful action.
+add_success_message = st.session_state.pop("batch_add_success_message", None)
+if add_success_message:
+    st.success(add_success_message)
+
+finalize_success_message = st.session_state.pop("batch_finalize_success_message", None)
+if finalize_success_message:
+    st.success(finalize_success_message)
+
+
+# ─── Finalized "success state": Excel download, entry UI hidden ──────────
+finalize_state = st.session_state.get(FINALIZE_STATE_KEY)
+if finalize_state:
+    st.download_button(
+        label="📥 دانلود فایل اکسل لیست پرداخت",
+        data=finalize_state["excel_bytes"],
+        file_name=finalize_state["filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    st.markdown("---")
+    st.dataframe(
+        _display_dataframe(finalize_state["dataframe"]), width="stretch", hide_index=True
+    )
+    if st.button("🆕 شروع لیست پرداخت جدید"):
+        st.session_state.pop(FINALIZE_STATE_KEY, None)
+        st.rerun()
+    st.stop()
+
+
+# ─── 1. Global Config: applies to every new row added below ──────────────
 st.subheader("۱. اطلاعات کلی لیست پرداخت")
-col_s1, col_s2, col_s3 = st.columns(3)
+col_s1, col_s2 = st.columns(2)
 with col_s1:
-    series_number = st.number_input("شماره سری پرداخت (لیست):", min_value=1, value=15, step=1)
+    series_number = st.text_input(
+        "شماره سری پرداخت (لیست):", value="15", key="batch_series"
+    )
 with col_s2:
-    # Default to current Jalali year (1405 based on conceptual doc context)
-    payment_year = st.number_input("سال پرداخت (شمسی):", min_value=1398, max_value=1410, value=1405)
-with col_s3:
-    st.info("💡 این اطلاعات به طور خودکار به تمام ردیف‌های این لیست اعمال خواهد شد.")
+    payment_year = st.number_input(
+        "سال پرداخت (شمسی):",
+        min_value=1398,
+        max_value=1410,
+        value=1405,
+        key="batch_payment_year",
+    )
 
 st.markdown("---")
 
-# 3. Data Entry Section (Row by Row)
+# ─── 2. Add New Row: search a contract, then stage a draft against it ────
 st.subheader("۲. ورود اطلاعات ردیف جدید")
 
-# Live search for contracts
-search_query = st.text_input("🔍 جستجوی قرارداد (کد رهگیری یا بخشی از عنوان قرارداد):")
+search_query = st.text_input(
+    "🔍 جستجوی قرارداد (کد رهگیری یا بخشی از عنوان قرارداد):",
+    key="batch_search_query",
+)
 selected_contract = None
 
 if search_query:
     try:
-        response = requests.get(f"{API_URL}/contracts/search", params={"q": search_query}, timeout=5)
+        response = requests.get(
+            f"{API_URL}/contracts/search", params={"q": search_query}, timeout=5
+        )
         if response.status_code == 200 and response.json():
             contracts_found = response.json()
-            # Format display for the selectbox
-            options = {f"{c['contract_tracking_code']} - {c['title'][:40]}...": c for c in contracts_found}
-            choice = st.selectbox("قرارداد مورد نظر را انتخاب کنید:", list(options.keys()))
+            options = {
+                f"{c['contract_tracking_code']} - {c['title'][:40]}...": c
+                for c in contracts_found
+            }
+            choice = st.selectbox(
+                "قرارداد مورد نظر را انتخاب کنید:",
+                list(options.keys()),
+                key="batch_contract_choice",
+            )
             selected_contract = options[choice]
-            
-            # Auto-fill Read-only data to assure the clerk
-            st.success(f"🏢 متقاضی (شرکت مادر): {selected_contract['employer_name']} | 🎓 مجری: {selected_contract['university_name']} | 🧑‍💻 فناور: {selected_contract['researcher_name']}")
+            st.success(
+                f"🏢 متقاضی (شرکت مادر): {selected_contract['employer_name']} | "
+                f"🎓 مجری: {selected_contract['university_name']} | "
+                f"🧑‍💻 فناور: {selected_contract['researcher_name']}"
+            )
         else:
             st.warning("هیچ قراردادی با این مشخصات یافت نشد.")
     except requests.exceptions.ConnectionError:
-        st.error("خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است.")
+        st.error(
+            "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+            "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+        )
     except requests.exceptions.Timeout:
         st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
-    except Exception as e:
-        st.error(f"خطا در اتصال به بک‌اند: {e}")
+    except Exception as exc:
+        st.error(f"خطا در اتصال به بک‌اند: {exc}")
 
-# Other input fields for the row
 col_r1, col_r2, col_r3 = st.columns(3)
 with col_r1:
-    pay_tracking_code = st.text_input("کد رهگیری پرداخت (از سامانه ساتع):")
+    pay_tracking_code = st.text_input(
+        "کد رهگیری پرداخت (از سامانه ساتع):", key="batch_pay_tracking_code"
+    )
 with col_r2:
-    amount = st.number_input("مبلغ پرداختی (ریال):", min_value=0.0, step=1000000.0, format="%.2f")
+    # Integer-only amount: value/step are ints, which puts st.number_input
+    # into integer mode (it returns a float if any of value/step/min/max
+    # were floats), and format="%d" keeps the on-screen display integral.
+    amount = st.number_input(
+        "مبلغ پرداختی (ریال):",
+        min_value=0,
+        step=1000000,
+        format="%d",
+        value=0,
+        key="batch_amount",
+    )
 with col_r3:
-    funding_year = st.number_input("پرداخت از محل سال مالی (شمسی):", min_value=1398, max_value=1410, value=1402)
+    funding_year = st.number_input(
+        "پرداخت از محل سال مالی (شمسی):",
+        min_value=1398,
+        max_value=1410,
+        value=1402,
+        key="batch_funding_year",
+    )
 
-# Row Validation and Insertion into Temporary Cart
-if st.button("➕ بررسی و اضافه کردن به لیست"):
-    if not selected_contract or not pay_tracking_code or amount <= 0:
+if st.button("➕ افزودن به لیست", type="primary"):
+    if not selected_contract or not pay_tracking_code.strip() or amount <= 0:
         st.error("لطفاً تمامی فیلدهای الزامی ردیف را تکمیل کنید.")
+    elif not series_number.strip():
+        st.error("لطفاً شماره سری پرداخت را وارد کنید.")
     else:
-        # Calculate pending amount for this employer in the current cart
-        employer_code = selected_contract['employer_classification_code']
-        pending_amount = sum(item['amount'] for item in st.session_state.payment_cart 
-                             if item['employer_code'] == employer_code and item['funding_year'] == funding_year)
-        
-        # Call Backend to validate draft with pending cart consideration
-        val_payload = {
-            "contract_tracking_code": selected_contract['contract_tracking_code'],
-            "amount": amount,
-            "funding_year": funding_year,
-            "pending_cart_amount": pending_amount
+        draft_payload = {
+            "tracking_code": pay_tracking_code.strip(),
+            "contract_tracking_code": selected_contract["contract_tracking_code"],
+            "amount": int(amount),
+            "funding_year": int(funding_year),
+            "payment_year": int(payment_year),
+            "series": series_number.strip(),
         }
-        
         try:
-            val_response = requests.post(f"{API_URL}/payments/validate-draft", json=val_payload)
-            if val_response.status_code == 200:
-                # Add to local state (Memory Cart)
-                new_row = {
-                    "tracking_code": pay_tracking_code,
-                    "contract_tracking_code": selected_contract['contract_tracking_code'],
-                    "title": selected_contract['title'],
-                    "employer_name": selected_contract['employer_name'],
-                    "employer_code": employer_code,
-                    "amount": amount,
-                    "funding_year": funding_year,
-                    "payment_year": payment_year,
-                    "series": str(series_number)
-                }
-                st.session_state.payment_cart.append(new_row)
-                st.toast("✅ ردیف با موفقیت تایید و به لیست پیش‌نویس اضافه شد.", icon="🔥")
+            draft_response = requests.post(
+                f"{API_URL}/payments/draft", json=draft_payload, timeout=10
+            )
+            if draft_response.status_code == 201:
+                data = draft_response.json()
+                st.session_state.batch_add_success_message = (
+                    "✅ پرداخت به لیست اضافه شد. "
+                    f"مانده کارفرما قبل از پرداخت: {_format_rials(data['employer_balance_before'])} ریال "
+                    f"| مانده پس از پرداخت: {_format_rials(data['employer_balance_after'])} ریال"
+                )
+                _schedule_row_reset()
+            elif draft_response.status_code == 400:
+                # Insufficient funds or duplicate tracking code — the exact
+                # backend message (deficit amount, etc.) is shown verbatim.
+                st.error(f"❌ {_response_detail(draft_response)}")
             else:
-                err_detail = val_response.json().get('detail', 'موجودی کافی نیست.')
-                st.error(f"❌ خطای عدم کفایت موجودی: {err_detail}")
-        except Exception as e:
-            st.error(f"خطا در ارتباط با سرور اعتبارسنجی: {e}")
+                st.error(f"❌ خطا در افزودن ردیف: {_response_detail(draft_response)}")
+        except requests.exceptions.ConnectionError:
+            st.error(
+                "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+                "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+            )
+        except requests.exceptions.Timeout:
+            st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+        except Exception as exc:
+            st.error(f"خطا در ارتباط با سرور: {exc}")
 
 st.markdown("---")
 
-# 4. Display Current Temporary Cart Table
-st.subheader("۳. لیست پیش‌نویس پرداخت‌های در حال انتظار (ثبت موقت)")
-if st.session_state.payment_cart:
-    df_cart = pd.DataFrame(st.session_state.payment_cart)
-    # Re-order columns for display
-    display_df = df_cart[['series', 'tracking_code', 'contract_tracking_code', 'employer_name', 'amount', 'funding_year', 'payment_year']]
-    display_df.columns = ['سری', 'کد رهگیری پرداخت', 'کد قرارداد', 'نام کارفرما', 'مبلغ (ریال)', 'محل سال مالی', 'سال خروج پول']
-    st.dataframe(display_df, width="stretch")
-    
-    if st.button("🗑️ خالی کردن کل لیست"):
-        st.session_state.payment_cart = []
-        st.rerun()
-        
-    st.markdown("### 🚀 نهایی‌سازی و ثبت در دیتابیس")
-    if st.button("💾 تأیید نهایی و ارسال لیست به صندوق", type="primary"):
-        # Format payload for bulk submit
-        bulk_payload = {
-            "payments": [
-                {
-                    "tracking_code": item['tracking_code'],
-                    "contract_tracking_code": item['contract_tracking_code'],
-                    "amount": item['amount'],
-                    "series": item['series'],
-                    "payment_year": item['payment_year'],
-                    "funding_year": item['funding_year']
-                } for item in st.session_state.payment_cart
-            ]
+# ─── 3. Data Table: always reflects the database, not local state ────────
+st.subheader("۳. لیست پیش‌نویس پرداخت‌های در حال انتظار (ثبت‌شده در پایگاه داده)")
+
+current_series = series_number.strip()
+drafts = _fetch_drafts(current_series) if current_series else None
+
+if drafts:
+    drafts_df = _build_dataframe(drafts)
+    st.dataframe(_display_dataframe(drafts_df), width="stretch", hide_index=True)
+
+    delete_col1, delete_col2 = st.columns([3, 1])
+    with delete_col1:
+        delete_options = {
+            f"{d['tracking_code']} — {d.get('employer_name') or '-'} "
+            f"({_format_rials(d['amount'])} ریال)": d["tracking_code"]
+            for d in drafts
         }
-        
+        delete_choice = st.selectbox(
+            "حذف یک ردیف از لیست:", list(delete_options.keys()), key="batch_delete_choice"
+        )
+    with delete_col2:
+        st.write("")
+        st.write("")
+        if st.button("🗑️ حذف ردیف انتخاب‌شده"):
+            tracking_code_to_delete = delete_options[delete_choice]
+            try:
+                delete_response = requests.delete(
+                    f"{API_URL}/payments/draft/{tracking_code_to_delete}", timeout=10
+                )
+                if delete_response.status_code == 200:
+                    st.toast("🗑️ ردیف حذف شد.", icon="🗑️")
+                    st.rerun()
+                else:
+                    st.error(f"❌ خطا در حذف ردیف: {_response_detail(delete_response)}")
+            except requests.exceptions.ConnectionError:
+                st.error(
+                    "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+                    "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+                )
+            except Exception as exc:
+                st.error(f"خطا در حذف ردیف: {exc}")
+
+    st.markdown("### 🚀 نهایی‌سازی و ثبت در دیتابیس")
+    if st.button("💾 تأیید نهایی لیست", type="primary"):
         try:
-            submit_res = requests.post(f"{API_URL}/payments/bulk-submit", json=bulk_payload)
-            if submit_res.status_code == 201:
-                submitted_count = submit_res.json().get("submitted_count", 0)
-                st.success(f"🎉 لیست با موفقیت نهایی شد! {submitted_count} قلم پرداخت ثبت و قفل گردید.")
-                st.session_state.payment_cart = [] # Clear cart on success
+            finalize_response = requests.post(
+                f"{API_URL}/payments/finalize-batch",
+                json={"series": current_series},
+                timeout=10,
+            )
+            if finalize_response.status_code == 200:
+                data = finalize_response.json()
+                finalized_df = _build_dataframe(data["finalized_payments"])
+                st.session_state[FINALIZE_STATE_KEY] = {
+                    "excel_bytes": _to_excel_bytes(finalized_df),
+                    "filename": f"payments_series_{current_series}.xlsx",
+                    "dataframe": finalized_df,
+                }
+                st.session_state.batch_finalize_success_message = (
+                    f"🎉 لیست با موفقیت نهایی شد! {data['finalized_count']} "
+                    "قلم پرداخت ثبت و قفل گردید."
+                )
+                st.rerun()
             else:
-                st.error(f"❌ خطا در ثبت نهایی: {submit_res.json().get('detail')}")
-        except Exception as e:
-            st.error(f"خطا در ارسال نهایی به سرور: {e}")
-else:
-    st.info("لیست پیش‌نویس در حال حاضر خالی است. ردیف‌های پرداخت را از بخش بالا اضافه کنید.")
+                st.error(f"❌ خطا در نهایی‌سازی: {_response_detail(finalize_response)}")
+        except requests.exceptions.ConnectionError:
+            st.error(
+                "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+                "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+            )
+        except Exception as exc:
+            st.error(f"خطا در ارسال نهایی به سرور: {exc}")
+elif drafts is not None:
+    st.info(
+        "لیست پیش‌نویس برای این سری در حال حاضر خالی است. "
+        "ردیف‌های پرداخت را از بخش بالا اضافه کنید."
+    )

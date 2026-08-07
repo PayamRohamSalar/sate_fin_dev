@@ -12,6 +12,50 @@ from models.payment import Payment
 from models.transfer import CreditTransfer
 
 
+class InsufficientFundsError(ValueError):
+    """Raised when a payment would exceed the employer's real balance.
+
+    A ``ValueError`` subclass so existing ``except ValueError`` call sites
+    still catch it, while callers that need to distinguish "insufficient
+    funds" from other validation failures (e.g. "contract not found") can
+    match on this specific type instead of parsing the error message.
+
+    Attributes
+    ----------
+    employer_code : str
+        The employer whose balance was insufficient.
+    funding_year : int
+        The funding year the balance was checked against.
+    current_balance : float
+        The employer's real balance before this payment.
+    amount : float
+        The payment amount that was rejected.
+    deficit : float
+        ``amount - current_balance`` — how much the payment exceeds the
+        available balance, in Rials.
+    """
+
+    def __init__(
+        self,
+        employer_code: str,
+        funding_year: int,
+        current_balance: float,
+        amount: float,
+    ) -> None:
+        self.employer_code = employer_code
+        self.funding_year = funding_year
+        self.current_balance = current_balance
+        self.amount = amount
+        self.deficit = amount - current_balance
+        super().__init__(
+            "موجودی کافی نیست: "
+            f"مانده فعلی کارفرما '{employer_code}' برای سال مالی "
+            f"{funding_year} برابر {current_balance:,.0f} ریال است، اما "
+            f"مبلغ درخواستی {amount:,.0f} ریال می‌باشد "
+            f"(کسری: {self.deficit:,.0f} ریال)."
+        )
+
+
 def lock_active_contracts(
     db: Session,
     contract_codes: Sequence[str],
@@ -196,6 +240,10 @@ def calculate_real_balance(
     Calculate the real balance for an active employer and funding year.
 
     Formula: ``(Deposits + Transfers In) - (Payments + Transfers Out)``.
+    "Payments" includes both ``Final`` and ``Draft`` status rows: a draft
+    reserves funds against the employer's balance the moment it is staged
+    in the batch-payment cart, so a second draft cannot be added against
+    money a first, not-yet-finalized draft has already claimed.
 
     Args:
         db: Active SQLAlchemy database session.
@@ -239,6 +287,7 @@ def calculate_real_balance(
         Contract.employer_code == employer_code,
         Payment.funding_year == funding_year,
         Payment.is_deleted == False,
+        Payment.status.in_(("Final", "Draft")),
         Contract.is_deleted == False,
     ).scalar()
     total_payments = payments_query or Decimal("0.0")
@@ -424,8 +473,11 @@ def validate_payment_impact(
     """
     Validate a payment's impact on the linked employer's real balance.
 
-    This function implements FR-18, FR-19, and FR-20. A negative projected
-    balance is reported through ``is_negative`` and never raises an error.
+    Supersedes the original FR-18/FR-19/FR-20 "warn but allow" behavior:
+    negative balances are now a **hard block**, not a warning. A projected
+    balance below zero raises :class:`InsufficientFundsError` instead of
+    being reported through an ``is_negative`` flag — there is no longer a
+    success return path for an unaffordable payment.
 
     Args:
         db: Active SQLAlchemy database session.
@@ -436,11 +488,15 @@ def validate_payment_impact(
             the duration of the caller's transaction.
 
     Returns:
-        A dictionary containing employer code, current balance, payment amount,
-        projected balance, and whether the projected balance is negative.
+        A dictionary containing employer code, current balance, payment
+        amount, and projected balance — always affordable, since an
+        unaffordable payment raises instead of returning.
 
     Raises:
-        ValueError: If the contract or linked employer is missing or soft-deleted.
+        ValueError: If the contract or linked employer is missing or
+            soft-deleted.
+        InsufficientFundsError: If ``current_balance - payment_amount`` is
+            negative.
     """
     if lock_rows:
         contract, _ = lock_active_contract_and_employer(db, contract_code)
@@ -470,10 +526,15 @@ def validate_payment_impact(
     current_balance = calculate_real_balance(db, employer_code, funding_year)
     new_balance = current_balance - payment_amount
 
+    if new_balance < 0:
+        raise InsufficientFundsError(
+            employer_code, funding_year, current_balance, payment_amount
+        )
+
     return {
         "employer_code": employer_code,
         "current_balance": current_balance,
         "payment_amount": payment_amount,
         "new_balance": new_balance,
-        "is_negative": new_balance < 0,
+        "is_negative": False,
     }

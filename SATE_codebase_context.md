@@ -5,6 +5,7 @@
     main.py
     SATE_codebase_context.md
     test_engine_cli.py
+    .cursor/
     .pgdata/
         base/
             1/
@@ -47,6 +48,7 @@
                 __init__.py
     core/
         database.py
+        date_helper.py
     dashboard/
         app.py
         app_v2.py
@@ -60,11 +62,14 @@
             university_entry_page.py
     data/
         Archive/
+            Contracts/
             Payments/
     Docs/
         Phase1_Complete.md
         Phase2_Start.md
         Phase3_Dashboard_Complete.md
+        SATE_Living_Documentation.md
+        Technical Transition Report_R2.md
     models/
         contract.py
         deposits.py
@@ -358,11 +363,19 @@ api_router.include_router(researchers.router)
 
 ## File: api\v1\endpoints\contracts.py
 ------------------------------
+import logging
+import traceback
+from datetime import date
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import (
+    DataError,
+    IntegrityError,
+    OperationalError,
+    SQLAlchemyError,
+)
 from sqlalchemy.orm import Session
 
 from core.database import get_db
@@ -373,11 +386,19 @@ from models.university import University
 from schemas.contract_schema import ContractCreate, ContractSearchResult
 
 router = APIRouter(prefix="/contracts", tags=["Contracts"])
+logger = logging.getLogger(__name__)
 
-DUPLICATE_CONTRACT_MESSAGE = (
-    "قراردادی با کد رهگیری '{tracking_code}' قبلاً ثبت شده است. "
-    "لطفاً از ارسال مجدد فرم خودداری کنید."
+DUPLICATE_CONTRACT_MESSAGE = "کد رهگیری تکراری است."
+CONTRACT_DATA_MISMATCH_MESSAGE = (
+    "خطای یکپارچگی اطلاعات: کارفرما، دانشگاه یا فناور نامعتبر است."
 )
+CONTRACT_DATA_FORMAT_MESSAGE = (
+    "نوع یا طول داده‌های ارسالی نامعتبر است (مثلا فرمت تاریخ یا مبالغ)."
+)
+CONTRACT_CONNECTION_ERROR_MESSAGE = (
+    "خطا در ارتباط با پایگاه داده. لطفاً چند لحظه دیگر دوباره تلاش کنید."
+)
+ALLOWED_CONTRACT_EMPLOYER_TYPES = {"Mother", "Independent"}
 
 
 def _optional_text(value: str | None) -> str | None:
@@ -386,6 +407,100 @@ def _optional_text(value: str | None) -> str | None:
         return None
     normalized_value = value.strip()
     return normalized_value or None
+
+
+def _is_unique_violation(error: IntegrityError) -> bool:
+    """Return whether an integrity error represents a unique-key conflict."""
+    original_error = error.orig
+    sqlstate = getattr(original_error, "sqlstate", None) or getattr(
+        original_error, "pgcode", None
+    )
+    if sqlstate == "23505":
+        return True
+
+    return "unique constraint" in str(original_error).lower()
+
+
+def _is_foreign_key_violation(error: IntegrityError) -> bool:
+    """Return whether an integrity error represents a foreign-key conflict."""
+    original_error = error.orig
+    sqlstate = getattr(original_error, "sqlstate", None) or getattr(
+        original_error, "pgcode", None
+    )
+    if sqlstate == "23503":
+        return True
+
+    return "foreign key" in str(original_error).lower()
+
+
+def _raise_contract_persistence_error(
+    error: SQLAlchemyError,
+    tracking_code: str,
+) -> None:
+    """Map a failed contract write to a localized API error."""
+    logger.exception("Failed to persist contract '%s': %s", tracking_code, error)
+
+    if isinstance(error, IntegrityError) and _is_unique_violation(error):
+        raise HTTPException(
+            status_code=409,
+            detail=DUPLICATE_CONTRACT_MESSAGE.format(tracking_code=tracking_code),
+        ) from error
+
+    if isinstance(error, IntegrityError) and _is_foreign_key_violation(error):
+        raise HTTPException(
+            status_code=400,
+            detail=CONTRACT_DATA_MISMATCH_MESSAGE,
+        ) from error
+
+    if isinstance(error, DataError):
+        raise HTTPException(
+            status_code=400,
+            detail=CONTRACT_DATA_FORMAT_MESSAGE,
+        ) from error
+
+    raise HTTPException(
+        status_code=400,
+        detail=CONTRACT_DATA_MISMATCH_MESSAGE,
+    ) from error
+
+
+def _raise_contract_connection_error(
+    error: Exception,
+    tracking_code: str,
+) -> None:
+    """Log a database connectivity failure and return a retryable 503 error.
+
+    Handles both SQLAlchemy's wrapped ``OperationalError`` and a raw
+    ``ConnectionResetError`` that may surface if the connection drops before
+    the driver wraps it, so a mid-request network failure never escapes as an
+    unhandled exception.
+    """
+    logger.error(
+        "Database connection failure while persisting contract '%s': %s",
+        tracking_code,
+        error,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail=CONTRACT_CONNECTION_ERROR_MESSAGE,
+    ) from error
+
+
+def _raise_unexpected_contract_error(
+    error: Exception,
+    tracking_code: str,
+) -> None:
+    """Log an unexpected contract failure and return a safe server error."""
+    logger.error(
+        "Unexpected contract persistence error for '%s': %s",
+        tracking_code,
+        error,
+    )
+    print(traceback.format_exc())
+    raise HTTPException(
+        status_code=500,
+        detail="خطا در ذخیره قرارداد. لطفاً مجدداً تلاش کنید.",
+    ) from error
 
 
 def _get_active_contract_parties(
@@ -407,12 +522,11 @@ def _get_active_contract_parties(
             status_code=404,
             detail="کارفرمای انتخاب‌شده یافت نشد یا حذف شده است.",
         )
-    if employer.employer_type == "Subsidiary":
+    if employer.employer_type not in ALLOWED_CONTRACT_EMPLOYER_TYPES:
         raise HTTPException(
             status_code=400,
             detail=(
-                "خطا: شرکت‌های زیرمجموعه مجاز به انعقاد قرارداد نمی‌باشند. "
-                "قرارداد باید به نام شرکت مادر ثبت شود."
+                "خطا: قرارداد فقط باید به نام شرکت مادر یا مستقل ثبت شود."
             ),
         )
 
@@ -525,7 +639,11 @@ def create_contract(
     payload: ContractCreate,
     db: Session = Depends(get_db),
 ):
-    """Register a contract and gracefully reject duplicate submissions."""
+    """Register a contract, keeping the full lookup-and-write flow inside one
+    transaction-safe try/except so any failure — validation, persistence, or
+    a dropped database connection — rolls back cleanly and returns a proper
+    HTTP error instead of an unhandled exception.
+    """
     tracking_code = payload.tracking_code.strip()
     title = payload.title.strip()
     if not tracking_code or not title:
@@ -534,57 +652,63 @@ def create_contract(
             detail="کد رهگیری و عنوان قرارداد الزامی هستند.",
         )
 
-    existing_contract = (
-        db.query(Contract.tracking_code)
-        .filter(
-            Contract.tracking_code == tracking_code,
-            Contract.is_deleted == False,
-        )
-        .first()
-    )
-    if existing_contract is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=DUPLICATE_CONTRACT_MESSAGE.format(
-                tracking_code=tracking_code
-            ),
-        )
-
-    employer, university, researcher = _get_active_contract_parties(db, payload)
-    contract = Contract(
-        tracking_code=tracking_code,
-        employer_code=payload.employer_classification_code,
-        university_id=payload.university_national_id,
-        researcher_id=payload.researcher_national_id,
-        contract_number=_optional_text(payload.contract_number),
-        proposal_id=_optional_text(payload.proposal_id),
-        attachment_path=_optional_text(payload.attachment_path),
-        title=title,
-        total_amount=payload.total_amount,
-        contract_date=payload.contract_date,
-        duration_months=payload.duration_months,
-        status="فعال",
-        is_deleted=False,
-    )
-    db.add(contract)
-
     try:
+        existing_contract = (
+            db.query(Contract.tracking_code)
+            .filter(
+                Contract.tracking_code == tracking_code,
+                Contract.is_deleted == False,
+            )
+            .first()
+        )
+        if existing_contract is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=DUPLICATE_CONTRACT_MESSAGE.format(
+                    tracking_code=tracking_code
+                ),
+            )
+
+        employer, university, researcher = _get_active_contract_parties(
+            db, payload
+        )
+        contract_date: date = payload.contract_date
+        contract = Contract(
+            tracking_code=tracking_code,
+            employer_code=payload.employer_classification_code,
+            university_id=payload.university_national_id,
+            researcher_id=payload.researcher_national_id,
+            contract_number=_optional_text(payload.contract_number),
+            proposal_id=_optional_text(payload.proposal_id),
+            attachment_path=_optional_text(payload.attachment_path),
+            title=title,
+            total_amount=payload.total_amount,
+            contract_date=contract_date,
+            duration_months=payload.duration_months,
+            status="فعال",
+            is_deleted=False,
+        )
+        db.add(contract)
         db.commit()
         db.refresh(contract)
+    except HTTPException:
+        db.rollback()
+        raise
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=DUPLICATE_CONTRACT_MESSAGE.format(
-                tracking_code=tracking_code
-            ),
-        ) from exc
+        _raise_contract_persistence_error(exc, tracking_code)
+    except DataError as exc:
+        db.rollback()
+        _raise_contract_persistence_error(exc, tracking_code)
+    except (OperationalError, ConnectionResetError) as exc:
+        db.rollback()
+        _raise_contract_connection_error(exc, tracking_code)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        _raise_unexpected_contract_error(exc, tracking_code)
     except Exception as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail="خطا در ذخیره قرارداد. لطفاً مجدداً تلاش کنید.",
-        ) from exc
+        _raise_unexpected_contract_error(exc, tracking_code)
 
     return _to_search_result(contract, employer, university, researcher)
 
@@ -1155,8 +1279,22 @@ def create_university(payload: UniversityCreate, db: Session = Depends(get_db)):
 
 ## File: core\database.py
 ------------------------------
+"""Database core for the SATE financial system.
+
+Configures the SQLAlchemy engine, session factory, declarative ``Base`` class,
+and the shared :class:`SoftDeleteMixin` used by every domain model to support
+non-destructive (soft) deletion of records.
+
+Soft-delete convention
+----------------------
+Every model inherits from both :data:`Base` and :class:`SoftDeleteMixin`.
+Records are flagged via ``is_deleted`` rather than physically removed, which
+preserves audit history and referential integrity across the dataset.
+"""
+
 import os
-from sqlalchemy import create_engine
+
+from sqlalchemy import Boolean, Column, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
@@ -1173,13 +1311,79 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+
+class SoftDeleteMixin:
+    """Mixin providing non-destructive (soft) deletion support.
+
+    Columns
+    -------
+    is_deleted : bool
+        Flag indicating whether the row is logically deleted. ``False`` means
+        the record is live; ``True`` means it has been soft-deleted and should
+        be excluded from active result sets. Indexed for query performance.
+    """
+
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+
+
 def get_db():
-    """Dependency to yield database session."""
+    """Yield a scoped database session and ensure it is closed afterwards."""
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+## File: core\date_helper.py
+------------------------------
+"""Shared strict date conversion helpers."""
+
+from datetime import date
+
+import jdatetime
+
+
+def parse_strict_jalali_date(date_str: str) -> date:
+    """
+    Parse a Jalali date using strict calendar validation.
+
+    Both ``YYYY/MM/DD`` and ``YYYY-MM-DD`` inputs are accepted. Invalid month
+    lengths, leap-day values, and malformed inputs raise ``ValueError``.
+
+    Args:
+        date_str: Jalali date text entered by a user or loaded from a file.
+
+    Returns:
+        The equivalent Gregorian ``date`` value.
+
+    Raises:
+        TypeError: If ``date_str`` is not a string.
+        ValueError: If the input is empty, malformed, or invalid in the Jalali
+            calendar.
+    """
+    if not isinstance(date_str, str):
+        raise TypeError("Jalali date value must be a string.")
+
+    clean_str = date_str.strip().replace("-", "/")
+    if not clean_str:
+        raise ValueError("Jalali date value cannot be empty.")
+
+    parsed_date = jdatetime.datetime.strptime(clean_str, "%Y/%m/%d").date()
+    return parsed_date.togregorian()
+
+
+def parse_strict_jalali_iso(date_str: str) -> str:
+    """
+    Parse a Jalali date securely and return Gregorian ISO format.
+
+    Args:
+        date_str: Jalali date text in ``YYYY/MM/DD`` or ``YYYY-MM-DD`` format.
+
+    Returns:
+        Gregorian date text in ISO ``YYYY-MM-DD`` format.
+    """
+    return parse_strict_jalali_date(date_str).isoformat()
 
 
 ## File: dashboard\app.py
@@ -2738,9 +2942,10 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
-import jdatetime
 import requests
 import streamlit as st
+
+from core.date_helper import parse_strict_jalali_iso
 
 API_URL = "http://127.0.0.1:8000/api/v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -2818,17 +3023,6 @@ def _optional_text(value: str) -> str | None:
     return normalized_value or None
 
 
-def _parse_jalali_date(value: str) -> str:
-    """Parse a strict Jalali date and return its Gregorian ISO representation."""
-    date_parts = re.split(r"[/-]", value.strip())
-    if len(date_parts) != 3 or any(not part.isdigit() for part in date_parts):
-        raise ValueError("Invalid Jalali date format")
-
-    year, month, day = (int(part) for part in date_parts)
-    jalali_date = jdatetime.date(year, month, day)
-    return jalali_date.togregorian().isoformat()
-
-
 def _safe_filename(original_name: str) -> str:
     """Create a collision-resistant filename without unsafe path characters."""
     original_path = Path(original_name)
@@ -2879,11 +3073,26 @@ def _apply_pending_form_reset() -> None:
 
 
 def _response_detail(response: requests.Response) -> str:
-    """Extract an API error detail while tolerating non-JSON responses."""
+    """Extract a user-facing API error detail from JSON or text responses."""
     try:
-        return response.json().get("detail", "خطای ناشناخته.")
+        response_data = response.json()
     except ValueError:
-        return "خطای ناشناخته."
+        response_data = None
+
+    if isinstance(response_data, dict):
+        detail = response_data.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail
+        if isinstance(detail, list):
+            messages = [
+                item.get("msg", str(item)) if isinstance(item, dict) else str(item)
+                for item in detail
+            ]
+            return " ".join(messages)
+    elif isinstance(response_data, str) and response_data.strip():
+        return response_data
+
+    return f"خطا در ثبت قرارداد (کد وضعیت: {response.status_code})."
 
 
 _apply_pending_form_reset()
@@ -2992,9 +3201,12 @@ if submitted:
         st.error("مبلغ قرارداد باید بیشتر از صفر باشد.")
     else:
         try:
-            contract_date_iso = _parse_jalali_date(contract_date_str)
-        except (TypeError, ValueError, OverflowError):
-            st.error("فرمت یا مقدار تاریخ نامعتبر است. تاریخ را به صورت YYYY/MM/DD وارد کنید.")
+            contract_date_iso = parse_strict_jalali_iso(contract_date_str)
+        except ValueError:
+            st.warning(
+                "تاریخ نامعتبر است. بررسی کنید که روز و ماه با تقویم شمسی "
+                "تطابق داشته باشد."
+            )
         else:
             attachment_path = None
             try:
@@ -3636,6 +3848,232 @@ The Phase 3 dashboard provides a powerful, user-friendly interface for:
 The implementation is clean, well-documented, and ready for immediate use by the SATE management team.
 
 
+## File: Docs\SATE_Living_Documentation.md
+------------------------------
+# SATE Financial System — Living Documentation
+### سامانه مالی نظارت بر تأمین اعتبار طرح‌های پژوهشی ساتع
+
+**Status:** MVP — Phase 4 complete (data-entry forms), entering demo phase.
+**Maintenance rule:** This document is updated automatically after every coding task completed in this workspace (see [Continuous Update Protocol](#continuous-update-protocol) at the bottom). Treat it as the current source of truth; if it conflicts with the code, the code wins and this file should be corrected in the same turn.
+
+---
+
+## 1. Environment & Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3.10+ |
+| Backend framework | FastAPI |
+| Frontend framework | Streamlit (RTL, Vazirmatn font) |
+| Database | PostgreSQL |
+| ORM | SQLAlchemy 2.0 (declarative, session-based) |
+| Environment isolation | Conda environment named `sate_env` |
+| Data interchange | pandas + openpyxl (Excel ETL) |
+| Calendar handling | `jdatetime` via `core/date_helper.py` |
+| Dependencies | `requirements.txt`: pandas, openpyxl, SQLAlchemy, python-dotenv, psycopg2-binary, jdatetime, streamlit |
+
+**Directory layout**
+
+```
+core/        connection/session factory (database.py), SoftDeleteMixin, strict Jalali date helper (date_helper.py)
+models/      SQLAlchemy ORM models (one file per domain table)
+schemas/     Pydantic request/response schemas, one file per API resource
+api/v1/      FastAPI routers; api_router.py aggregates per-resource routers under api/v1/endpoints/
+services/    Business-logic core — financial_engine.py (balances, locking, dynamic contract status)
+dashboard/   Streamlit frontend — app.py (active), app_v2.py (legacy, see §2), views/ (data-entry forms)
+scripts/     ETL loaders, one-off migrations, and reporting utilities (see §4)
+data/        Source Excel workbooks consumed by scripts/import_*.py
+results/     Output of reporting scripts (generate_financial_report.py, generate_contract_status_report.py)
+Docs/        Project documentation, including this file
+```
+
+Configuration is loaded from a local `.env` (not committed) via `python-dotenv`; `DATABASE_URL` is required and `core/database.py` raises `RuntimeError` at import time if it is missing. The engine uses `pool_pre_ping=True` and a 5s `connect_timeout`.
+
+---
+
+## 2. Frontend Architecture Note
+
+`dashboard/app.py` is the **active, maintained entry point** (`streamlit run dashboard/app.py`, per `dashboard/README.md`/`QUICKSTART.md`). It builds a multi-page `st.navigation` shell with two groups:
+
+- **داشبوردهای مدیریتی (Management dashboards):** a two-tab view — Tab 1 (`render_tab1`) is a single-employer balance sheet (KPI cards, detail table, bar/waterfall charts, Excel export); Tab 2 (`render_tab2`) is the macro/executive summary across all employers, sourced from `services.financial_engine.get_all_employers_financials`. The dashboard tabs query the database **directly** via SQLAlchemy — they do not go through the FastAPI layer.
+- **فرم‌های ورود اطلاعات (Data-entry forms):** `views/batch_payments_page.py`, `views/contract_entry_page.py`, `views/university_entry_page.py`, `views/researcher_entry_page.py`. These forms **do** call the FastAPI backend over HTTP (`API_URL = "http://127.0.0.1:8000/api/v1"`), so both `uvicorn main:app` and `streamlit run dashboard/app.py` must be running for the forms to work.
+
+`dashboard/app_v2.py` is a **frozen, legacy single-page prototype** — it predates the navigation/forms refactor, duplicates Tab 1's logic almost verbatim, and has not been touched since its one initial commit. Treat it as reference-only; do not extend it. `dashboard/README.md`, `QUICKSTART.md`, and `CHANGELOG.md` describe the pre-refactor single-page app and are stale relative to current `app.py` — they need an update pass to document the navigation shell and the four data-entry forms.
+
+**Batch payment "cart" pattern** (`views/batch_payments_page.py`): payments are staged client-side in `st.session_state.payment_cart` (a plain list of dicts). Each row is validated against `POST /payments/validate-draft` — which nets out `pending_cart_amount` (the sum of other not-yet-submitted cart rows for the same employer+funding_year) against the real DB balance — before being added to the cart. Only the final "تأیید نهایی" action calls `POST /payments/bulk-submit`, which performs the actual locked, atomic insert (§3.3).
+
+---
+
+## 3. Database Architecture
+
+### 3.1 Soft-delete enforcement (mandatory, no exceptions)
+
+Every model mixes in `core.database.SoftDeleteMixin`, which adds an indexed `is_deleted: Boolean` column (`default=False, nullable=False`). **All** queries, joins, and validation lookups across `api/`, `services/`, and `dashboard/` explicitly filter `is_deleted == False` — records are never physically deleted, preserving financial audit history. New code (endpoints, services, scripts, dashboard queries) must add this filter to every query against a soft-deletable table, including join conditions (see `api/v1/endpoints/contracts.py`'s `search_contracts`, which filters `is_deleted == False` on all four joined tables, not just the primary one).
+
+### 3.2 Core models
+
+| Table (model) | Purpose | Key relationships |
+|---|---|---|
+| `employers` (`Employer`) | مشمولین — organizations under funding mandate. `employer_type` ∈ {Mother, Subsidiary, Independent} (CHECK constraint). Self-referential `parent_code` FK groups Subsidiaries under a Mother. | Parent of `contracts`, `deposits`/`annual_mandates`/`deposit_receipts`, `credit_transfers`. |
+| `universities` (`University`) | دانشگاه‌ها — executing institutions. `national_id` PK. | Parent of `researchers`, referenced by `contracts`. |
+| `researchers` (`Researcher`) | فناوران — individual researchers, one-to-many under a university. `national_code` PK. | FK to `universities.national_id`. |
+| `contracts` (`Contract`) | The central junction table — links one employer, one university, one researcher. `tracking_code` PK, `total_amount` as `Numeric(22,0)` (whole Rials, no decimals). | FKs to `employers`, `universities`, `researchers`; parent of `payments`, `credit_transfers`. |
+| `payments` (`Payment`) | پرداختی‌ها — disbursements against a contract. Carries both `payment_year` (cash-flow year) and `funding_year` (budget-consumption year) — see §5.1 for why these must never be conflated. | FK to `contracts.tracking_code`. |
+| `deposits` (`Deposit`) | Aggregate mandate-vs-deposit summary per (employer, fiscal_year); unique constraint enforces one row per pair. Appears less actively used than the split `AnnualMandate`/`DepositReceipt` tables below — verify before building new features on it. | FK to `employers`. |
+| `annual_mandates` (`AnnualMandate`) | تکالیف قانونی — the legally mandated budget amount per employer per fiscal year. Unique on `(employer_code, fiscal_year)`. | FK to `employers` (`ondelete="CASCADE"`). |
+| `deposit_receipts` (`DepositReceipt`) | واریزهای فیزیکی — individual deposit receipts per employer per fiscal year (detail records, not aggregated). | FK to `employers` (`ondelete="CASCADE"`). |
+| `credit_transfers` (`CreditTransfer`) | انتقالات اعتباری — reallocates unspent funds from a source employer to a destination employer's contract (Tabsare 2, ماده 5), without mutating deposit/payment history. Defaults `destination_employer_code` to the Secretariat (`"128342"`). | FKs to `employers` (source + destination) and `contracts`. |
+
+**Balance formula (single source of truth, `services/financial_engine.py`):**
+
+```
+real_balance(employer, funding_year) =
+      Σ DepositReceipt.deposit_amount   (employer + its Subsidiaries if Mother)
+    + Σ CreditTransfer.amount           (destination = employer)
+    − Σ CreditTransfer.amount           (source = employer or its Subsidiaries)
+    − Σ Payment.amount                  (via Contract.employer_code == employer, funding_year match)
+```
+
+For a `Mother` employer, deposits/transfers/payments are rolled up across itself + all `Subsidiary` employers whose `parent_code` matches; `Independent` and `Subsidiary` employers use only their own rows.
+
+### 3.3 Transaction safety & concurrency
+
+- **Pessimistic locking is mandatory for financial inserts.** `services/financial_engine.py` provides `lock_active_contracts`/`lock_active_employers`/`lock_active_contract_and_employer`, all using `.with_for_update()` and sorting keys before locking to give concurrent transactions a consistent lock order (deadlock avoidance). Any new code path that reads a balance and then writes a payment/transfer in the same logical operation must lock first and keep the same session/transaction open through the write.
+- **Negative balances are a warning, not a block (FR-18/19/20).** `validate_payment_impact` and the `/payments/bulk-submit` endpoint compute `is_negative` / append `warning_messages` but never raise or roll back solely for a negative projected balance — this is a deliberate MVP business decision, not a bug. Do not "fix" this without explicit product sign-off.
+- **`bulk-submit` is one atomic transaction**: it locks all involved contracts and employers up front (batch lock, not per-row), tracks running balances per `(employer_code, funding_year)` in memory across the batch, inserts all `Payment` rows, and commits once. A duplicate `tracking_code` (in-request or already in the DB) aborts the whole batch before any row is written.
+
+### 3.4 Business rule: contract-eligible employer types
+
+`api/v1/endpoints/contracts.py` enforces `ALLOWED_CONTRACT_EMPLOYER_TYPES = {"Mother", "Independent"}` when creating a contract — a `Subsidiary` employer is rejected with a 400 and a Persian error message. This is the single enforcement point today; any future contract-writing code path (e.g. a bulk contract importer) must apply the same check.
+
+---
+
+## 4. Core Business Logic
+
+### 4.1 Funding-year based balance calculation
+
+All balance/limit calculations key off **`funding_year`** (سال مالی تأمین اعتبار — the fiscal year the budget was drawn from), never `payment_year` (the calendar year cash actually moved). `Payment` carries both fields precisely so payments can be executed late against an earlier year's budget without corrupting that year's balance. Any new report or dashboard metric touching money must group/filter by `funding_year`, not `payment_date`/`payment_year`, unless it is explicitly a cash-flow (not budget) report.
+
+### 4.2 Strict Jalali calendar parsing
+
+`core/date_helper.py` exposes `parse_strict_jalali_date`/`parse_strict_jalali_iso` — the **only sanctioned way** to convert a Jalali date string to a Gregorian `datetime.date`/ISO string. It accepts `YYYY/MM/DD` or `YYYY-MM-DD`, uses real `jdatetime` calendar validation (rejects invalid month lengths/leap days), and raises `TypeError`/`ValueError` on bad input — callers must catch and surface a user-facing error rather than let a bad date silently reach the database.
+
+Current adoption is inconsistent — see §4.4 for scripts that bypass this helper with an approximate/incorrect conversion. `dashboard/views/contract_entry_page.py` is currently the only dashboard file using it correctly (via `parse_strict_jalali_iso`) for the contract-date field.
+
+### 4.3 Dynamic contract status
+
+`get_contracts_with_dynamic_status(db, threshold_year=1402)` in `services/financial_engine.py` computes contract lifecycle status **entirely in SQL** at query time (never persisted to `Contract.status`): `Completed` if total non-deleted payments ≥ `total_amount`; else `Stagnant` if the contract's most recent activity year (max payment `funding_year`, or an approximated Jalali contract-creation year, whichever is greater) is before `threshold_year`; else `Active`. Used by `scripts/generate_contract_status_report.py`.
+
+### 4.4 Known data-integrity risks to track
+
+- **`scripts/import_deposits.py`**: `deposit_amount` scaling (`× 1_000_000_000` billion→base-Rials) is present in `mandated_amount` handling but **commented out** for `deposit_amount`, while the log message still claims the value was scaled. `scripts/process_budgets.py` has the same asymmetry. Needs a data-source audit (is `Deposit_Budget` actually already in base Rials, or is this a bug undercounting deposits by 10^9?) before the next full reload.
+- **`scripts/import_deposits.py`**'s `persian_date_to_gregorian()` is a self-admitted MVP approximation (`gregorian_year = jalali_year + 621`, day hard-coded to March 20 regardless of actual month/day) rather than a real conversion — it does not use `core/date_helper.py`. Every historical `DepositReceipt.deposit_date` loaded this way carries a synthetic, likely-inaccurate date.
+- **`scripts/chart01_total_trend.py`** imports a `chart_config` module that does not exist in the repository — currently broken/orphaned, cannot run as-is.
+- **`scripts/process_budgets.py`** uses a hard-coded absolute Windows path (`C:\Users\pchin\...`) instead of deriving from `__file__` — will break on another machine/environment.
+- **`scripts/check_excel.py`** reads `data/University.xlsx` (singular) while `scripts/import_universities.py` reads `data/Universities.xlsx` (plural) — verify which source file is authoritative.
+
+### 4.5 ETL conventions
+
+- Standing reload pipeline: `import_employers.py` → `import_universities.py` → `import_researchers.py` → `import_contracts.py` → `import_deposits.py` → `import_payments.py` → `import_credit_transfers.py` (order matters: later scripts `DROP ... CASCADE` tables that earlier scripts' FKs depend on if run out of order).
+- `append_new_mandates.py` is the **evolved, non-destructive pattern** — true upsert by `(employer_code, fiscal_year)` instead of truncate/reload — and is the intended model for future incremental loaders. Per the architectural decision recorded in `Docs/Technical Transition Report_R2.md`, truncate/reload is being phased out now that Phase 4 data-entry forms are live (it would silently wipe user-entered records); prefer the upsert pattern for any new import work.
+- Money scaling convention: only the `Budget.xlsx`/`New_Mandates.xlsx` mandate figures are stored in the source as *billions* of Rials and need `× 10^9`; Contracts/Payments/CreditTransfers source files already store raw Rials.
+
+---
+
+## 5. Active Changelog & Action Registry
+
+> Newest entries first. Each entry: date, scope, one-line summary, and any follow-up implications. Appended automatically after every completed coding task in this workspace per the protocol below.
+
+### 2026-08-07
+- **Docs:** Created `Docs/SATE_Living_Documentation.md` via a full read-only codebase scan (core, models, schemas, api, services, dashboard, scripts). No application code was modified. Established the Continuous Update Protocol (see below). Findings worth prioritizing: the deposit-amount billion-scaling bug/ambiguity (§4.4), `import_deposits.py`'s non-calendar-accurate date approximation (§4.4), and the orphaned `chart01_total_trend.py` (§4.4).
+
+---
+
+## Continuous Update Protocol
+
+**Adopted and in effect.** From this point forward, whenever a coding task, bug fix, refactor, or feature implementation is completed in this workspace, a concise entry is appended to §5 (Active Changelog & Action Registry) above — dated, scoped, and noting any follow-up implications — before the response concludes. Sections 1–4 (architecture/business-logic reference) are updated in place, not appended to, whenever the change actually alters that structure (e.g. a new table, a new endpoint, a changed business rule) — the changelog records *that it changed*, the reference sections record *what is currently true*.
+
+
+## File: Docs\Technical Transition Report_R2.md
+------------------------------
+
+
+# 📂 سند فنی انتقال وضعیت پروژه (Technical Transition Report) \- نسخه R3
+
+نام پروژه: سامانه مالی نظارت بر تأمین اعتبار طرح‌های پژوهشی ساتع (SATE\_Fin\_Dev)  
+موقعیت کنونی: اتمام فاز ۴ (فرم‌های ورود اطلاعات) | ورود به فاز دمو، توسعه داشبوردهای تحلیلی و امنیت  
+نقش محوری: معماری سیستم، مهندسی داده، و مدیریت محصول (حفظ یکپارچگی مالی)  
+سلام\! ما در حال توسعه سامانه جامع مالی ساتع هستیم. هدف این سامانه ایجاد شفافیت مالی، نظارت بر تعهدات قانونی (ماده ۶۵ قانون بودجه) و مدیریت یکپارچه جریان مالی از واریز تا پرداخت است. ما از دیتابیس‌های سنتی (مانند Access که دارای محدودیت است) عبور کرده و یک زیرساخت استاندارد با PostgreSQL بنا کرده‌ایم. لطفاً برای درک کامل وضعیت پروژه، معماری زیر را با دقت تحلیل کنید.
+
+### 🛠 بخش اول: زیرساخت و ساختار کدینگ (Tech Stack & Architecture)
+
+پروژه کاملاً ایزوله در محیط Conda (sate\_env) قرار دارد. ما از معماری چندلایه (Multi-tier Architecture) برای جداسازی منطق کسب‌وکار از لایه نمایش استفاده کرده‌ایم:
+
+* زبان و فریم‌ورک‌ها: Python 3.10+ | Backend: FastAPI | Frontend: Streamlit (RTL Vazirmatn).  
+* پایگاه داده: PostgreSQL | ORM: SQLAlchemy 2.0.  
+* ساختار دایرکتوری‌ها (Coding Structure):  
+  * core/: تنظیمات پایه شامل database.py (کانفیگ کانکشن استخر داده).  
+  * models/: مدل‌های دیتابیس شامل کلاس پایه SoftDeleteMixin.  
+  * schemas/: اعتبارسنجی داده‌ها (Pydantic Models) برای ورودی و خروجی APIها.  
+  * api/v1/: لایه کنترلر شامل routers و فایل‌های endpoints/ (مثل contracts.py).  
+  * services/: هسته‌های محاسباتی و منطق تجاری (financial\_engine.py).  
+  * dashboard/: کدهای لایه نمایش (Streamlit) شامل app.py و پوشه views/ برای فرم‌ها.  
+  * scripts/: فایل‌های مربوط به ETL و استخراج داده اولیه.
+
+### 🗄 بخش دوم: ساختار دیتابیس طراحی‌شده (Database Schema)
+
+دیتابیس کاملاً رابطه‌ای و مبتنی بر حسابداری تعهدی است. تمامی جداول از SoftDeleteMixin ارث‌بری می‌کنند (is\_deleted \= False) تا هیچ رکورد مالی به‌صورت فیزیکی حذف نشود و تاریخچه حفظ گردد.
+
+* مشمولین (employers): شامل نوع مشمول (مادر، زیرمجموعه، مستقل). *ابتکار مهندسی:* استفاده از parent\_code (Self-referencing FK) برای اعمال منطق تجمیع مالی هلدینگ‌ها.  
+* تکالیف و واریزها (annual\_mandates & deposit\_receipts): ثبت تعهدات قانونی و واریزی‌های فیزیکی به صندوق.  
+* دانشگاه‌ها (universities) و فناوران (researchers): مجریان طرح‌ها با نگاشت یک‌به‌چند (هر فناور متعلق به یک دانشگاه).  
+* قراردادها (contracts): جدول مرکزی (Junction). *قانون تجاری:* فقط شرکت‌های "مادر" و "مستقل" اجازه انعقاد قرارداد دارند.  
+* پرداختی‌ها (payments): جداسازی payment\_year (خروج پول) از funding\_year (سال منبع تأمین اعتبار). تمامی محاسبات مانده حساب منحصراً بر اساس funding\_year انجام می‌شود تا مشکل پرداخت‌های معوق حل شود.  
+* انتقالات اعتباری (credit\_transfers): برای اعمال اصلاحیه تبصره ۲ ماده ۵ (جلوگیری از رسوب منابع بدون مخدوش شدن تاریخچه واریزی‌ها).
+
+### 📥 بخش سوم: استراتژی Import داده‌ها (ETL Pipelines)
+
+با توجه به اینکه داده‌های تاریخی از سال ۱۳۹۸ باید وارد سیستم شوند، فرآیند انتقال داده (ETL) با استفاده از Pandas توسعه یافته است. در زمان Import تمام ارقام پولی اکسل (میلیارد ریال) در $10^9$ ضرب شده و به عنوان "ریال پایه" در تایپ Numeric(18,2) ذخیره می‌شوند.  
+چالش فنی در فاز Import: مدیریت رکوردهای تکراری در اجرای مجدد اسکریپت‌ها  
+برای این چالش دو راهکار در نظر گرفته شد:
+
+| ویژگی | راهکار الف: Truncate / Drop & Load (استفاده فعلی در MVP) | راهکار ب: Upsert (Insert on Conflict Update) |
+| ----: | ----: | ----: |
+| مکانیزم | پاک کردن کل جدول با CASCADE و بازنویسی مجدد از فایل اکسل. | جستجوی کلید اصلی، در صورت وجود آپدیت، در غیر این صورت درج. |
+| مزایا | \- سرعت توسعه بسیار بالا. \- اطمینان از پاک شدن داده‌های کثیف (Dirty Data) قبلی. | \- حفظ کامل رکوردهایی که توسط کاربران از طریق فرم‌ها (UI) ثبت شده‌اند. |
+| معایب | \- پاک شدن داده‌های جدیدی که از طریق سیستم وارد شده‌اند (نامناسب برای Production). | \- نیازمند کدنویسی پیچیده‌تر در SQLAlchemy. \- کندتر بودن فرآیند Import اولیه. |
+| تصمیم معماری | برای فاز *توسعه اولیه* مناسب بود، اما با راه‌اندازی فرم‌های ورود اطلاعات (فاز ۴)، باید ممنوع شود. از این پس فقط از راهکار Upsert یا درج دستی استفاده خواهد شد. |  |
+
+### ⚙️ بخش چهارم: هسته‌های محاسباتی و منطق تجاری (Business Logic Cores)
+
+قلب تپنده سامانه در پوشه services/ قرار دارد. هسته‌های محاسباتی فعلی و در حال توسعه عبارتند از:
+
+1. هسته ترازنامه (Real-time Balance Calculator): محاسبه پویای مانده حساب کارفرما با فرمول: *(مجموع واریزی مادر و زیرمجموعه‌ها در سال X) \- (مجموع هزینه‌کرد مادر در سال X)*.  
+2. هسته مدیریت همزمانی تراکنش‌ها (Concurrency Core): هنگام ثبت پرداخت، برای جلوگیری از Race Conditions، از قفل‌گذاری بدبینانه (.with\_for\_update()) روی رکورد قرارداد استفاده شده است. سامانه در صورت منفی شدن مانده حساب، صرفاً "هشدار" می‌دهد و جلوی ثبت را نمی‌گیرد (جلوگیری از تغییر خودسرانه منطق مالی MVP).  
+3. هسته طبقه‌بندی پویای قراردادها: قراردادها به صورت Real-time با استفاده از کوئری‌های SQL به سه دسته "فعال"، "خاتمه‌یافته" و "راکد" تقسیم می‌شوند.  
+4. *(نیازمند توسعه)* هسته پردازش شبکه همکاری (Collaboration Network Engine): یک موتور محاسباتی گراف‌محور برای کشف ارتباطات بین "کارفرمایان" و "دانشگاه‌های مجری" جهت تغذیه داشبوردهای تعاملی.
+
+### 📊 بخش پنجم: داشبوردهای مدیریتی و تحلیلی (BI Dashboards)
+
+وضعیت فعلی: تب‌های اولیه برای ترازنامه اختصاصی مشمولین و نمای کلان کشور (نمودارهای Waterfall) ایجاد شده است. تکمیل داشبوردها (پروپوزال مدیر محصول): برای دستیابی به اهداف نظارتی، توسعه داشبوردهای زیر در اولویت قرار دارد:
+
+* داشبورد عملکرد مشمولین (Employer KPI): بررسی درصد تحقق واریز (واریزی/تکلیفی) و نمایش دستگاه‌های متخلف (Red Flags).  
+* داشبورد رتبه‌بندی و سهم‌بازار دانشگاه‌ها: استفاده از نمودار *Sankey Diagram* برای نمایش جریان پول از هلدینگ‌ها به سمت دانشگاه‌های خاص و رتبه‌بندی دانشگاه‌های موفق در جذب بودجه پژوهشی.  
+* داشبورد شبکه تعاملات (Heatmap/Network): ماتریس همکاری کارفرما-مجری برای شناسایی قطب‌های پژوهشی پرتکرار.  
+* داشبورد قراردادهای رسوب‌کرده (Stagnant Alerts): لیستی از قراردادهایی که بیش از ۲ سال (از ۱۴۰۲) دریافتی نداشته‌اند جهت اعمال اصلاحیه تبصره ۲ ماده ۵.
+
+### 🚀 بخش ششم: نقشه راه و اقدامات باقیمانده (Roadmap)
+
+اقدامات زیر به ترتیب اولویت برای ادامه توسعه سیستم تعریف شده‌اند:
+
+1. گام فوری (جهت جلسه دمو): استقرار موقت با تونل‌زنی. استفاده از Ngrok یا Cloudflare Tunnels برای ایجاد دسترسی عمومی موقت (بدون نیاز به دیپلویمنت سرور) جهت نمایش دمو به کارفرما.  
+2. فاز ۳: تکمیل داشبوردهای تحلیلی ذکر شده در بخش پنجم (GIS، رتبه‌بندی، شبکه همکاری).  
+3. فاز ۵ (IAM & Security): پیاده‌سازی سیستم Authentication (بر مبنای JWT) و Role-Based Access Control (RBAC) برای نقش‌های: ادمین، کارشناس مالی، مدیر و کارشناس پاسخگویی (هر نقش فقط داده‌های مجاز خود را ببیند).  
+4. فاز ۶ (Deployment): داکرایز کردن (Dockerizing) دیتابیس و اپلیکیشن (FastAPI \+ Streamlit)، تنظیم Nginx، و استقرار دائم روی سرور ابری لینوکسی بومی (جهت حفظ امنیت داده‌های مالی و کدهای ملی).
+
+پایان گزارش.  
+
+
 ## File: models\contract.py
 ------------------------------
 from sqlalchemy import Column, Date, ForeignKey, Integer, Numeric, String, Text
@@ -3677,23 +4115,110 @@ class Contract(SoftDeleteMixin, Base):
 
 ## File: models\deposits.py
 ------------------------------
-from sqlalchemy import Column, Integer, String, Date, Text, ForeignKey, Numeric, UniqueConstraint
+"""Deposit (نظارت بر واریز) models for the SATE financial system.
+
+This module defines the domain models used to monitor mandated budgets and the
+deposits actually received from each employer.
+
+Tables
+------
+Deposit
+    Spec-defined aggregate record tying the mandated amount and the deposited
+    amount for a given employer and fiscal year. Enforces a composite unique
+    constraint on ``(employer_code, fiscal_year)`` so that there is exactly one
+    mandate/deposit summary per employer-year pair.
+AnnualMandate
+    Master record of the mandated budget amount per employer per fiscal year.
+DepositReceipt
+    Detail record of an individual deposit receipt per employer per fiscal year.
+"""
+
+from sqlalchemy import (
+    Column,
+    Date,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
-from core.database import Base
-from models.employer import SoftDeleteMixin
+
+from core.database import Base, SoftDeleteMixin
+
+
+class Deposit(SoftDeleteMixin, Base):
+    """Aggregate mandate-vs-deposit summary for one employer in one fiscal year.
+
+    Attributes
+    ----------
+    id : int
+        Auto-incrementing surrogate primary key.
+    employer_code : str
+        Foreign key to ``employers.classification_code``.
+    fiscal_year : int
+        Fiscal (Persian-calendar) year the record applies to.
+    mandated_amount : Decimal
+        Amount mandated for the employer in the given year.
+    deposit_amount : Decimal
+        Amount actually deposited by the employer in the given year.
+    deposit_date : date or None
+        Date the deposit was made, when known.
+    receipt_number : str or None
+        Reference number of the deposit receipt, when available.
+
+    Notes
+    -----
+    A composite unique constraint on ``(employer_code, fiscal_year)`` guarantees
+    a single summary row per employer-year combination.
+    """
+
+    __tablename__ = "deposits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    employer_code = Column(
+        String(20),
+        ForeignKey("employers.classification_code", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    fiscal_year = Column(Integer, nullable=False, index=True)
+    mandated_amount = Column(Numeric(18, 2), nullable=False)
+    deposit_amount = Column(Numeric(18, 2), nullable=False)
+    deposit_date = Column(Date, nullable=True)
+    receipt_number = Column(String(50), nullable=True)
+
+    employer = relationship("Employer", backref="deposits")
+
+    __table_args__ = (
+        UniqueConstraint("employer_code", "fiscal_year", name="uq_deposit_employer_year"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<Deposit(employer={self.employer_code}, year={self.fiscal_year}, "
+            f"mandated={self.mandated_amount}, deposited={self.deposit_amount})>"
+        )
 
 
 class AnnualMandate(SoftDeleteMixin, Base):
-    """Master table tracking mandated budget amounts per employer per fiscal year."""
-    __tablename__ = 'annual_mandates'
+    """Master record tracking mandated budget amounts per employer per fiscal year."""
+
+    __tablename__ = "annual_mandates"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    employer_code = Column(String(20), ForeignKey('employers.classification_code', ondelete='CASCADE'), nullable=False, index=True)
+    employer_code = Column(
+        String(20),
+        ForeignKey("employers.classification_code", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     fiscal_year = Column(Integer, nullable=False, index=True)
     mandated_amount = Column(Numeric(22, 0), nullable=False, default=0)
 
     __table_args__ = (
-        UniqueConstraint('employer_code', 'fiscal_year', name='uq_employer_year_mandate'),
+        UniqueConstraint("employer_code", "fiscal_year", name="uq_employer_year_mandate"),
     )
 
     def __repr__(self):
@@ -3701,11 +4226,17 @@ class AnnualMandate(SoftDeleteMixin, Base):
 
 
 class DepositReceipt(SoftDeleteMixin, Base):
-    """Detail table tracking individual deposit receipts per employer per fiscal year."""
-    __tablename__ = 'deposit_receipts'
+    """Detail record tracking individual deposit receipts per employer per fiscal year."""
+
+    __tablename__ = "deposit_receipts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    employer_code = Column(String(20), ForeignKey('employers.classification_code', ondelete='CASCADE'), nullable=False, index=True)
+    employer_code = Column(
+        String(20),
+        ForeignKey("employers.classification_code", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     fiscal_year = Column(Integer, nullable=False, index=True)
     deposit_amount = Column(Numeric(22, 0), nullable=False)
     deposit_date = Column(Date, nullable=True)
@@ -3719,59 +4250,193 @@ class DepositReceipt(SoftDeleteMixin, Base):
 
 ## File: models\employer.py
 ------------------------------
-from sqlalchemy import Column, String, Boolean, CheckConstraint
-from core.database import Base
+"""Employer (مشمولین) model for the SATE financial system.
 
-class SoftDeleteMixin:
-    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+Represents organizations subject to research-and-technology funding mandates.
+An employer may be a Mother company, a Subsidiary of another employer, or an
+Independent entity. The ``parent_code`` foreign key is self-referential,
+allowing hierarchical grouping of subsidiary employers under their parent.
+"""
+
+from sqlalchemy import CheckConstraint, Column, ForeignKey, String
+
+from core.database import Base, SoftDeleteMixin
+
 
 class Employer(SoftDeleteMixin, Base):
-    __tablename__ = 'employers'
+    """Organization liable for mandated research-and-technology funding.
+
+    Attributes
+    ----------
+    classification_code : str
+        Unique classification code; primary key (max 20 chars).
+    name : str
+        Official name of the employer (max 200 chars).
+    employer_type : str
+        Structural type: one of ``Mother``, ``Subsidiary`` or ``Independent``.
+    parent_code : str or None
+        Classification code of the parent (mother) employer. Self-referential
+        foreign key to ``employers.classification_code``; ``None`` for mother
+        or independent employers.
+    province : str
+        Province where the employer is located (max 50 chars).
+    affairs_category : str or None
+        Optional functional category of the employer's affairs.
+    upper_organization : str
+        Name of the supervising/executing body above this employer.
+    status : str
+        Lifecycle status; defaults to ``Active``.
+    """
+
+    __tablename__ = "employers"
 
     classification_code = Column(String(20), primary_key=True)
     name = Column(String(200), nullable=False)
     employer_type = Column(String(20), nullable=False)
-    parent_code = Column(String(20), nullable=True)
+    parent_code = Column(
+        String(20),
+        ForeignKey("employers.classification_code"),
+        nullable=True,
+    )
     province = Column(String(50), nullable=False)
     affairs_category = Column(String(100), nullable=True)
     upper_organization = Column(String(100), nullable=False)
-    status = Column(String(20), nullable=False, default='Active')
+    status = Column(String(20), nullable=False, default="Active")
 
     __table_args__ = (
-        CheckConstraint("employer_type IN ('Mother', 'Subsidiary', 'Independent')", name="check_employer_type"),
-        CheckConstraint("status IN ('Active', 'Inactive')", name="check_employer_status"),
+        CheckConstraint(
+            "employer_type IN ('Mother', 'Subsidiary', 'Independent')",
+            name="check_employer_type",
+        ),
+        CheckConstraint(
+            "status IN ('Active', 'Inactive')",
+            name="check_employer_status",
+        ),
     )
+
+    def __repr__(self):
+        return (
+            f"<Employer(code={self.classification_code!r}, "
+            f"name={self.name!r}, type={self.employer_type!r})>"
+        )
+
 
 ## File: models\payment.py
 ------------------------------
-from sqlalchemy import Column, String, ForeignKey, Date, Numeric, Integer
-from core.database import Base
-from models.employer import SoftDeleteMixin
+"""Payment (پرداختی‌ها) model for the SATE financial system.
+
+Records individual disbursements made against a research contract. Each payment
+references its parent contract via ``contract_tracking_code`` and captures the
+amount, date, execution year and payment type.
+"""
+
+from sqlalchemy import Column, Date, ForeignKey, Integer, Numeric, String
+
+from core.database import Base, SoftDeleteMixin
 
 
 class Payment(SoftDeleteMixin, Base):
-    __tablename__ = 'payments'
+    """A single payment made against a research contract.
+
+    Attributes
+    ----------
+    tracking_code : str
+        Unique tracking code for the payment; primary key (max 50 chars).
+    contract_tracking_code : str
+        Foreign key to ``contracts.tracking_code``.
+    amount : Decimal
+        Payment amount (Numeric(18, 2)).
+    payment_date : date
+        Date the payment was executed.
+    execution_year : int
+        Fiscal (execution) year the payment is recorded against.
+    payment_type : str
+        Category/type of the payment (max 50 chars).
+    series : str or None
+        Optional series/sequence identifier.
+    notification_letter_number : str or None
+        Optional notification letter reference number.
+    notification_date : date or None
+        Optional date of the notification letter.
+    payment_year : int or None
+        Cash-flow year of the payment (legacy/compatibility field).
+    funding_year : int or None
+        Budget-consumption year of the payment (legacy/compatibility field).
+    attachment_path : str or None
+        Optional path to a supporting attachment.
+    """
+
+    __tablename__ = "payments"
 
     tracking_code = Column(String(50), primary_key=True)
-    contract_tracking_code = Column(String(50), ForeignKey('contracts.tracking_code'), nullable=False)
+    contract_tracking_code = Column(
+        String(50),
+        ForeignKey("contracts.tracking_code"),
+        nullable=False,
+    )
+    amount = Column(Numeric(18, 2), nullable=False)
+    payment_date = Column(Date, nullable=False)
+    execution_year = Column(Integer, nullable=False)
+    payment_type = Column(String(50), nullable=False)
+
     series = Column(String(50), nullable=True)
-    amount = Column(Numeric(22, 0), nullable=False)  # Base Rials
     notification_letter_number = Column(String(100), nullable=True)
     notification_date = Column(Date, nullable=True)
-    payment_year = Column(Integer, nullable=False)  # Cash flow year
-    funding_year = Column(Integer, nullable=False)  # Budget consumption year
+    payment_year = Column(Integer, nullable=True)
+    funding_year = Column(Integer, nullable=True)
     attachment_path = Column(String(255), nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<Payment(tracking_code={self.tracking_code!r}, "
+            f"contract={self.contract_tracking_code!r}, amount={self.amount})>"
+        )
 
 
 ## File: models\researchers.py
 ------------------------------
+"""Researcher (فناور) model for the SATE financial system.
+
+Represents an individual researcher/technologist who is affiliated with a
+university and may participate in one or more research contracts.
+"""
+
 from sqlalchemy import Column, ForeignKey, String
 
-from core.database import Base
-from models.employer import SoftDeleteMixin
+from core.database import Base, SoftDeleteMixin
 
 
 class Researcher(SoftDeleteMixin, Base):
+    """A researcher (فناور) affiliated with a university.
+
+    Attributes
+    ----------
+    national_code : str
+        Iranian national code; primary key (max 10 chars).
+    tracking_code : str or None
+        Optional tracking code assigned to the researcher.
+    first_name : str
+        Researcher's first name (max 100 chars).
+    last_name : str
+        Researcher's last name (max 100 chars).
+    full_name : str
+        Full display name of the researcher (max 200 chars).
+    mobile : str or None
+        Contact mobile number.
+    email : str or None
+        Contact email address.
+    academic_rank : str or None
+        Academic rank/position (max 50 chars).
+    university_id : str
+        Foreign key to ``universities.national_id``.
+    education_level : str or None
+        Highest education level attained.
+    researcher_type : str or None
+        Category/type of researcher.
+    status : str
+        Lifecycle status; defaults to ``Active``.
+    """
+
     __tablename__ = "researchers"
 
     national_code = Column(String(10), primary_key=True)
@@ -3782,103 +4447,155 @@ class Researcher(SoftDeleteMixin, Base):
     mobile = Column(String(20), nullable=True)
     email = Column(String(100), nullable=True)
     academic_rank = Column(String(50), nullable=True)
-    university_id = Column(String(20), ForeignKey("universities.national_id"), nullable=False)
+    university_id = Column(
+        String(20),
+        ForeignKey("universities.national_id"),
+        nullable=False,
+    )
     education_level = Column(String(50), nullable=True)
     researcher_type = Column(String(50), nullable=True)
     status = Column(String(20), nullable=False, default="Active")
 
+    def __repr__(self):
+        return f"<Researcher(national_code={self.national_code!r}, full_name={self.full_name!r})>"
+
 
 ## File: models\transfer.py
 ------------------------------
+"""Credit Transfer model for the SATE financial system.
+
+Junction table allocating unspent funds from one employer to a specific
+contract, typically routed through the central Secretariat, without altering
+the core deposit/payment tables.
 """
-Credit Transfer Model
-Junction table for allocating unspent funds from employers to specific contracts
-"""
 
-from sqlalchemy import Column, Integer, String, Numeric, Text, ForeignKey
-from core.database import Base
-from models.employer import SoftDeleteMixin
+from sqlalchemy import Column, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy.orm import relationship
+
+from core.database import Base, SoftDeleteMixin
 
 
-class CreditTransfer(Base, SoftDeleteMixin):
-    """
-    Credit Transfer model - tracks fund transfers between employers.
+class CreditTransfer(SoftDeleteMixin, Base):
+    """Track fund transfers between employers.
+
     Allows allocation of unspent funds from various employers to contracts
-    managed by a central Secretariat without altering core deposit/payment tables.
+    managed by a central Secretariat without altering the core deposit/payment
+    tables.
+
+    Attributes
+    ----------
+    id : int
+        Auto-incrementing surrogate primary key.
+    source_employer_code : str
+        Employer the funds originate from (FK to ``employers.classification_code``).
+    destination_employer_code : str
+        Employer the funds are transferred to (FK to ``employers``); defaults to
+        the Secretariat.
+    broker_name : str or None
+        Optional broker facilitating the transfer.
+    fiscal_year : int
+        Fiscal year the transferred funds originated from.
+    amount : Decimal
+        Transfer amount in Rials.
+    contract_tracking_code : str
+        Contract receiving the transferred funds (FK to ``contracts.tracking_code``).
+    documentation : str or None
+        Supporting documentation or free-text notes.
     """
-    __tablename__ = 'credit_transfers'
-    
+
+    __tablename__ = "credit_transfers"
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    
-    # Source employer (where funds come from)
+
     source_employer_code = Column(
-        String,
-        ForeignKey('employers.classification_code'),
+        String(20),
+        ForeignKey("employers.classification_code"),
         nullable=False,
-        index=True
+        index=True,
     )
-    
-    # Destination employer (where funds go to, default is Secretariat)
+
     destination_employer_code = Column(
-        String,
-        ForeignKey('employers.classification_code'),
+        String(20),
+        ForeignKey("employers.classification_code"),
         nullable=False,
-        default='128342',
-        index=True
+        default="128342",
+        index=True,
     )
-    
-    # Optional broker facilitating the transfer
-    broker_name = Column(String, nullable=True)
-    
-    # Fiscal year the funds originated from
+
+    broker_name = Column(String(100), nullable=True)
+
     fiscal_year = Column(Integer, nullable=False, index=True)
-    
-    # Transfer amount in Rials
+
     amount = Column(Numeric(22, 0), nullable=False)
-    
-    # Contract receiving the transferred funds
+
     contract_tracking_code = Column(
-        String,
-        ForeignKey('contracts.tracking_code'),
+        String(50),
+        ForeignKey("contracts.tracking_code"),
         nullable=False,
-        index=True
+        index=True,
     )
-    
-    # Supporting documentation or notes
+
+    contract = relationship("Contract", backref="credit_transfers")
+
     documentation = Column(Text, nullable=True)
-    
+
     def __repr__(self):
         return (
-            f"<CreditTransfer(id={self.id}, "
-            f"from={self.source_employer_code}, "
-            f"to={self.destination_employer_code}, "
-            f"amount={self.amount}, "
+            f"<CreditTransfer(id={self.id}, from={self.source_employer_code}, "
+            f"to={self.destination_employer_code}, amount={self.amount}, "
             f"year={self.fiscal_year})>"
         )
 
 
 ## File: models\university.py
 ------------------------------
+"""University (دانشگاه‌ها) model for the SATE financial system.
+
+Represents a university or executing institution that supervises researchers
+and administers research contracts on behalf of the funding program.
+"""
+
 from sqlalchemy import Column, String, Text
-from core.database import Base
-from models.employer import SoftDeleteMixin
+
+from core.database import Base, SoftDeleteMixin
 
 
 class University(SoftDeleteMixin, Base):
-    """University/Executing Institution model"""
-    __tablename__ = 'universities'
-    
-    national_id = Column(String(20), primary_key=True, comment='شناسه ملی موسسه')
-    tracking_code = Column(String(50), nullable=True, comment='کد رهگیری')
-    name = Column(String(200), nullable=False, comment='نام موسسه')
-    city = Column(String(100), nullable=True, comment='شهر')
-    address = Column(Text, nullable=True, comment='آدرس')
-    province = Column(String(50), nullable=False, comment='استان موسسه')
-    university_type = Column(String(100), nullable=False, comment='نوع موسسه')
-    status = Column(String(20), nullable=False, default='Active', comment='وضعیت')
-    
+    """University or executing institution.
+
+    Attributes
+    ----------
+    national_id : str
+        National identifier of the institution; primary key (max 20 chars).
+    tracking_code : str or None
+        Optional tracking code assigned to the institution.
+    name : str
+        Official name of the institution (max 200 chars).
+    city : str or None
+        City where the institution is located.
+    address : str or None
+        Postal address of the institution.
+    province : str
+        Province where the institution is located (max 50 chars).
+    university_type : str
+        Category/type of the institution (max 50 chars).
+    status : str
+        Lifecycle status; defaults to ``Active``.
+    """
+
+    __tablename__ = "universities"
+
+    national_id = Column(String(20), primary_key=True, comment="شناسه ملی موسسه")
+    tracking_code = Column(String(50), nullable=True, comment="کد رهگیری")
+    name = Column(String(200), nullable=False, comment="نام موسسه")
+    city = Column(String(100), nullable=True, comment="شهر")
+    address = Column(Text, nullable=True, comment="آدرس")
+    province = Column(String(50), nullable=False, comment="استان موسسه")
+    university_type = Column(String(50), nullable=False, comment="نوع موسسه")
+    status = Column(String(20), nullable=False, default="Active", comment="وضعیت")
+
     def __repr__(self):
-        return f"<University(national_id='{self.national_id}', name='{self.name}')>"
+        return f"<University(national_id={self.national_id!r}, name={self.name!r})>"
 
 
 ## File: schemas\contract_schema.py
@@ -3923,25 +4640,39 @@ class ContractSearchResult(BaseModel):
 
 
 class ContractCreate(BaseModel):
-    """Define the payload accepted when registering a new contract."""
+    """Define the payload accepted when registering a new contract.
+
+    Field length limits mirror the ``contracts`` table column definitions so
+    that oversized input is rejected with a clear 422 validation error instead
+    of silently failing as a database ``DataError`` at insert time.
+    """
 
     tracking_code: str = Field(
-        ..., min_length=1, description="The contract tracking code (primary key)"
+        ...,
+        min_length=1,
+        max_length=50,
+        description="The contract tracking code (primary key)",
     )
     employer_classification_code: str = Field(
-        ..., description="Classification code of the contracting employer"
+        ...,
+        max_length=20,
+        description="Classification code of the contracting employer",
     )
     university_national_id: str = Field(
-        ..., description="National ID of the executing university"
+        ...,
+        max_length=20,
+        description="National ID of the executing university",
     )
     researcher_national_id: str = Field(
-        ..., description="National code of the lead researcher"
+        ...,
+        max_length=10,
+        description="National code of the lead researcher",
     )
     contract_number: Optional[str] = Field(
         None, description="Operational contract number"
     )
     proposal_id: Optional[str] = Field(
-        None, description="Identifier of the linked proposal"
+        None, max_length=50, description="Identifier of the linked proposal"
     )
     attachment_path: Optional[str] = Field(
         None, description="Local path of the archived contract document"
@@ -3949,8 +4680,14 @@ class ContractCreate(BaseModel):
     title: str = Field(
         ..., min_length=1, description="Contract or project title"
     )
-    total_amount: float = Field(
-        ..., gt=0, description="Total contract amount in Rials"
+    total_amount: int = Field(
+        ...,
+        gt=0,
+        description=(
+            "Total contract amount in whole Rials. Integer to match the "
+            "database's zero-decimal Numeric(22, 0) column and reject "
+            "fractional amounts instead of silently truncating them."
+        ),
     )
     contract_date: date = Field(
         ..., description="Contract date in Gregorian ISO format"
@@ -3970,7 +4707,7 @@ class ContractCreate(BaseModel):
                 "proposal_id": "PRP-1403-002",
                 "attachment_path": "data/Archive/Contracts/example.pdf",
                 "title": "پروژه تحقیقاتی نمونه",
-                "total_amount": 1000000000.0,
+                "total_amount": 1000000000,
                 "contract_date": "2024-03-20",
                 "duration_months": 12,
             }
@@ -4286,6 +5023,11 @@ class UniversityCreated(BaseModel):
 ## File: scripts\add_contract_attachment_path.py
 ------------------------------
 """Add contract attachment storage to an existing PostgreSQL database."""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text
 
@@ -4928,7 +5670,6 @@ import pandas as pd
 import sys
 from pathlib import Path
 import io
-import jdatetime
 from decimal import Decimal
 
 # Fix encoding for Windows console
@@ -4941,6 +5682,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from core.database import engine, Base
+from core.date_helper import parse_strict_jalali_date
 from models.contract import Contract
 from models.employer import Employer
 from models.university import University
@@ -4948,18 +5690,14 @@ from models.researchers import Researcher
 
 
 def parse_persian_date(date_str):
-    """Parse Persian date string (e.g., '1400/05/05') to Gregorian date"""
+    """Parse a Jalali date strictly and return a Gregorian date."""
     if pd.isna(date_str) or not date_str:
         return None
-    
+
     try:
-        # Remove any whitespace
-        date_str = str(date_str).strip()
-        # Parse Persian date and convert to Gregorian
-        persian_date = jdatetime.datetime.strptime(date_str, '%Y/%m/%d')
-        return persian_date.togregorian().date()
-    except Exception as e:
-        print(f"  [WARNING] Invalid date format: {date_str} - {e}")
+        return parse_strict_jalali_date(str(date_str))
+    except (TypeError, ValueError) as exc:
+        print(f"  [WARNING] Invalid date format: {date_str} - {exc}")
         return None
 
 
@@ -5014,23 +5752,31 @@ def import_contracts():
         print("Fetching valid foreign key references...")
         
         valid_employer_codes = set(
-            code for (code,) in session.query(Employer.classification_code).all()
+            code for (code,) in session.query(Employer.classification_code).filter(
+                Employer.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(valid_employer_codes)} valid employer codes")
         
         valid_university_ids = set(
-            uid for (uid,) in session.query(University.national_id).all()
+            uid for (uid,) in session.query(University.national_id).filter(
+                University.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(valid_university_ids)} valid university IDs")
         
         valid_researcher_ids = set(
-            rid for (rid,) in session.query(Researcher.national_code).all()
+            rid for (rid,) in session.query(Researcher.national_code).filter(
+                Researcher.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(valid_researcher_ids)} valid researcher IDs")
         
         # Query existing tracking codes to avoid duplicates
         existing_tracking_codes = set(
-            code for (code,) in session.query(Contract.tracking_code).all()
+            code for (code,) in session.query(Contract.tracking_code).filter(
+                Contract.is_deleted == False
+            ).all()
         )
         print(f"[OK] Found {len(existing_tracking_codes)} existing contracts in database")
         
@@ -5810,31 +6556,23 @@ from datetime import datetime, date
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import pandas as pd
-import jdatetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from core.date_helper import parse_strict_jalali_date
 from core.database import engine, Base
 from models.payment import Payment
 from models.contract import Contract
 
 
 def parse_jalali_date(date_str):
-    """Convert Jalali date string (YYYY/MM/DD) to Gregorian date object."""
-    if pd.isna(date_str) or date_str == '' or date_str is None:
+    """Parse a Jalali date strictly and return a Gregorian date."""
+    if pd.isna(date_str) or date_str == "" or date_str is None:
         return None
-    
+
     try:
-        date_str = str(date_str).strip()
-        parts = date_str.split('/')
-        if len(parts) != 3:
-            return None
-        
-        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
-        jalali_date = jdatetime.date(year, month, day)
-        gregorian_date = jalali_date.togregorian()
-        return gregorian_date
-    except (ValueError, AttributeError, IndexError):
+        return parse_strict_jalali_date(str(date_str))
+    except (TypeError, ValueError):
         return None
 
 
@@ -5892,7 +6630,11 @@ def main():
     print("\n3. Fetching valid contract tracking codes...")
     session = Session(bind=engine)
     try:
-        valid_contracts = set(session.query(Contract.tracking_code).all())
+        valid_contracts = set(
+            session.query(Contract.tracking_code)
+            .filter(Contract.is_deleted == False)
+            .all()
+        )
         valid_contracts = {code[0] for code in valid_contracts}
         print(f"   Found {len(valid_contracts)} valid contracts")
     finally:

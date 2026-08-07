@@ -39,6 +39,12 @@ class Payment(SoftDeleteMixin, Base):
         Budget-consumption year of the payment (legacy/compatibility field).
     attachment_path : str or None
         Optional path to a supporting attachment.
+    status : str
+        Lifecycle status; ``"Draft"`` while staged in the batch-payment
+        cart (reserves funds against the employer's balance without being
+        a finalized disbursement) or ``"Final"`` once confirmed. Defaults
+        to ``"Final"`` so directly-inserted payments (e.g. bulk ETL
+        imports) behave as before this field existed.
     """
 
     __tablename__ = "payments"
@@ -60,6 +66,7 @@ class Payment(SoftDeleteMixin, Base):
     payment_year = Column(Integer, nullable=True)
     funding_year = Column(Integer, nullable=True)
     attachment_path = Column(String(255), nullable=True)
+    status = Column(String(20), default="Final")
 
     def __repr__(self):
         return (

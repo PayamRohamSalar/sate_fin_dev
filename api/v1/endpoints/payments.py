@@ -1,23 +1,28 @@
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Query as SAQuery
 from sqlalchemy.orm import Session
 
 from core.database import get_db
+from models.contract import Contract
+from models.employer import Employer
 from models.payment import Payment
+from models.university import University
 from schemas.payment_schema import (
-    PaymentBatchValidationRequest,
-    PaymentBatchValidationResponse,
-    PaymentBulkCreate,
-    PaymentBulkCreateResponse,
+    DraftDeleteResponse,
+    FinalizeBatchRequest,
+    FinalizeBatchResponse,
+    PaymentDraftCreate,
+    PaymentDraftCreateResponse,
+    PaymentDraftResponse,
     PaymentValidationRequest,
     PaymentValidationResponse,
 )
 from services.financial_engine import (
+    InsufficientFundsError,
     calculate_real_balance,
-    lock_active_contract_and_employer,
-    lock_active_contracts,
-    lock_active_employers,
     validate_payment_impact,
 )
 
@@ -33,27 +38,22 @@ def validate_payment(
     db: Session = Depends(get_db)
 ):
     """
-    Validate the impact of a payment on the employer's balance before registration.
-    
-    This endpoint implements FR-18, FR-19, FR-20:
-    - Finds the employer linked to the contract
-    - Calculates current and projected balance
-    - Warns if balance becomes negative (but does not block the operation)
-    
-    **Business Rule:** This endpoint returns HTTP 200 even if the balance becomes negative,
-    as the system is designed to warn but not prevent negative balances.
-    
+    Validate the impact of a payment on the employer's balance without registering it.
+
+    **Business Rule (updated):** negative balances are a hard block, not a
+    warning — a payment that would take the employer's balance below zero
+    returns HTTP 400, not HTTP 200 with a warning message. This mirrors the
+    same check ``POST /payments/draft`` performs before staging a draft.
+
     **Parameters:**
     - `contract_tracking_code`: The contract tracking code
     - `amount`: The payment amount to validate
     - `funding_year`: The funding year for the payment
-    
+
     **Returns:**
-    - Current balance, new balance, and warning message if applicable
+    - Current balance and projected balance for an affordable payment.
     """
-    
     try:
-        # Call the financial engine to validate payment impact
         validation_result = validate_payment_impact(
             db=db,
             contract_code=request.contract_tracking_code,
@@ -61,244 +61,386 @@ def validate_payment(
             funding_year=request.funding_year,
             lock_rows=True,
         )
-        
-        # Prepare warning message if balance becomes negative
-        warning_message = None
-        if validation_result["is_negative"]:
-            warning_message = "هشدار: ثبت این پرداخت باعث منفی شدن مانده حساب کارفرما خواهد شد"
-        
-        # Build and return response
-        return PaymentValidationResponse(
-            employer_code=validation_result["employer_code"],
-            current_balance=validation_result["current_balance"],
-            payment_amount=validation_result["payment_amount"],
-            new_balance=validation_result["new_balance"],
-            is_negative=validation_result["is_negative"],
-            warning_message=warning_message
-        )
-        
-    except ValueError as e:
-        # Contract not found or deleted
-        raise HTTPException(
-            status_code=404,
-            detail=str(e)
-        )
-    except Exception as e:
-        # Unexpected error during validation
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error validating payment: {str(e)}"
-        )
-
-
-@router.post("/validate-draft", response_model=PaymentBatchValidationResponse)
-def validate_draft_payment(
-    request: PaymentBatchValidationRequest,
-    db: Session = Depends(get_db),
-):
-    """
-    Validate a single drafted (cart) payment against the employer's balance.
-
-    The available balance is computed as the current database balance minus the
-    `pending_cart_amount` (other drafts already reserved in the frontend cart
-    for the same employer). If the payment amount exceeds the available balance,
-    the request is rejected with HTTP 400 and the exact remaining balance.
-
-    **Parameters:**
-    - `contract_tracking_code`: Contract linked to the drafted payment.
-    - `amount`: Amount of the drafted payment.
-    - `funding_year`: Funding (budget consumption) year.
-    - `pending_cart_amount`: Sum of other drafts for the same employer in the cart.
-
-    **Returns:**
-    - HTTP 200 with balance breakdown when the draft is affordable.
-    - HTTP 400 with the remaining balance when funds are insufficient.
-    """
-    try:
-        contract, _ = lock_active_contract_and_employer(
-            db, request.contract_tracking_code
-        )
-        current_db_balance = calculate_real_balance(
-            db, contract.employer_code, request.funding_year
-        )
+        db.rollback()  # Read-only check: release the row locks immediately.
+    except InsufficientFundsError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:
+        db.rollback()
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
+        db.rollback()
         raise HTTPException(
             status_code=500,
-            detail=f"Error calculating balance: {str(exc)}",
+            detail=f"Error validating payment: {str(exc)}"
         )
 
-    available_balance = current_db_balance - request.pending_cart_amount
-
-    if available_balance < request.amount:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Insufficient funds for this draft payment. "
-                f"Remaining available balance is {available_balance:,.0f} Rials, "
-                f"but the requested amount is {request.amount:,.0f} Rials."
-            ),
-        )
-
-    return PaymentBatchValidationResponse(
-        employer_code=contract.employer_code,
-        current_db_balance=current_db_balance,
-        pending_cart_amount=request.pending_cart_amount,
-        available_balance=available_balance,
-        amount=request.amount,
-        remaining_balance=available_balance - request.amount,
-        is_valid=True,
+    return PaymentValidationResponse(
+        employer_code=validation_result["employer_code"],
+        current_balance=validation_result["current_balance"],
+        payment_amount=validation_result["payment_amount"],
+        new_balance=validation_result["new_balance"],
+        is_negative=False,
+        warning_message=None,
     )
 
 
-@router.post("/bulk-submit", response_model=PaymentBulkCreateResponse, status_code=201)
-def bulk_submit_payments(
-    request: PaymentBulkCreate,
+def _enriched_payment_query(db: Session) -> SAQuery:
+    """Build the shared Payment+Contract+Employer+University join.
+
+    Every join is on a single FK to a single PK (Payment -> Contract is
+    many-to-one, Contract -> Employer/University are each many-to-one), so
+    this always returns exactly one row per ``Payment`` — no fan-out, no
+    Cartesian product, and no N+1 (a single query regardless of row count).
+    ``outerjoin`` is used throughout so a payment is still returned even if
+    its contract or a downstream link is missing/soft-deleted-adjacent.
+    """
+    return (
+        db.query(Payment, Contract, Employer, University)
+        .outerjoin(
+            Contract, Payment.contract_tracking_code == Contract.tracking_code
+        )
+        .outerjoin(
+            Employer, Contract.employer_code == Employer.classification_code
+        )
+        .outerjoin(
+            University, Contract.university_id == University.national_id
+        )
+    )
+
+
+def _compute_balances_after(
+    db: Session,
+    rows: list[tuple[Payment, Contract, Employer, University]],
+) -> dict[str, float]:
+    """Compute each payment's employer balance immediately after it.
+
+    ``calculate_real_balance`` already sums every ``Draft``/``Final``
+    payment for an (employer, funding_year) pair, so it reflects the state
+    *after all* of ``rows`` are applied. To show a distinct, meaningful
+    "balance after this row" per row (not just the same final number
+    repeated), payments are grouped by (employer_code, funding_year), the
+    group's amounts are added back to get the balance *before* any of them,
+    and a running balance is walked forward in tracking-code order.
+
+    Only one ``calculate_real_balance`` call is made per distinct
+    (employer_code, funding_year) pair present in ``rows`` — not one per
+    row — regardless of how many payments share that pair.
+
+    Returns:
+        A ``{tracking_code: balance_after}`` map.
+    """
+    groups: dict[tuple[str, int], list[Payment]] = {}
+    for payment, _contract, employer, _university in rows:
+        if employer is None:
+            continue
+        key = (employer.classification_code, payment.funding_year)
+        groups.setdefault(key, []).append(payment)
+
+    balance_after: dict[str, float] = {}
+    for (employer_code, funding_year), group_payments in groups.items():
+        current_balance = calculate_real_balance(db, employer_code, funding_year)
+        # current_balance already includes every payment in this group;
+        # add them all back to recover the balance before any of them.
+        running_balance = current_balance + sum(
+            float(p.amount) for p in group_payments
+        )
+        for payment in sorted(group_payments, key=lambda p: p.tracking_code):
+            running_balance -= float(payment.amount)
+            balance_after[payment.tracking_code] = running_balance
+
+    return balance_after
+
+
+def _to_draft_response(
+    payment: Payment,
+    contract: Contract,
+    employer: Employer,
+    university: University,
+    *,
+    balance_after: float | None = None,
+) -> PaymentDraftResponse:
+    """Build the display-ready draft response from the joined entities."""
+    return PaymentDraftResponse(
+        tracking_code=payment.tracking_code,
+        contract_tracking_code=payment.contract_tracking_code,
+        contract_title=contract.title if contract else None,
+        contract_total_amount=float(contract.total_amount) if contract else None,
+        employer_code=employer.classification_code if employer else None,
+        employer_name=employer.name if employer else None,
+        university_name=university.name if university else None,
+        amount=float(payment.amount),
+        funding_year=payment.funding_year,
+        payment_year=payment.payment_year,
+        series=payment.series,
+        status=payment.status,
+        employer_balance_after=balance_after,
+    )
+
+
+@router.post("/draft", response_model=PaymentDraftCreateResponse, status_code=201)
+def create_draft_payment(
+    request: PaymentDraftCreate,
     db: Session = Depends(get_db),
 ):
     """
-    Register a payment batch in one pessimistically locked transaction.
+    Stage a single payment as a database-backed draft (batch-payment cart).
 
-    Active contract and employer rows are locked with PostgreSQL ``FOR UPDATE``
-    before balances are calculated. Locks are acquired in deterministic order
-    and held through all inserts and the commit. Negative balances do not block
-    or roll back registration; they are returned as FR-20 warning messages.
+    Replaces the old in-memory ``st.session_state`` cart: drafts are
+    persisted immediately, so they survive a browser reload, and their
+    amount is reserved against the employer's real balance the instant
+    they are created (``calculate_real_balance`` counts ``Draft`` rows
+    alongside ``Final`` ones). A payment that would drive the balance
+    negative is rejected outright with HTTP 400 — there is no warning-only
+    path anymore.
 
-    Args:
-        request: Validated batch of payments to register atomically.
-        db: Active SQLAlchemy database session.
+    **Parameters:**
+    - `tracking_code`: Unique payment tracking code (primary key).
+    - `contract_tracking_code`: Contract the payment is drawn against.
+    - `amount`: Payment amount in base Rials.
+    - `funding_year`: Fiscal year the balance check and reservation apply to.
+    - `payment_year`, `series`, `notification_letter_number`,
+      `notification_date`: Optional metadata.
 
-    Returns:
-        The committed tracking codes and any negative-balance warnings.
+    **Returns:**
+    - The created draft, HTTP 201, including `employer_balance_before` and
+      `employer_balance_after` so the frontend can show the balance
+      transition without a second API call.
 
-    Raises:
-        HTTPException: If identifiers are duplicated, missing, or soft-deleted,
-            or if the database transaction fails.
+    **Raises:**
+    - `HTTPException(400)`: Duplicate tracking code, or insufficient funds.
+    - `HTTPException(404)`: The contract or its employer is missing/deleted.
     """
-    tracking_codes = [item.tracking_code for item in request.payments]
-    seen_codes: set[str] = set()
-    duplicate_request_code = None
-    for tracking_code in tracking_codes:
-        if tracking_code in seen_codes:
-            duplicate_request_code = tracking_code
-            break
-        seen_codes.add(tracking_code)
-
-    if duplicate_request_code is not None:
+    existing = (
+        db.query(Payment.tracking_code)
+        .filter(
+            Payment.tracking_code == request.tracking_code,
+            Payment.is_deleted == False,
+        )
+        .first()
+    )
+    if existing is not None:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"خطا: کد رهگیری پرداخت '{duplicate_request_code}' "
+                f"خطا: کد رهگیری پرداخت '{request.tracking_code}' "
                 "قبلاً در سیستم ثبت شده است."
             ),
         )
 
-    running_balances: dict[tuple[str, int], float] = {}
-    created_tracking_codes: List[str] = []
-    warning_messages: List[str] = []
+    try:
+        validation_result = validate_payment_impact(
+            db=db,
+            contract_code=request.contract_tracking_code,
+            payment_amount=request.amount,
+            funding_year=request.funding_year,
+            lock_rows=True,
+        )
+    except InsufficientFundsError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc))
 
     try:
-        existing = (
-            db.query(Payment.tracking_code)
-            .filter(
-                Payment.tracking_code.in_(tracking_codes),
-                Payment.is_deleted == False,
-            )
-            .first()
+        payment = Payment(
+            tracking_code=request.tracking_code,
+            contract_tracking_code=request.contract_tracking_code,
+            amount=request.amount,
+            funding_year=request.funding_year,
+            payment_year=request.payment_year,
+            series=request.series,
+            notification_letter_number=request.notification_letter_number,
+            notification_date=request.notification_date,
+            status="Draft",
+            is_deleted=False,
         )
-        if existing:
-            duplicate_code = existing[0]
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"خطا: کد رهگیری پرداخت '{duplicate_code}' "
-                    "قبلاً در سیستم ثبت شده است."
-                ),
-            )
-
-        contract_codes = [
-            item.contract_tracking_code for item in request.payments
-        ]
-        locked_contracts = lock_active_contracts(db, contract_codes)
-        missing_contract_codes = sorted(
-            set(contract_codes) - set(locked_contracts)
-        )
-        if missing_contract_codes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Contract '{missing_contract_codes[0]}' not found or "
-                    "has been deleted."
-                ),
-            )
-
-        employer_codes = [
-            contract.employer_code for contract in locked_contracts.values()
-        ]
-        locked_employers = lock_active_employers(db, employer_codes)
-        missing_employer_codes = sorted(
-            set(employer_codes) - set(locked_employers)
-        )
-        if missing_employer_codes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Employer '{missing_employer_codes[0]}' not found or "
-                    "has been deleted."
-                ),
-            )
-
-        for index, item in enumerate(request.payments):
-            contract = locked_contracts[item.contract_tracking_code]
-            balance_key = (contract.employer_code, item.funding_year)
-            if balance_key not in running_balances:
-                running_balances[balance_key] = calculate_real_balance(
-                    db, contract.employer_code, item.funding_year
-                )
-
-            payment = Payment(
-                tracking_code=item.tracking_code,
-                contract_tracking_code=item.contract_tracking_code,
-                series=item.series,
-                amount=item.amount,
-                notification_letter_number=item.notification_letter_number,
-                notification_date=item.notification_date,
-                payment_year=item.payment_year,
-                funding_year=item.funding_year,
-                attachment_path=item.attachment_path,
-                is_deleted=False,
-            )
-            db.add(payment)
-
-            running_balances[balance_key] -= item.amount
-            if running_balances[balance_key] < 0:
-                warning_messages.append(
-                    f"Row {index + 1} (tracking code '{item.tracking_code}'): "
-                    f"employer '{contract.employer_code}' balance for funding "
-                    f"year {item.funding_year} is negative "
-                    f"({running_balances[balance_key]:,.0f} Rials) after registration."
-                )
-            created_tracking_codes.append(item.tracking_code)
-
+        db.add(payment)
         db.commit()
-    except HTTPException:
+        db.refresh(payment)
+    except IntegrityError:
         db.rollback()
-        raise
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"خطا: کد رهگیری پرداخت '{request.tracking_code}' "
+                "قبلاً در سیستم ثبت شده است."
+            ),
+        )
     except Exception as exc:
         db.rollback()
         raise HTTPException(
             status_code=500,
-            detail=f"Error during bulk submission (transaction rolled back): {str(exc)}",
+            detail=f"خطا در ذخیره پیش‌نویس پرداخت: {exc}",
         )
 
-    return PaymentBulkCreateResponse(
+    # Single joined round-trip for the display-ready contract/employer/
+    # university fields, rather than one query per related entity.
+    contract, employer, university = (
+        db.query(Contract, Employer, University)
+        .outerjoin(
+            Employer, Contract.employer_code == Employer.classification_code
+        )
+        .outerjoin(
+            University, Contract.university_id == University.national_id
+        )
+        .filter(Contract.tracking_code == payment.contract_tracking_code)
+        .first()
+    )
+
+    base_response = _to_draft_response(
+        payment,
+        contract,
+        employer,
+        university,
+        balance_after=validation_result["new_balance"],
+    )
+    return PaymentDraftCreateResponse(
+        **base_response.model_dump(),
+        employer_balance_before=validation_result["current_balance"],
+    )
+
+
+@router.get("/drafts", response_model=List[PaymentDraftResponse])
+def list_draft_payments(
+    series: Optional[str] = Query(
+        None, description="Restrict results to a single payment series"
+    ),
+    db: Session = Depends(get_db),
+):
+    """Return every active draft payment, optionally filtered by series.
+
+    Each row is enriched with its contract title/amount, employer name,
+    university name, and a running ``employer_balance_after`` computed
+    across the returned set (§ ``_compute_balances_after``) — all via one
+    joined query plus one balance calculation per distinct employer/year
+    pair, never one query per row.
+    """
+    query = _enriched_payment_query(db).filter(
+        Payment.status == "Draft",
+        Payment.is_deleted == False,
+    )
+    if series:
+        query = query.filter(Payment.series == series)
+
+    rows = query.order_by(Payment.tracking_code).all()
+    balances_after = _compute_balances_after(db, rows)
+    return [
+        _to_draft_response(
+            payment,
+            contract,
+            employer,
+            university,
+            balance_after=balances_after.get(payment.tracking_code),
+        )
+        for payment, contract, employer, university in rows
+    ]
+
+
+@router.delete("/draft/{tracking_code}", response_model=DraftDeleteResponse)
+def delete_draft_payment(
+    tracking_code: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Remove one draft payment (soft-delete, per the system-wide rule).
+
+    Only ``Draft``-status rows can be removed this way; a ``Final``
+    payment is not touched by this endpoint even if the tracking code
+    matches.
+    """
+    draft = (
+        db.query(Payment)
+        .filter(
+            Payment.tracking_code == tracking_code,
+            Payment.status == "Draft",
+            Payment.is_deleted == False,
+        )
+        .first()
+    )
+    if draft is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"پیش‌نویس پرداخت با کد رهگیری '{tracking_code}' یافت نشد.",
+        )
+
+    draft.is_deleted = True
+    db.commit()
+
+    return DraftDeleteResponse(
+        message="پیش‌نویس با موفقیت حذف شد.",
+        tracking_code=tracking_code,
+    )
+
+
+@router.post("/finalize-batch", response_model=FinalizeBatchResponse)
+def finalize_batch(
+    request: FinalizeBatchRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Confirm every active draft in a series, moving it to ``Final`` status.
+
+    Purely a status transition: ``calculate_real_balance`` already counts
+    ``Draft`` and ``Final`` payments identically, so finalizing a series
+    does not change any employer's projected balance — the funds were
+    already reserved the moment each draft was created. Finalizing a
+    series with no matching drafts succeeds with ``finalized_count: 0``
+    rather than erroring, so a duplicate click is harmless.
+
+    Returns the full enriched records for the finalized batch (not just
+    the count), so the frontend can build an Excel export from the
+    response alone without a follow-up ``GET`` call.
+    """
+    try:
+        drafts = (
+            db.query(Payment)
+            .filter(
+                Payment.series == request.series,
+                Payment.status == "Draft",
+                Payment.is_deleted == False,
+            )
+            .all()
+        )
+        finalized_tracking_codes = [draft.tracking_code for draft in drafts]
+        for draft in drafts:
+            draft.status = "Final"
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"خطا در نهایی‌سازی لیست پرداخت: {exc}",
+        )
+
+    finalized_payments: List[PaymentDraftResponse] = []
+    if finalized_tracking_codes:
+        rows = (
+            _enriched_payment_query(db)
+            .filter(Payment.tracking_code.in_(finalized_tracking_codes))
+            .order_by(Payment.tracking_code)
+            .all()
+        )
+        balances_after = _compute_balances_after(db, rows)
+        finalized_payments = [
+            _to_draft_response(
+                payment,
+                contract,
+                employer,
+                university,
+                balance_after=balances_after.get(payment.tracking_code),
+            )
+            for payment, contract, employer, university in rows
+        ]
+
+    return FinalizeBatchResponse(
         message=(
-            "All payments were registered successfully with balance warnings."
-            if warning_messages
-            else "All payments were registered successfully."
+            f"{len(drafts)} پرداخت با موفقیت نهایی شد."
+            if drafts
+            else "هیچ پیش‌نویس فعالی برای این سری یافت نشد."
         ),
-        submitted_count=len(created_tracking_codes),
-        tracking_codes=created_tracking_codes,
-        warning_messages=warning_messages,
+        series=request.series,
+        finalized_count=len(drafts),
+        finalized_payments=finalized_payments,
     )

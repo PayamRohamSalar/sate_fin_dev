@@ -26,8 +26,10 @@ python3 scripts/import_credit_transfers.py
 
 ## Run Server
 python -m streamlit run dashboard/app.py
-python -m uvicorn main:app --reload --port 8000
 python -m uvicorn main:app --port 8000
+
+python -m uvicorn main:app --reload --port 8000
+
 
 python -m streamlit run dashboard/app_v2.py
 
@@ -37,6 +39,8 @@ Then open browser: http://127.0.0.1:8000/docs
 python scripts/generate_financial_report.py
 python scripts/generate_contract_status_report.py
 python generate_context.py
+
+python scripts/
 
 ## Phase 3
 
