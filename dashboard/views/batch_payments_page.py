@@ -67,7 +67,16 @@ st.markdown(
         margin-top: 0.1rem !important;
         margin-bottom: 0.1rem !important;
     }
-    div[data-testid="stDataFrame"] * { direction: rtl !important; }
+    /* st.table renders a real HTML <table> (unlike st.dataframe, which draws
+       cells on a <canvas> that ignores page CSS entirely — the root cause
+       of the font/RTL/number-ordering bugs in the drafts table). */
+    table, th, td, .stTable, [data-testid="stTable"] * {
+        font-family: 'Vazirmatn', sans-serif !important;
+        font-size: 15px !important;
+        text-align: center !important;
+        direction: rtl !important;
+    }
+    th { background-color: #f0f2f6 !important; border-bottom: 2px solid #4a4a4a !important; color: black !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -76,11 +85,61 @@ st.markdown(
 st.title("📂 فرم ثبت دسته‌ای لیست پرداخت (کارتابل صندوق عتف)")
 
 
+PERSIAN_DIGITS = {
+    "0": "۰", "1": "۱", "2": "۲", "3": "۳", "4": "۴",
+    "5": "۵", "6": "۶", "7": "۷", "8": "۸", "9": "۹",
+}
+
+
+def _to_persian_digits(text) -> str:
+    """Convert ASCII digits to Persian digits.
+
+    Western digits inside an RTL-directed comma-separated number are prone
+    to bidi reordering in the browser (the exact "balance is messed up"
+    symptom) — Persian digits are treated as part of the surrounding RTL
+    run and render in the correct order, matching the convention already
+    used for on-screen numbers elsewhere in this app (``dashboard/app.py``'s
+    ``to_persian_numbers``).
+    """
+    text = str(text)
+    for eng, per in PERSIAN_DIGITS.items():
+        text = text.replace(eng, per)
+    return text
+
+
 def _format_rials(value) -> str:
-    """Format a Rial amount with thousand separators, or '-' when absent."""
+    """Format a Rial amount with thousand separators in Persian digits, or '-' when absent."""
     if value is None:
         return "-"
-    return f"{value:,.0f}"
+    return _to_persian_digits(f"{value:,.0f}")
+
+
+def _fetch_employer_balance(employer_code: str, funding_year: int) -> float | None:
+    """Fetch an employer's current real balance for a funding year.
+
+    Reflects every ``Draft``/``Final`` payment already on record (including
+    drafts staged earlier in this same batch), so this is genuinely the
+    balance "up to this moment" — not a stale snapshot.
+    """
+    try:
+        response = requests.get(
+            f"{API_URL}/employers/{employer_code}/balance",
+            params={"funding_year": funding_year},
+            timeout=5,
+        )
+        if response.status_code == 200:
+            return response.json()["total_balance"]
+        st.error(f"❌ خطا در دریافت موجودی کارفرما: {_response_detail(response)}")
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "خطا: امکان اتصال به سرور بک‌اند وجود ندارد. لطفاً مطمئن شوید "
+            "سرور اصلی (FastAPI) روی پورت 8000 در حال اجرا است."
+        )
+    except requests.exceptions.Timeout:
+        st.error("خطا: پاسخ از سرور بک‌اند بیش از حد طول کشید. لطفاً مجدداً تلاش کنید.")
+    except Exception as exc:
+        st.error(f"خطای پیش‌بینی‌نشده در دریافت موجودی کارفرما: {exc}")
+    return None
 
 
 def _response_detail(response: requests.Response) -> str:
@@ -149,10 +208,19 @@ def _build_dataframe(items: list[dict]) -> pd.DataFrame:
 
 
 def _display_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Comma-format numeric columns for on-screen display (raw numbers stay in the Excel export)."""
+    """Format numeric columns with Persian digits for on-screen display.
+
+    Raw numbers stay in the Excel export (unaffected by this function).
+    Tracking-code columns are deliberately left untouched — those are
+    system identifiers, not display quantities, and must stay
+    byte-for-byte matchable against the database.
+    """
     display_df = df.copy()
     for column in NUMERIC_TABLE_COLUMNS:
         display_df[column] = display_df[column].apply(_format_rials)
+    display_df["پرداخت از محل سال مالی"] = display_df["پرداخت از محل سال مالی"].apply(
+        _to_persian_digits
+    )
     return display_df
 
 
@@ -205,9 +273,7 @@ if finalize_state:
         type="primary",
     )
     st.markdown("---")
-    st.dataframe(
-        _display_dataframe(finalize_state["dataframe"]), width="stretch", hide_index=True
-    )
+    st.table(_display_dataframe(finalize_state["dataframe"]).reset_index(drop=True))
     if st.button("🆕 شروع لیست پرداخت جدید"):
         st.session_state.pop(FINALIZE_STATE_KEY, None)
         st.rerun()
@@ -263,6 +329,21 @@ if search_query:
                 f"🎓 مجری: {selected_contract['university_name']} | "
                 f"🧑‍💻 فناور: {selected_contract['researcher_name']}"
             )
+
+            # Live balance preview: the funding-year widget below hasn't run
+            # yet this script pass, so its *previous* value (or the default,
+            # on first selection) is read straight from session_state — the
+            # same value that widget is about to render with.
+            preview_funding_year = st.session_state.get("batch_funding_year", 1402)
+            preview_balance = _fetch_employer_balance(
+                selected_contract["employer_classification_code"], preview_funding_year
+            )
+            if preview_balance is not None:
+                st.info(
+                    f"💰 موجودی فعلی کارفرما تا این لحظه (سال مالی "
+                    f"{_to_persian_digits(preview_funding_year)}): "
+                    f"{_format_rials(preview_balance)} ریال"
+                )
         else:
             st.warning("هیچ قراردادی با این مشخصات یافت نشد.")
     except requests.exceptions.ConnectionError:
@@ -353,7 +434,7 @@ drafts = _fetch_drafts(current_series) if current_series else None
 
 if drafts:
     drafts_df = _build_dataframe(drafts)
-    st.dataframe(_display_dataframe(drafts_df), width="stretch", hide_index=True)
+    st.table(_display_dataframe(drafts_df).reset_index(drop=True))
 
     delete_col1, delete_col2 = st.columns([3, 1])
     with delete_col1:
