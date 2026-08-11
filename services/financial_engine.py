@@ -1,3 +1,4 @@
+from datetime import date
 from decimal import Decimal
 from typing import Sequence
 
@@ -5,11 +6,14 @@ import pandas as pd
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
+from core.date_helper import to_jalali_date
 from models.contract import Contract
 from models.deposits import AnnualMandate, DepositReceipt
 from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
+from models.trustee_payments import TrusteePayment
+from models.university import University
 
 
 class InsufficientFundsError(ValueError):
@@ -538,3 +542,712 @@ def validate_payment_impact(
         "new_balance": new_balance,
         "is_negative": False,
     }
+
+
+STAGNANT_CONTRACT_STATUSES = ("خاتمه‌یافته", "آغاز نشده", "راکد", "فعال")
+
+
+def get_contract_status_overview(
+    db: Session,
+    *,
+    since_jalali_year: int = 1402,
+    dormant_days_threshold: int = 365,
+    as_of: date | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Build a per-contract activity/status overview for the "قراردادهای
+    رسوب‌کرده" (stagnant contracts) dashboard, scoped to contracts concluded
+    from ``since_jalali_year`` onward.
+
+    This is deliberately a different question from
+    ``get_contracts_with_dynamic_status`` above: that function buckets a
+    contract's *entire* history into Active/Stagnant/Completed by comparing
+    the fiscal ``funding_year`` of its last payment against a fixed cliff
+    year. This function instead scopes to contracts *created* from
+    ``since_jalali_year`` onward (by ``Contract.contract_date``, Jalali
+    year) and measures dormancy in real elapsed calendar days against a
+    rolling ``as_of`` reference (default: today) — a live,
+    continuously-shifting measure rather than a static year cliff. Both are
+    legitimate, separate views; do not merge or replace one with the other.
+    See Docs/SATE_Living_Documentation.md §4.1 on why ``funding_year``
+    (budget year) and ``payment_date``/``payment_year`` (cash-flow date)
+    must not be conflated.
+
+    The "last payment" date is ``COALESCE(Payment.payment_date,
+    Payment.notification_date)`` — prefer the real cash-disbursement date
+    when known, but fall back to the notification/ابلاغ date (the date the
+    payment was officially communicated) when it isn't. This is not a
+    cosmetic choice: as of 2026-08-11, every row in ``payments`` has a
+    ``NULL`` ``payment_date`` (the column has never actually been populated
+    in this database, despite the fallback rule in
+    ``scripts/import_payments_upsert.py``'s docstring describing it as a
+    per-row fallback), while ``notification_date`` is now 100% populated
+    after the ``Q_PaymentsFrom1402.xlsx`` reconciliation
+    (``scripts/reconcile_q_payments_from_1402.py`` +
+    ``scripts/backfill_notification_date_placeholder.py``). Before this fix,
+    ``last_payment_date`` was unconditionally ``NULL`` for every contract,
+    so *every* contract with payment history that wasn't yet "خاتمه‌یافته"
+    was conservatively misclassified as "راکد" via the
+    ``missing_payment_date_flags`` path below — that is the exact "۲۹۹
+    قرارداد ... تاریخ پرداخت ... نامعتبر/خالی" symptom the notification-date
+    backfill alone could not fix, since this query never read
+    ``notification_date`` at all until now.
+
+    ``trustee_payments`` (پرداخت‌های امانی — payments the executing
+    institution funded directly from its own resources, outside the
+    employer-managed budget pool; see ``models/trustee_payments.py``) are
+    folded into ``total_paid`` and ``last_payment_date`` here, per explicit
+    instruction, because from the *contract's* point of view a trustee
+    payment is still money the contract received and still evidence the
+    contract is active — the four-status classification below answers "is
+    this contract moving", not "did the employer's own budget pay for it".
+    This is the ONLY place trustee payments are ever combined with regular
+    payments: ``calculate_real_balance`` and every other employer
+    balance/credit calculation in this module deliberately never reference
+    ``TrusteePayment`` — trustee amounts must never be deducted from an
+    employer's mandate/deposit balance. ``Payment`` and ``TrusteePayment``
+    are aggregated in separate pre-grouped subqueries before being outer
+    joined to ``Contract`` (not joined directly against each other), so a
+    contract with both regular and trustee payments never fans out into a
+    row-count cross product that would corrupt the ``SUM``/``MAX``/``COUNT``
+    aggregates — each subquery yields at most one row per contract before
+    the join. ``TrusteePayment`` has no ``payment_date`` column at all (only
+    ``notification_date``), so its contribution to ``last_payment_date`` is
+    always via the notification date.
+
+    Four mutually exclusive statuses, in priority order:
+      1. ``"خاتمه‌یافته"`` (Completed) — confirmed payments cover the
+         contract's ``total_amount``.
+      2. ``"آغاز نشده"`` (Not Started) — no payment has ever been recorded
+         against the contract.
+      3. ``"راکد"`` (Dormant) — at least one payment exists, the contract
+         is not completed, and no payment has landed in the last
+         ``dormant_days_threshold`` days. This is the category the
+         dashboard's name refers to, and the one relevant to Tabsare 2
+         Madde 5 credit-transfer review.
+      4. ``"فعال"`` (Active) — at least one payment exists, the contract
+         is not completed, and the most recent payment is within
+         ``dormant_days_threshold`` days.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        since_jalali_year: Jalali year of ``Contract.contract_date`` used as
+            the inclusion cutoff (default 1402).
+        dormant_days_threshold: Elapsed days since the last payment beyond
+            which a contract with payment history is considered dormant
+            (default 365, i.e. one calendar year).
+        as_of: Reference date for the elapsed-days calculation; defaults to
+            today.
+
+    Returns:
+        A tuple of:
+          - A DataFrame, one row per in-scope contract, with columns
+            ``tracking_code``, ``title``, ``employer_name``,
+            ``university_name``, ``contract_date``, ``contract_jalali_year``,
+            ``total_amount``, ``total_paid`` (regular + trustee payments
+            combined), ``trustee_paid_amount`` (the trustee-only portion of
+            ``total_paid``, broken out for auditability — ``0.0`` when the
+            contract has no trustee payments), ``remaining_amount``,
+            ``last_payment_date``, ``days_since_last_payment``, ``status``,
+            ``data_quality_flag``.
+          - A metadata dict: ``as_of``, ``since_jalali_year``,
+            ``dormant_days_threshold``, ``excluded_no_contract_date``
+            (in-scope-by-everything-else contracts skipped because
+            ``contract_date`` is ``NULL`` and their Jalali year cannot be
+            determined — not included in the DataFrame at all),
+            ``missing_payment_date_flags`` (contracts that do have payment
+            rows but none carry a usable ``payment_date`` or
+            ``notification_date`` from either ``payments`` or
+            ``trustee_payments`` — classified conservatively as ``"راکد"``
+            since recency cannot be proven at all; see
+            Docs/SATE_Living_Documentation.md §4.4 on legacy rows with a
+            ``NULL`` ``payment_date``), and ``contracts_with_trustee_payment``
+            (count of in-scope contracts that have at least one trustee
+            payment attributed to them).
+    """
+    as_of = as_of or date.today()
+
+    payment_agg = (
+        select(
+            Payment.contract_tracking_code.label("contract_tracking_code"),
+            func.coalesce(func.sum(Payment.amount), 0).label("total_paid"),
+            func.max(
+                func.coalesce(Payment.payment_date, Payment.notification_date)
+            ).label("last_payment_date"),
+            func.count(Payment.tracking_code).label("payment_count"),
+        )
+        .where(Payment.is_deleted == False)
+        .group_by(Payment.contract_tracking_code)
+        .subquery()
+    )
+
+    trustee_agg = (
+        select(
+            TrusteePayment.contract_tracking_code.label("contract_tracking_code"),
+            func.coalesce(func.sum(TrusteePayment.amount), 0).label("trustee_paid"),
+            func.max(TrusteePayment.notification_date).label(
+                "last_trustee_payment_date"
+            ),
+            func.count(TrusteePayment.id).label("trustee_payment_count"),
+        )
+        .where(TrusteePayment.is_deleted == False)
+        .group_by(TrusteePayment.contract_tracking_code)
+        .subquery()
+    )
+
+    statement = (
+        select(
+            Contract.tracking_code,
+            Contract.title,
+            Contract.contract_date,
+            Contract.total_amount,
+            Employer.name.label("employer_name"),
+            University.name.label("university_name"),
+            func.coalesce(payment_agg.c.total_paid, 0).label("total_paid"),
+            payment_agg.c.last_payment_date,
+            func.coalesce(payment_agg.c.payment_count, 0).label("payment_count"),
+            func.coalesce(trustee_agg.c.trustee_paid, 0).label("trustee_paid"),
+            trustee_agg.c.last_trustee_payment_date,
+            func.coalesce(trustee_agg.c.trustee_payment_count, 0).label(
+                "trustee_payment_count"
+            ),
+        )
+        .join(
+            Employer,
+            and_(
+                Contract.employer_code == Employer.classification_code,
+                Employer.is_deleted == False,
+            ),
+        )
+        .join(
+            University,
+            and_(
+                Contract.university_id == University.national_id,
+                University.is_deleted == False,
+            ),
+        )
+        .outerjoin(
+            payment_agg,
+            payment_agg.c.contract_tracking_code == Contract.tracking_code,
+        )
+        .outerjoin(
+            trustee_agg,
+            trustee_agg.c.contract_tracking_code == Contract.tracking_code,
+        )
+        .where(Contract.is_deleted == False)
+    )
+
+    rows = db.execute(statement).all()
+
+    records = []
+    excluded_no_contract_date = 0
+    missing_payment_date_flags = 0
+    contracts_with_trustee_payment = 0
+
+    for row in rows:
+        if row.contract_date is None:
+            excluded_no_contract_date += 1
+            continue
+
+        jalali_year = to_jalali_date(row.contract_date).year
+        if jalali_year < since_jalali_year:
+            continue
+
+        total_amount_val = float(row.total_amount or 0)
+        regular_paid_val = float(row.total_paid or 0)
+        trustee_paid_val = float(row.trustee_paid or 0)
+        total_paid_val = regular_paid_val + trustee_paid_val
+        payment_count_val = (row.payment_count or 0) + (
+            row.trustee_payment_count or 0
+        )
+        if trustee_paid_val > 0:
+            contracts_with_trustee_payment += 1
+
+        candidate_dates = [
+            d for d in (row.last_payment_date, row.last_trustee_payment_date) if d
+        ]
+        last_payment_date = max(candidate_dates) if candidate_dates else None
+
+        data_quality_flag = None
+        days_since_last_payment = None
+
+        if total_amount_val > 0 and total_paid_val >= total_amount_val:
+            status = "خاتمه‌یافته"
+        elif payment_count_val == 0 or total_paid_val <= 0:
+            status = "آغاز نشده"
+        elif last_payment_date is None:
+            status = "راکد"
+            missing_payment_date_flags += 1
+            data_quality_flag = (
+                "دارای پرداخت ثبت‌شده بدون تاریخ معتبر — به صورت "
+                "محافظه‌کارانه «راکد» طبقه‌بندی شد"
+            )
+        else:
+            days_since_last_payment = (as_of - last_payment_date).days
+            status = (
+                "راکد"
+                if days_since_last_payment > dormant_days_threshold
+                else "فعال"
+            )
+
+        records.append(
+            {
+                "tracking_code": row.tracking_code,
+                "title": row.title,
+                "employer_name": row.employer_name,
+                "university_name": row.university_name,
+                "contract_date": row.contract_date,
+                "contract_jalali_year": jalali_year,
+                "total_amount": total_amount_val,
+                "total_paid": total_paid_val,
+                "trustee_paid_amount": trustee_paid_val,
+                "remaining_amount": max(total_amount_val - total_paid_val, 0.0),
+                "last_payment_date": last_payment_date,
+                "days_since_last_payment": days_since_last_payment,
+                "status": status,
+                "data_quality_flag": data_quality_flag,
+            }
+        )
+
+    columns = [
+        "tracking_code",
+        "title",
+        "employer_name",
+        "university_name",
+        "contract_date",
+        "contract_jalali_year",
+        "total_amount",
+        "total_paid",
+        "trustee_paid_amount",
+        "remaining_amount",
+        "last_payment_date",
+        "days_since_last_payment",
+        "status",
+        "data_quality_flag",
+    ]
+    df = pd.DataFrame.from_records(records, columns=columns)
+
+    meta = {
+        "as_of": as_of,
+        "since_jalali_year": since_jalali_year,
+        "dormant_days_threshold": dormant_days_threshold,
+        "excluded_no_contract_date": excluded_no_contract_date,
+        "missing_payment_date_flags": missing_payment_date_flags,
+        "contracts_with_trustee_payment": contracts_with_trustee_payment,
+    }
+    return df, meta
+
+
+EMPLOYER_KPI_TIERS = ("قرمز", "زرد", "سبز", "بدون تکلیف")
+
+
+def get_employer_deposit_performance(
+    db: Session,
+    *,
+    since_jalali_year: int = 1402,
+    fiscal_years: Sequence[int] | None = None,
+    red_threshold: float = 50.0,
+    yellow_threshold: float = 80.0,
+) -> pd.DataFrame:
+    """
+    Build the "درصد تحقق واریز" (deposit-realization %) performance table for
+    the "داشبورد عملکرد مشمولین" (Employer KPI) dashboard — one row per
+    employer, ranking compliance with their legal deposit mandate (اعتبار
+    تکلیفی) and flagging under-performers ("دستگاه‌های متخلف" / red flags).
+
+    This is a deliberately narrower metric than the "مانده واقعی" (real
+    balance) used elsewhere in the app: it only compares deposits against
+    the mandate (``deposit_amount / mandated_amount``), ignoring
+    payments/transfers entirely, because the question here is "did this
+    employer deposit what it legally owes", not "how much money is left to
+    spend". Built on top of ``get_all_employers_financials`` (single source
+    of truth for the per-employer/per-year mandate and deposit aggregates,
+    including the existing Mother+Subsidiary roll-up), not a separate query,
+    so this view can never drift from the numbers shown in the main
+    dashboard's Tab 1/Tab 2.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        since_jalali_year: Lower bound (inclusive) on the fiscal year used
+            when ``fiscal_years`` is not given (default 1402, matching the
+            rest of the app's "data from 1402 onward" convention).
+        fiscal_years: If given, restrict to exactly these fiscal years
+            (e.g. a single year for a year-by-year view) instead of the
+            open-ended ``since_jalali_year`` range — lets the caller compute
+            either a single-year snapshot or a multi-year cumulative total
+            by summing whichever years are selected.
+        red_threshold: Realization-% cutoff (exclusive upper bound) for the
+            "قرمز" (red flag) tier (default 50).
+        yellow_threshold: Realization-% cutoff (exclusive upper bound) for
+            the "زرد" tier, above ``red_threshold`` (default 80). Employers
+            at or above this are "سبز".
+
+    Returns:
+        A DataFrame, one row per in-scope employer with any mandate/deposit
+        activity, with columns: ``employer_code``, ``employer_name``,
+        ``employer_type``, ``province``, ``mandated_amount``,
+        ``deposit_amount``, ``shortfall_amount`` (``max(mandated - deposit,
+        0)``), ``realization_pct`` (``None`` when ``mandated_amount`` is 0 —
+        the ratio is undefined, not zero), and ``tier`` — one of
+        :data:`EMPLOYER_KPI_TIERS`; an employer with no mandate in scope
+        (``mandated_amount == 0``) is tiered ``"بدون تکلیف"`` rather than
+        forced into a percentage tier it has no legal basis for.
+
+        ``Subsidiary`` employers are excluded from the returned rows:
+        ``get_all_employers_financials`` already rolls every Subsidiary's
+        mandate/deposit figures up into its Mother's row (the same
+        aggregation used everywhere else in the app), so a Subsidiary's own
+        standalone row would either double-count money already reflected
+        under its Mother or — far more often, since mandates are issued at
+        the Mother/Independent level in practice — show up as meaningless
+        ``"بدون تکلیف"`` noise in a list whose entire purpose is flagging
+        real legal non-compliance. No figures are lost by this filter; they
+        remain inside the Mother's aggregated row.
+    """
+    df_all = get_all_employers_financials(db)
+    columns = [
+        "employer_code",
+        "employer_name",
+        "employer_type",
+        "province",
+        "mandated_amount",
+        "deposit_amount",
+        "shortfall_amount",
+        "realization_pct",
+        "tier",
+    ]
+    if df_all.empty:
+        return pd.DataFrame(columns=columns)
+
+    df_scope = df_all[df_all["year"] >= since_jalali_year]
+    if fiscal_years:
+        df_scope = df_scope[df_scope["year"].isin(fiscal_years)]
+    if df_scope.empty:
+        return pd.DataFrame(columns=columns)
+
+    grouped = df_scope.groupby(
+        ["employer_code", "employer_name"], as_index=False
+    )[["mandated_amount", "deposit_amount"]].sum()
+
+    employer_rows = (
+        db.query(
+            Employer.classification_code,
+            Employer.employer_type,
+            Employer.province,
+        )
+        .filter(Employer.is_deleted == False)
+        .all()
+    )
+    employer_meta = pd.DataFrame(
+        employer_rows, columns=["employer_code", "employer_type", "province"]
+    )
+    grouped = grouped.merge(employer_meta, on="employer_code", how="left")
+
+    def _tier_for(mandated: float, realization_pct) -> str:
+        if mandated <= 0 or realization_pct is None:
+            return "بدون تکلیف"
+        if realization_pct < red_threshold:
+            return "قرمز"
+        if realization_pct < yellow_threshold:
+            return "زرد"
+        return "سبز"
+
+    grouped["realization_pct"] = grouped.apply(
+        lambda r: (r["deposit_amount"] / r["mandated_amount"] * 100)
+        if r["mandated_amount"] > 0
+        else None,
+        axis=1,
+    )
+    grouped["shortfall_amount"] = (
+        grouped["mandated_amount"] - grouped["deposit_amount"]
+    ).clip(lower=0)
+    grouped["tier"] = grouped.apply(
+        lambda r: _tier_for(r["mandated_amount"], r["realization_pct"]), axis=1
+    )
+
+    grouped = grouped[grouped["employer_type"] != "Subsidiary"]
+
+    return grouped[columns]
+
+
+def get_employer_contract_activity(
+    db: Session,
+    *,
+    since_jalali_year: int = 1402,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Per-employer, per-year contract-signing and payment activity for the
+    "عملکرد مشمولین" (Employer KPI) dashboard's contract-activity section:
+    how many contracts an employer concluded each year, the combined value
+    of those contracts, and how much was actually paid out (against any of
+    that employer's contracts) that year.
+
+    Mother employers are rolled up with their Subsidiaries (via
+    ``_codes_to_include``, the same helper ``get_all_employers_financials``
+    uses), matching the rollup convention used everywhere else in this
+    module; standalone ``Subsidiary`` rows are excluded from the result for
+    the same reason :func:`get_employer_deposit_performance` excludes them
+    — their contracts/payments are already counted under their Mother.
+
+    Two different "year" concepts intentionally share one ``year`` column:
+      - ``contracts_count``/``contracts_amount`` are grouped by the Jalali
+        year of ``Contract.contract_date`` (year the contract was signed).
+      - ``payments_amount`` is grouped by ``Payment.funding_year`` (budget
+        year), matching the ``funding_year`` convention used everywhere
+        else in this app (§4.1 of the Living Documentation) — **not**
+        necessarily the same contracts, since a contract signed in year Y
+        can go on receiving payments in later years. Callers must not treat
+        ``payments_amount`` as "how much of that year's contracts got
+        paid"; it is "how much cash moved against this employer's
+        contracts, budgeted to year Y" — a different, and not directly
+        comparable, question. This function deliberately does not compute
+        a payments/contracts ratio for this reason.
+
+    Contracts with a ``NULL`` ``contract_date`` and payments with a
+    ``NULL`` ``funding_year`` cannot be year-bucketed and are excluded,
+    with counts surfaced in the returned metadata (see
+    Docs/SATE_Living_Documentation.md §4.4 on known data-integrity gaps in
+    these fields).
+
+    Args:
+        db: Active SQLAlchemy database session.
+        since_jalali_year: Inclusive lower bound (Jalali year) applied
+            independently to the contract-signing-year axis and the
+            payment-funding-year axis (default 1402).
+
+    Returns:
+        A tuple of:
+          - A DataFrame, one row per ``(employer, year)`` combination with
+            any in-scope contract or payment activity, columns:
+            ``employer_code``, ``employer_name``, ``employer_type``,
+            ``year``, ``contracts_count``, ``contracts_amount``,
+            ``payments_amount``.
+          - A metadata dict: ``since_jalali_year``,
+            ``excluded_no_contract_date``, ``excluded_no_funding_year``.
+    """
+    employers = (
+        db.query(Employer)
+        .filter(Employer.status == "Active", Employer.is_deleted == False)
+        .all()
+    )
+
+    records = []
+    excluded_no_contract_date = 0
+    excluded_no_funding_year = 0
+
+    for employer in employers:
+        if employer.employer_type == "Subsidiary":
+            continue
+
+        codes = _codes_to_include(db, employer)
+
+        contract_rows = (
+            db.query(Contract.contract_date, Contract.total_amount)
+            .filter(Contract.employer_code.in_(codes), Contract.is_deleted == False)
+            .all()
+        )
+        contract_year_agg: dict[int, list] = {}
+        for contract_date, total_amount in contract_rows:
+            if contract_date is None:
+                excluded_no_contract_date += 1
+                continue
+            year = to_jalali_date(contract_date).year
+            if year < since_jalali_year:
+                continue
+            entry = contract_year_agg.setdefault(year, [0, 0.0])
+            entry[0] += 1
+            entry[1] += float(total_amount or 0)
+
+        payment_rows = (
+            db.query(Payment.funding_year, Payment.amount)
+            .join(Contract, Payment.contract_tracking_code == Contract.tracking_code)
+            .filter(
+                Contract.employer_code.in_(codes),
+                Payment.is_deleted == False,
+                Contract.is_deleted == False,
+            )
+            .all()
+        )
+        payment_year_agg: dict[int, float] = {}
+        for funding_year, amount in payment_rows:
+            if funding_year is None:
+                excluded_no_funding_year += 1
+                continue
+            if funding_year < since_jalali_year:
+                continue
+            payment_year_agg[funding_year] = payment_year_agg.get(
+                funding_year, 0.0
+            ) + float(amount or 0)
+
+        all_years = set(contract_year_agg) | set(payment_year_agg)
+        for year in all_years:
+            count, contracts_amount = contract_year_agg.get(year, (0, 0.0))
+            records.append(
+                {
+                    "employer_code": employer.classification_code,
+                    "employer_name": employer.name,
+                    "employer_type": employer.employer_type,
+                    "year": year,
+                    "contracts_count": count,
+                    "contracts_amount": contracts_amount,
+                    "payments_amount": payment_year_agg.get(year, 0.0),
+                }
+            )
+
+    columns = [
+        "employer_code",
+        "employer_name",
+        "employer_type",
+        "year",
+        "contracts_count",
+        "contracts_amount",
+        "payments_amount",
+    ]
+    df = pd.DataFrame.from_records(records, columns=columns)
+
+    meta = {
+        "since_jalali_year": since_jalali_year,
+        "excluded_no_contract_date": excluded_no_contract_date,
+        "excluded_no_funding_year": excluded_no_funding_year,
+    }
+    return df, meta
+
+
+def get_employer_university_fund_flow(
+    db: Session,
+    *,
+    since_jalali_year: int = 1402,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Per ``(employer, university)`` pair: contract count/amount and payments
+    actually received, for contracts concluded (``Contract.contract_date``,
+    Jalali year) from ``since_jalali_year`` onward.
+
+    This is the single base table for two different views in the
+    "رتبه‌بندی دانشگاه‌ها" dashboard — the university ranking (group this by
+    university) and the employer→university money-flow Sankey diagram (use
+    the pairs directly) — kept as one function so the two views can never
+    disagree with each other about the underlying numbers.
+
+    Unlike :func:`get_employer_deposit_performance` and
+    :func:`get_employer_contract_activity`, no Mother/Subsidiary roll-up is
+    applied here: only ``Mother`` and ``Independent`` employers may hold a
+    contract at all (§3.4's ``ALLOWED_CONTRACT_EMPLOYER_TYPES`` business
+    rule, enforced in ``api/v1/endpoints/contracts.py`` and
+    ``scripts/import_contracts_upsert.py``), so ``Contract.employer_code``
+    is already the correct top-level holding entity for current and future
+    data. Any pre-rule historical exception is surfaced as-is rather than
+    silently merged into a parent, since misattributing it would be worse
+    than showing it under its own (unusual) employer code.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        since_jalali_year: Inclusive lower bound (Jalali year) on
+            ``Contract.contract_date`` (default 1402).
+
+    Returns:
+        A tuple of:
+          - A DataFrame, one row per in-scope ``(employer, university)``
+            pair with columns: ``employer_code``, ``employer_name``,
+            ``university_id``, ``university_name``, ``province``,
+            ``university_type``, ``contracts_count``, ``contracts_amount``,
+            ``payments_amount``.
+          - A metadata dict: ``since_jalali_year``,
+            ``excluded_no_contract_date`` (contracts with a ``NULL``
+            ``contract_date``, which cannot be year-scoped and are excluded
+            entirely).
+    """
+    contract_rows = (
+        db.query(
+            Contract.tracking_code,
+            Contract.contract_date,
+            Contract.total_amount,
+            Contract.university_id,
+            Contract.employer_code,
+        )
+        .filter(Contract.is_deleted == False)
+        .all()
+    )
+
+    pair_agg: dict[tuple, dict] = {}
+    in_scope_codes = []
+    excluded_no_contract_date = 0
+
+    for tracking_code, contract_date, total_amount, university_id, employer_code in contract_rows:
+        if contract_date is None:
+            excluded_no_contract_date += 1
+            continue
+        year = to_jalali_date(contract_date).year
+        if year < since_jalali_year:
+            continue
+        in_scope_codes.append(tracking_code)
+        key = (employer_code, university_id)
+        entry = pair_agg.setdefault(key, {"contracts_count": 0, "contracts_amount": 0.0})
+        entry["contracts_count"] += 1
+        entry["contracts_amount"] += float(total_amount or 0)
+
+    payments_by_pair: dict[tuple, float] = {}
+    if in_scope_codes:
+        payment_rows = (
+            db.query(
+                Contract.employer_code,
+                Contract.university_id,
+                func.sum(Payment.amount),
+            )
+            .join(Payment, Payment.contract_tracking_code == Contract.tracking_code)
+            .filter(
+                Contract.tracking_code.in_(in_scope_codes),
+                Payment.is_deleted == False,
+            )
+            .group_by(Contract.employer_code, Contract.university_id)
+            .all()
+        )
+        payments_by_pair = {
+            (employer_code, university_id): float(amount or 0)
+            for employer_code, university_id, amount in payment_rows
+        }
+
+    employer_meta = {
+        e.classification_code: e
+        for e in db.query(Employer).filter(Employer.is_deleted == False).all()
+    }
+    university_meta = {
+        u.national_id: u
+        for u in db.query(University).filter(University.is_deleted == False).all()
+    }
+
+    records = []
+    for (employer_code, university_id), agg in pair_agg.items():
+        employer = employer_meta.get(employer_code)
+        university = university_meta.get(university_id)
+        records.append(
+            {
+                "employer_code": employer_code,
+                "employer_name": employer.name if employer else employer_code,
+                "university_id": university_id,
+                "university_name": university.name if university else university_id,
+                "province": university.province if university else None,
+                "university_type": university.university_type if university else None,
+                "contracts_count": agg["contracts_count"],
+                "contracts_amount": agg["contracts_amount"],
+                "payments_amount": payments_by_pair.get((employer_code, university_id), 0.0),
+            }
+        )
+
+    columns = [
+        "employer_code",
+        "employer_name",
+        "university_id",
+        "university_name",
+        "province",
+        "university_type",
+        "contracts_count",
+        "contracts_amount",
+        "payments_amount",
+    ]
+    df = pd.DataFrame.from_records(records, columns=columns)
+    meta = {
+        "since_jalali_year": since_jalali_year,
+        "excluded_no_contract_date": excluded_no_contract_date,
+    }
+    return df, meta

@@ -45,3 +45,47 @@ def parse_strict_jalali_iso(date_str: str) -> str:
         Gregorian date text in ISO ``YYYY-MM-DD`` format.
     """
     return parse_strict_jalali_date(date_str).isoformat()
+
+
+def to_jalali_date(gregorian_date: date) -> jdatetime.date:
+    """
+    Convert a Gregorian date to its exact Jalali equivalent.
+
+    The sanctioned reverse-direction counterpart to
+    ``parse_strict_jalali_date``/``parse_strict_jalali_iso`` above. Use this
+    instead of repeating the inline ``jdatetime.date.fromgregorian(...)``
+    conversion already present in ``dashboard/views/contract_edit_page.py``
+    — a second call site (the stagnant-contracts dashboard) needing the same
+    conversion is exactly the trigger the Living Documentation flagged for
+    promoting it here.
+
+    Args:
+        gregorian_date: A Gregorian ``datetime.date``. Callers must check
+            for ``None`` themselves (e.g. a nullable ``contract_date``)
+            before calling.
+
+    Returns:
+        The equivalent ``jdatetime.date``.
+
+    Raises:
+        TypeError: If ``gregorian_date`` is not a ``datetime.date``.
+    """
+    if not isinstance(gregorian_date, date):
+        raise TypeError("gregorian_date must be a datetime.date instance.")
+    return jdatetime.date.fromgregorian(date=gregorian_date)
+
+
+def format_jalali(gregorian_date: date | None, *, empty: str = "—") -> str:
+    """
+    Format a Gregorian date as a ``YYYY/MM/DD`` Jalali string for display.
+
+    Args:
+        gregorian_date: A Gregorian ``datetime.date``, or ``None``.
+        empty: Text returned when ``gregorian_date`` is ``None``.
+
+    Returns:
+        The Jalali-formatted date string, or ``empty`` if no date was given.
+    """
+    if gregorian_date is None:
+        return empty
+    return to_jalali_date(gregorian_date).strftime("%Y/%m/%d")

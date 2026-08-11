@@ -623,21 +623,38 @@ def main():
 
     # 2. Define the pages via the st.Page API.
     dash_page = st.Page(render_dashboard, title="داشبورد اصلی", icon="📊", default=True)
+    stagnant_contracts_page = st.Page(
+        "views/stagnant_contracts_dashboard.py",
+        title="وضعیت قراردادهای ثبت شده",
+        icon="🕒",
+    )
+    employer_kpi_page = st.Page(
+        "views/employer_kpi_dashboard.py",
+        title="عملکرد مشمولین",
+        icon="🚦",
+    )
+    university_ranking_page = st.Page(
+        "views/university_ranking_dashboard.py",
+        title="رتبه‌بندی دانشگاه‌ها",
+        icon="🎓",
+    )
     batch_payments_page = st.Page("views/batch_payments_page.py", title="ثبت دسته‌ای پرداخت", icon="📝")
     contract_entry_page = st.Page("views/contract_entry_page.py", title="ثبت قرارداد جدید", icon="📄")
     contract_edit_page = st.Page("views/contract_edit_page.py", title="جستجو و ویرایش قرارداد", icon="✏️")
     university_entry_page = st.Page("views/university_entry_page.py", title="ثبت موسسه مجری", icon="🏫")
     researcher_entry_page = st.Page("views/researcher_entry_page.py", title="ثبت اطلاعات فناور", icon="🧑‍🔬")
+    deposit_entry_page = st.Page("views/deposit_entry_page.py", title="ثبت واریزی شرکت‌ها", icon="💰")
 
     # 3. Group and initialize navigation.
     pg = st.navigation({
-        "داشبوردهای مدیریتی": [dash_page],
+        "داشبوردهای مدیریتی": [dash_page, stagnant_contracts_page, employer_kpi_page, university_ranking_page],
         "فرم‌های ورود اطلاعات": [
             batch_payments_page,
             contract_entry_page,
             contract_edit_page,
             university_entry_page,
             researcher_entry_page,
+            deposit_entry_page,
         ],
     })
 
