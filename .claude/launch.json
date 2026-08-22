@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "streamlit-dashboard",
-      "runtimeExecutable": "C:\\Users\\Payam\\miniconda3\\envs\\sate_env\\python.exe",
+      "runtimeExecutable": "C:\\Users\\pchin\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
       "runtimeArgs": ["-m", "streamlit", "run", "dashboard/app.py", "--server.headless=true"],
-      "port": 8501
+      "port": 8501,
+      "autoPort": true
     }
   ]
 }

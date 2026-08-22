@@ -24,11 +24,11 @@ python3 scripts/import_payments.py
 # Import import_credit_transfers
 python3 scripts/import_credit_transfers.py
 
-## Run Server
-python -m streamlit run dashboard/app.py
-python -m uvicorn main:app --port 8000
-
+## Run Server and Project
 python -m uvicorn main:app --reload --port 8000
+python -m streamlit run dashboard/app.py
+
+python -m uvicorn main:app --port 8000
 
 
 python -m streamlit run dashboard/app_v2.py

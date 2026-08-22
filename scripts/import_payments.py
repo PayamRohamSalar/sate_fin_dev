@@ -75,7 +75,22 @@ def main():
     
     print("   Creating fresh payments table...")
     Base.metadata.create_all(bind=engine, tables=[Payment.__table__])
-    
+
+    # payment_date/execution_year/payment_type are NOT NULL on the model, but
+    # this loader (unlike import_payments_upsert.py) doesn't populate them and
+    # most historical rows have no notification_date to derive them from —
+    # same situation add_payment_missing_columns.py already resolved for the
+    # live table; apply the same relaxation to a freshly created one.
+    with engine.begin() as conn:
+        conn.execute(text(
+            """
+            ALTER TABLE payments
+            ALTER COLUMN payment_date DROP NOT NULL,
+            ALTER COLUMN execution_year DROP NOT NULL,
+            ALTER COLUMN payment_type DROP NOT NULL
+            """
+        ))
+
     # Fetch valid contract tracking codes
     print("\n3. Fetching valid contract tracking codes...")
     session = Session(bind=engine)

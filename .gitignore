@@ -41,6 +41,9 @@ env/
 # PostgreSQL data directory
 .pgdata/
 
+# Database dumps (full production data - synced via OneDrive, never git)
+data/Archive/db_backups/
+
 # Temporary files
 /tmp/
 *.tmp
