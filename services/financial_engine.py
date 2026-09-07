@@ -11,6 +11,7 @@ from models.contract import Contract
 from models.deposits import AnnualMandate, DepositReceipt
 from models.employer import Employer
 from models.payment import Payment
+from models.researchers import Researcher
 from models.transfer import CreditTransfer
 from models.trustee_payments import TrusteePayment
 from models.university import University
@@ -1241,6 +1242,132 @@ def get_employer_university_fund_flow(
         "university_name",
         "province",
         "university_type",
+        "contracts_count",
+        "contracts_amount",
+        "payments_amount",
+    ]
+    df = pd.DataFrame.from_records(records, columns=columns)
+    meta = {
+        "since_jalali_year": since_jalali_year,
+        "excluded_no_contract_date": excluded_no_contract_date,
+    }
+    return df, meta
+
+
+def get_researcher_contract_activity(
+    db: Session,
+    *,
+    since_jalali_year: int = 1402,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Per researcher (طرح‌مجری/فناور): contract count/amount and payments
+    actually received, for contracts concluded (``Contract.contract_date``,
+    Jalali year) from ``since_jalali_year`` onward.
+
+    Mirrors :func:`get_employer_university_fund_flow` (same scope rule --
+    is_deleted rows and NULL-``contract_date`` contracts excluded, same
+    Jalali-year cutoff) but aggregated by ``Contract.researcher_id`` instead
+    of ``university_id``, for the "سمت عرضه" (supply-side) researcher
+    ranking view. Kept as a separate function rather than reusing the same
+    row set as the university view because the two group by a different key
+    and a researcher's affiliated university/academic rank comes from
+    ``models.researchers``, not ``models.university``.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        since_jalali_year: Inclusive lower bound (Jalali year) on
+            ``Contract.contract_date`` (default 1402).
+
+    Returns:
+        A tuple of:
+          - A DataFrame, one row per in-scope researcher with columns:
+            ``researcher_national_code``, ``researcher_name``,
+            ``academic_rank``, ``researcher_type``, ``university_id``,
+            ``university_name``, ``province``, ``contracts_count``,
+            ``contracts_amount``, ``payments_amount``.
+          - A metadata dict: ``since_jalali_year``,
+            ``excluded_no_contract_date``.
+    """
+    contract_rows = (
+        db.query(
+            Contract.tracking_code,
+            Contract.contract_date,
+            Contract.total_amount,
+            Contract.researcher_id,
+        )
+        .filter(Contract.is_deleted == False)
+        .all()
+    )
+
+    researcher_agg: dict[str, dict] = {}
+    in_scope_codes = []
+    excluded_no_contract_date = 0
+
+    for tracking_code, contract_date, total_amount, researcher_id in contract_rows:
+        if contract_date is None:
+            excluded_no_contract_date += 1
+            continue
+        year = to_jalali_date(contract_date).year
+        if year < since_jalali_year:
+            continue
+        in_scope_codes.append(tracking_code)
+        entry = researcher_agg.setdefault(researcher_id, {"contracts_count": 0, "contracts_amount": 0.0})
+        entry["contracts_count"] += 1
+        entry["contracts_amount"] += float(total_amount or 0)
+
+    payments_by_researcher: dict[str, float] = {}
+    if in_scope_codes:
+        payment_rows = (
+            db.query(
+                Contract.researcher_id,
+                func.sum(Payment.amount),
+            )
+            .join(Payment, Payment.contract_tracking_code == Contract.tracking_code)
+            .filter(
+                Contract.tracking_code.in_(in_scope_codes),
+                Payment.is_deleted == False,
+            )
+            .group_by(Contract.researcher_id)
+            .all()
+        )
+        payments_by_researcher = {researcher_id: float(amount or 0) for researcher_id, amount in payment_rows}
+
+    researcher_meta = {
+        r.national_code: r
+        for r in db.query(Researcher).filter(Researcher.is_deleted == False).all()
+    }
+    university_meta = {
+        u.national_id: u
+        for u in db.query(University).filter(University.is_deleted == False).all()
+    }
+
+    records = []
+    for researcher_id, agg in researcher_agg.items():
+        researcher = researcher_meta.get(researcher_id)
+        university = university_meta.get(researcher.university_id) if researcher else None
+        records.append(
+            {
+                "researcher_national_code": researcher_id,
+                "researcher_name": researcher.full_name if researcher else researcher_id,
+                "academic_rank": researcher.academic_rank if researcher else None,
+                "researcher_type": researcher.researcher_type if researcher else None,
+                "university_id": researcher.university_id if researcher else None,
+                "university_name": university.name if university else None,
+                "province": university.province if university else None,
+                "contracts_count": agg["contracts_count"],
+                "contracts_amount": agg["contracts_amount"],
+                "payments_amount": payments_by_researcher.get(researcher_id, 0.0),
+            }
+        )
+
+    columns = [
+        "researcher_national_code",
+        "researcher_name",
+        "academic_rank",
+        "researcher_type",
+        "university_id",
+        "university_name",
+        "province",
         "contracts_count",
         "contracts_amount",
         "payments_amount",

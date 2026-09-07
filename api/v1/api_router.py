@@ -5,6 +5,8 @@ from api.v1.endpoints import (
     deposits,
     employers,
     payments,
+    transfers,
+    trustee_payments,
     universities,
     researchers,
 )
@@ -19,5 +21,7 @@ api_router.include_router(contracts.router)
 api_router.include_router(universities.router)
 api_router.include_router(researchers.router)
 api_router.include_router(deposits.router)
+api_router.include_router(trustee_payments.router)
+api_router.include_router(transfers.router)
 
 # Future routers can be added here as the system grows:

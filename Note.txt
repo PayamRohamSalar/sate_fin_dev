@@ -27,9 +27,12 @@ python3 scripts/import_credit_transfers.py
 ## Run Server and Project
 python -m uvicorn main:app --reload --port 8000
 python -m streamlit run dashboard/app.py
-
+http://localhost:8501/
 python -m uvicorn main:app --port 8000
 
+## BackUp & Restore database
+python scripts/db_backup.py
+python scripts/db_restore_from_backup.py
 
 python -m streamlit run dashboard/app_v2.py
 

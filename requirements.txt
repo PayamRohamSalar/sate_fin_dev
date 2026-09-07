@@ -8,3 +8,6 @@ streamlit
 plotly
 fastapi
 uvicorn
+matplotlib
+arabic-reshaper
+python-bidi
