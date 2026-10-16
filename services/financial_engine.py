@@ -321,6 +321,372 @@ def calculate_real_balance(
     return float(real_balance)
 
 
+# Every fiscal year folded into the combined pool -- see
+# ``calculate_combined_pool_balance`` below. 1405 is grouped with 1404 (not
+# its own bucket) because the Fund's own ledger treats 1405 disbursements as
+# spending from the 1404 pool (see scripts/reconcile_atf_audit.py's
+# COLS_EXPENSE_1405_FROM_1404 for the verified identity behind this), and
+# the DB mirrors the same grouping for deposits, payments and transfers.
+TRANSFER_POOL_YEARS = (1402, 1404, 1405)
+
+
+def calculate_gross_pool_balance(db: Session, employer_code: str) -> float:
+    """
+    Combined 1402+1404(+1405) balance **before any credit transfer is
+    netted in** -- deposits minus expense only.
+
+    Added 2026-10-12 for the موسسه تحقیقات سیاست علمی کشور (128342) funding
+    report: that institute acts purely as a broker/کارگزار with no mandate
+    of its own, so every one of its contracts is funded entirely by credit
+    transfers (اصلاحیه تبصره ۲) out of OTHER employers' spare balance. To
+    show "how much headroom did employer X have before this transfer, and
+    what's left after", you need both this gross figure and
+    :func:`calculate_combined_pool_balance` (the net-of-transfers figure)
+    side by side -- this function is the "before" half.
+
+    Same Mother/Subsidiary roll-up and :data:`TRANSFER_POOL_YEARS` scope as
+    :func:`calculate_combined_pool_balance`; the only difference is the
+    transfer terms are left out.
+    """
+    years = list(TRANSFER_POOL_YEARS)
+
+    total_deposits = db.query(func.sum(DepositReceipt.deposit_amount)).join(
+        Employer, DepositReceipt.employer_code == Employer.classification_code
+    ).filter(
+        or_(Employer.classification_code == employer_code, Employer.parent_code == employer_code),
+        DepositReceipt.fiscal_year.in_(years),
+        DepositReceipt.is_deleted == False, Employer.is_deleted == False,  # noqa: E712
+    ).scalar() or Decimal("0.0")
+
+    total_payments = db.query(func.sum(Payment.amount)).join(
+        Contract, Payment.contract_tracking_code == Contract.tracking_code
+    ).filter(
+        Contract.employer_code == employer_code,
+        Payment.funding_year.in_(years),
+        Payment.is_deleted == False, Payment.status.in_(("Final", "Draft")),
+        Contract.is_deleted == False,  # noqa: E712
+    ).scalar() or Decimal("0.0")
+
+    return float(total_deposits - total_payments)
+
+
+def calculate_combined_pool_balance(
+    db: Session,
+    employer_code: str,
+    *,
+    lock_employer: bool = False,
+) -> float:
+    """
+    Balance available to an employer for a credit transfer (انتقال اعتبار),
+    and the authoritative "current position" figure used wherever a single
+    across-years balance is needed (e.g. the commitment/free-balance report).
+
+    Added 2026-09-16 at Payam's request, after a real incident: our 1402
+    deposit figure for an employer was overstated (a data error, since
+    corrected -- see ``scripts/fix_deposits_1402.py``), which meant a real,
+    legitimate transfer recorded against ``fiscal_year=1402`` alone looked
+    like it exceeded that single year's balance once the deposit was fixed,
+    even though the employer's TRUE combined position covered it easily.
+    Rather than keep re-hitting this whenever one year's figures are
+    revised, transfers are now checked against the **combined** balance
+    across :data:`TRANSFER_POOL_YEARS` instead of a single year. This does
+    not change ``calculate_real_balance`` itself, which other views
+    (per-year balance sheets, payment validation) still use as single-year.
+
+    Bug found and fixed 2026-10-04: this used to sum
+    ``calculate_real_balance(db, employer_code, 1402)`` +
+    ``calculate_real_balance(db, employer_code, 1404)``, but that function
+    filters each component on an *exact* ``fiscal_year``/``funding_year``
+    match -- so every deposit, payment, and credit transfer tagged 1405
+    (real money: ~88,017M deposits and ~1,000M payments system-wide as of
+    2026-10-04) was silently excluded from the combined balance, including
+    from the transfer-validation check this function backs. Rewritten to
+    query each component directly across all of :data:`TRANSFER_POOL_YEARS`
+    at once (same Mother/Subsidiary roll-up as ``calculate_real_balance``),
+    so 1405 activity is no longer dropped.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        employer_code: Employer classification code (the transfer's source).
+        lock_employer: When true, acquire a ``FOR UPDATE`` lock on the
+            active employer row first; the caller must keep the transaction
+            open through the related write (same contract as
+            ``calculate_real_balance``).
+
+    Returns:
+        The combined balance across :data:`TRANSFER_POOL_YEARS`, in base Rials.
+
+    Raises:
+        ValueError: If ``lock_employer`` is true and the employer is missing
+            or soft-deleted.
+    """
+    if lock_employer and employer_code not in lock_active_employers(db, [employer_code]):
+        raise ValueError(
+            f"Employer with classification code '{employer_code}' not found or has been deleted."
+        )
+
+    years = list(TRANSFER_POOL_YEARS)
+
+    total_deposits = db.query(func.sum(DepositReceipt.deposit_amount)).join(
+        Employer, DepositReceipt.employer_code == Employer.classification_code
+    ).filter(
+        or_(Employer.classification_code == employer_code, Employer.parent_code == employer_code),
+        DepositReceipt.fiscal_year.in_(years),
+        DepositReceipt.is_deleted == False, Employer.is_deleted == False,  # noqa: E712
+    ).scalar() or Decimal("0.0")
+
+    total_payments = db.query(func.sum(Payment.amount)).join(
+        Contract, Payment.contract_tracking_code == Contract.tracking_code
+    ).filter(
+        Contract.employer_code == employer_code,
+        Payment.funding_year.in_(years),
+        Payment.is_deleted == False, Payment.status.in_(("Final", "Draft")),
+        Contract.is_deleted == False,  # noqa: E712
+    ).scalar() or Decimal("0.0")
+
+    transfers_out = db.query(func.sum(CreditTransfer.amount)).join(
+        Employer, CreditTransfer.source_employer_code == Employer.classification_code
+    ).filter(
+        or_(Employer.classification_code == employer_code, Employer.parent_code == employer_code),
+        CreditTransfer.fiscal_year.in_(years),
+        CreditTransfer.is_deleted == False, Employer.is_deleted == False,  # noqa: E712
+    ).scalar() or Decimal("0.0")
+
+    transfers_in = db.query(func.sum(CreditTransfer.amount)).filter(
+        CreditTransfer.destination_employer_code == employer_code,
+        CreditTransfer.fiscal_year.in_(years),
+        CreditTransfer.is_deleted == False,  # noqa: E712
+    ).scalar() or Decimal("0.0")
+
+    return float(total_deposits + transfers_in - transfers_out - total_payments)
+
+
+def get_holding_group_financials(
+    db: Session,
+    holding_company_code: str,
+    *,
+    since_jalali_year: int = 1402,
+    include_group_total: bool = True,
+) -> pd.DataFrame:
+    """
+    Per-(member, year) financial detail for a reporting-only holding group.
+
+    Added 2026-09-27 at Payam's request: some employers (e.g. هر یک از ۳۱
+    شرکت آب منطقه‌ای استانی) are fully financially independent -- they hold
+    their own contracts and have their own deposit/expense/balance -- but
+    are organizationally grouped under a holding company (e.g. شرکت
+    مادرتخصصی مدیریت منابع آب ایران) that wants to see all of them side by
+    side. This is deliberately **not** the existing Mother/Subsidiary
+    roll-up (``parent_code`` + ``calculate_real_balance``'s merging of
+    Subsidiary employers into their Mother for balance purposes): every
+    member here keeps its own numbers, nothing is merged or netted across
+    employers. See ``Employer.holding_company_code``'s docstring for the
+    full rationale.
+
+    Members are every employer with ``holding_company_code ==
+    holding_company_code``, plus the holding company itself (Payam's
+    explicit requirement: "وقتی مدیریت منابع آب گزارش زیرمجموعه‌هایش را
+    می‌خواهد، وضعیت خودش را نیز در گزارش به او می‌دهیم").
+
+    Args:
+        db: Active SQLAlchemy database session.
+        holding_company_code: The holding company's classification_code.
+        since_jalali_year: Inclusive lower bound (Jalali year) on every
+            metric -- contracts by ``Contract.contract_date``'s Jalali
+            year, mandate/deposit/expense by their own ``fiscal_year``/
+            ``funding_year`` (default 1402).
+        include_group_total: When true (default), append one synthetic
+            "جمع گروه" row per year summing every member (Payam confirmed
+            he wants both the detail and this total).
+
+    Returns:
+        One row per (employer_code, year) [plus one "جمع گروه" row per
+        year if requested], columns: ``employer_code``, ``employer_name``,
+        ``is_holding_company``, ``year``, ``contracts_count``,
+        ``contracts_amount``, ``mandated_amount``, ``deposit_amount``,
+        ``expense_amount``. Sorted by year, then holding company first,
+        then member name.
+    """
+    members = (
+        db.query(Employer)
+        .filter(
+            or_(
+                Employer.classification_code == holding_company_code,
+                Employer.holding_company_code == holding_company_code,
+            ),
+            Employer.is_deleted == False,  # noqa: E712
+        )
+        .all()
+    )
+    member_codes = [m.classification_code for m in members]
+    member_names = {m.classification_code: m.name for m in members}
+    return _group_member_financials(
+        db, member_codes, member_names, since_jalali_year=since_jalali_year,
+        include_group_total=include_group_total, highlight_code=holding_company_code,
+    )
+
+
+def get_ministry_group_financials(
+    db: Session,
+    upper_organization: str,
+    *,
+    since_jalali_year: int = 1402,
+    include_group_total: bool = True,
+) -> pd.DataFrame:
+    """
+    Per-(employer, year) financial detail for every employer under one
+    executive body/ministry (``Employer.upper_organization``), for the
+    "عملکرد دستگاهی" view (e.g. "شرکت‌های تابعه وزارت نیرو").
+
+    Unlike :func:`get_holding_group_financials`, no new column is needed
+    here -- ``upper_organization`` already exists and is populated on every
+    employer, so this simply groups by it. Per Payam's explicit choice
+    (2026-09-27): Mother AND Subsidiary employers under this ministry are
+    both listed as their own rows (a Subsidiary's real, standalone
+    deposit/contract activity is visible here even though it's rolled into
+    its Mother's balance everywhere else in the system) -- this view is
+    purely descriptive, not a balance calculation, so no double-counting
+    concern applies.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        upper_organization: Exact ``Employer.upper_organization`` value to
+            filter on (e.g. "وزارت نیرو").
+        since_jalali_year: Same semantics as
+            :func:`get_holding_group_financials`.
+        include_group_total: Same semantics as
+            :func:`get_holding_group_financials`.
+
+    Returns:
+        Same shape as :func:`get_holding_group_financials`, with
+        ``is_holding_company`` always ``False`` (no single employer is
+        singled out for a ministry-wide view).
+    """
+    members = (
+        db.query(Employer)
+        .filter(Employer.upper_organization == upper_organization, Employer.is_deleted == False)  # noqa: E712
+        .all()
+    )
+    member_codes = [m.classification_code for m in members]
+    member_names = {m.classification_code: m.name for m in members}
+    return _group_member_financials(
+        db, member_codes, member_names, since_jalali_year=since_jalali_year,
+        include_group_total=include_group_total, highlight_code=None,
+    )
+
+
+def _group_member_financials(
+    db: Session,
+    member_codes: list[str],
+    member_names: dict[str, str],
+    *,
+    since_jalali_year: int,
+    include_group_total: bool,
+    highlight_code: str | None,
+) -> pd.DataFrame:
+    """Shared per-(employer, year) aggregation behind
+    :func:`get_holding_group_financials` and
+    :func:`get_ministry_group_financials` -- see those for the business
+    context. Every member keeps its own numbers; nothing is merged or
+    netted across employers (deliberately not the Mother/Subsidiary
+    financial roll-up)."""
+    contract_rows = (
+        db.query(Contract.employer_code, Contract.contract_date, Contract.total_amount)
+        .filter(Contract.employer_code.in_(member_codes), Contract.is_deleted == False)  # noqa: E712
+        .all()
+    )
+    mandate_rows = (
+        db.query(AnnualMandate.employer_code, AnnualMandate.fiscal_year, AnnualMandate.mandated_amount)
+        .filter(AnnualMandate.employer_code.in_(member_codes), AnnualMandate.is_deleted == False)  # noqa: E712
+        .all()
+    )
+    deposit_rows = (
+        db.query(DepositReceipt.employer_code, DepositReceipt.fiscal_year, DepositReceipt.deposit_amount)
+        .filter(DepositReceipt.employer_code.in_(member_codes), DepositReceipt.is_deleted == False)  # noqa: E712
+        .all()
+    )
+    expense_rows = (
+        db.query(Contract.employer_code, Payment.funding_year, Payment.amount)
+        .join(Payment, Payment.contract_tracking_code == Contract.tracking_code)
+        .filter(
+            Contract.employer_code.in_(member_codes),
+            Payment.is_deleted == False, Contract.is_deleted == False,  # noqa: E712
+        )
+        .all()
+    )
+
+    cell: dict[tuple[str, int], dict] = {}
+
+    def bucket(code: str, year: int) -> dict:
+        return cell.setdefault(
+            (code, year),
+            {"contracts_count": 0, "contracts_amount": 0.0, "mandated_amount": 0.0,
+             "deposit_amount": 0.0, "expense_amount": 0.0},
+        )
+
+    for code, contract_date, total_amount in contract_rows:
+        if contract_date is None:
+            continue
+        year = to_jalali_date(contract_date).year
+        if year < since_jalali_year:
+            continue
+        b = bucket(code, year)
+        b["contracts_count"] += 1
+        b["contracts_amount"] += float(total_amount or 0)
+
+    for code, year, amount in mandate_rows:
+        if year < since_jalali_year:
+            continue
+        bucket(code, year)["mandated_amount"] += float(amount or 0)
+
+    for code, year, amount in deposit_rows:
+        if year < since_jalali_year:
+            continue
+        bucket(code, year)["deposit_amount"] += float(amount or 0)
+
+    for code, year, amount in expense_rows:
+        if year is None or year < since_jalali_year:
+            continue
+        bucket(code, year)["expense_amount"] += float(amount or 0)
+
+    years = sorted({year for (_, year) in cell})
+    records = []
+    for year in years:
+        for code in member_codes:
+            b = cell.get((code, year))
+            if b is None:
+                continue
+            records.append({
+                "employer_code": code,
+                "employer_name": member_names[code],
+                "is_holding_company": code == highlight_code,
+                "year": year,
+                **b,
+            })
+        if include_group_total:
+            total = {"contracts_count": 0, "contracts_amount": 0.0, "mandated_amount": 0.0,
+                     "deposit_amount": 0.0, "expense_amount": 0.0}
+            for code in member_codes:
+                b = cell.get((code, year))
+                if b is None:
+                    continue
+                for k in total:
+                    total[k] += b[k]
+            records.append({
+                "employer_code": None,
+                "employer_name": "جمع گروه",
+                "is_holding_company": False,
+                "year": year,
+                **total,
+            })
+
+    columns = [
+        "employer_code", "employer_name", "is_holding_company", "year",
+        "contracts_count", "contracts_amount", "mandated_amount", "deposit_amount", "expense_amount",
+    ]
+    return pd.DataFrame.from_records(records, columns=columns)
+
+
 def get_mandated_amount(db: Session, employer_code: str, fiscal_year: int) -> float:
     """
     Retrieves the mandated budget amount (اعتبار تکلیفی) for a specific employer.
@@ -1378,3 +1744,180 @@ def get_researcher_contract_activity(
         "excluded_no_contract_date": excluded_no_contract_date,
     }
     return df, meta
+
+
+def get_mandate_by_employer_raw(
+    db: Session, *, fiscal_years: Sequence[int] | None = None
+) -> pd.DataFrame:
+    """
+    One row per employer with any mandate in ``fiscal_years``: its
+    ``mandated_amount``/``deposit_amount`` summed across those years,
+    alongside ``employer_type`` and ``province`` -- deliberately **not**
+    rolled up (unlike :func:`get_all_employers_financials` /
+    :func:`get_employer_deposit_performance`, where a Mother's row absorbs
+    its Subsidiaries' figures).
+
+    Geographic and structural breakdowns ("توزیع اعتبار تکلیفی به تفکیک
+    استان", "سهم شرکت‌های مادر در مقابل زیرمجموعه") ask what each *legal
+    entity* was mandated on its own -- a Subsidiary showing up under its own
+    name/province/type is the whole point here, not something to collapse
+    into its Mother. Reusing the rolled-up view would make every
+    ``Subsidiary`` bucket read as ~0, hiding exactly the split this is
+    meant to show.
+
+    Args:
+        db: Active SQLAlchemy database session.
+        fiscal_years: Fiscal (Persian-calendar) years to sum over. Defaults
+            to just the most recent year with any mandate in the table
+            (a single-year snapshot, not all-time) -- pass an explicit list
+            for a multi-year cumulative view.
+
+    Returns:
+        A DataFrame with columns: ``employer_code``, ``employer_name``,
+        ``employer_type``, ``province``, ``mandated_amount``,
+        ``deposit_amount`` (0 when the employer has no deposit receipts on
+        file for the selected years).
+    """
+    if fiscal_years is None:
+        latest = db.query(func.max(AnnualMandate.fiscal_year)).filter(
+            AnnualMandate.is_deleted == False
+        ).scalar()
+        fiscal_years = [latest] if latest is not None else []
+
+    mandate_rows = (
+        db.query(
+            Employer.classification_code,
+            Employer.name,
+            Employer.employer_type,
+            Employer.province,
+            func.sum(AnnualMandate.mandated_amount),
+        )
+        .select_from(AnnualMandate)
+        .join(Employer, AnnualMandate.employer_code == Employer.classification_code)
+        .filter(
+            AnnualMandate.is_deleted == False,
+            Employer.is_deleted == False,
+            AnnualMandate.fiscal_year.in_(fiscal_years),
+        )
+        .group_by(
+            Employer.classification_code, Employer.name,
+            Employer.employer_type, Employer.province,
+        )
+        .all()
+    )
+
+    deposit_by_employer = dict(
+        db.query(DepositReceipt.employer_code, func.sum(DepositReceipt.deposit_amount))
+        .filter(
+            DepositReceipt.is_deleted == False,
+            DepositReceipt.fiscal_year.in_(fiscal_years),
+        )
+        .group_by(DepositReceipt.employer_code)
+        .all()
+    )
+
+    records = [
+        {
+            "employer_code": code,
+            "employer_name": name,
+            "employer_type": employer_type,
+            "province": province,
+            "mandated_amount": float(mandated_amount or 0),
+            "deposit_amount": float(deposit_by_employer.get(code, 0) or 0),
+        }
+        for code, name, employer_type, province, mandated_amount in mandate_rows
+    ]
+    columns = [
+        "employer_code", "employer_name", "employer_type", "province",
+        "mandated_amount", "deposit_amount",
+    ]
+    return pd.DataFrame.from_records(records, columns=columns)
+
+
+def get_combined_pool_breakdown(db: Session) -> pd.DataFrame:
+    """Bulk (one row per roll-up employer) version of
+    :func:`calculate_gross_pool_balance` / :func:`calculate_combined_pool_balance`.
+
+    Added 2026-10-13 for the Secretariat-vs-Fund balance sheet, which needs the
+    combined position of ~250 employers at once (calling the single-employer
+    functions would be 4 queries x N). The arithmetic is identical -- same
+    :data:`TRANSFER_POOL_YEARS`, same Subsidiary -> parent roll-up for
+    deposits and transfers-out, payments by the contract's own employer,
+    transfers-in by destination -- and it was checked (2026-10-13) to agree
+    with the single-employer functions for every employer.
+
+    Index key ``employer_code`` is the *roll-up* employer: a Subsidiary's
+    deposits and transfers-out are attributed to its ``parent_code``.
+
+    Columns (base Rials): ``deposit_1402``, ``deposit_1404_1405``,
+    ``deposit_total``, ``expense_total``, ``transfers_in``, ``transfers_out``,
+    ``gross_balance`` (deposits - expense), ``combined_balance`` (after
+    transfers).
+    """
+    years = list(TRANSFER_POOL_YEARS)
+
+    employers = db.query(
+        Employer.classification_code, Employer.parent_code
+    ).filter(Employer.is_deleted == False).all()  # noqa: E712
+    rollup = {code: (parent or code) for code, parent in employers}
+
+    def series(rows) -> pd.Series:
+        out: dict[str, float] = {}
+        for key, amount in rows:
+            root = rollup.get(key, key)
+            out[root] = out.get(root, 0.0) + float(amount or 0)
+        return pd.Series(out, dtype=float)
+
+    def deposits_for(year_filter) -> pd.Series:
+        return series(
+            db.query(DepositReceipt.employer_code, func.sum(DepositReceipt.deposit_amount))
+            .filter(
+                DepositReceipt.is_deleted == False,  # noqa: E712
+                year_filter(DepositReceipt.fiscal_year),
+            )
+            .group_by(DepositReceipt.employer_code)
+            .all()
+        )
+
+    dep_1402 = deposits_for(lambda col: col == 1402)
+    dep_1404_5 = deposits_for(lambda col: col.in_((1404, 1405)))
+    dep_total = deposits_for(lambda col: col.in_(years))
+
+    expense = pd.Series(dict(
+        db.query(Contract.employer_code, func.sum(Payment.amount))
+        .join(Contract, Payment.contract_tracking_code == Contract.tracking_code)
+        .filter(
+            Payment.is_deleted == False,  # noqa: E712
+            Payment.status.in_(("Final", "Draft")),
+            Contract.is_deleted == False,  # noqa: E712
+            Payment.funding_year.in_(years),
+        )
+        .group_by(Contract.employer_code)
+        .all()
+    ), dtype=float).astype(float)
+
+    transfers_out = series(
+        db.query(CreditTransfer.source_employer_code, func.sum(CreditTransfer.amount))
+        .filter(CreditTransfer.is_deleted == False, CreditTransfer.fiscal_year.in_(years))  # noqa: E712
+        .group_by(CreditTransfer.source_employer_code)
+        .all()
+    )
+    transfers_in = pd.Series(dict(
+        db.query(CreditTransfer.destination_employer_code, func.sum(CreditTransfer.amount))
+        .filter(CreditTransfer.is_deleted == False, CreditTransfer.fiscal_year.in_(years))  # noqa: E712
+        .group_by(CreditTransfer.destination_employer_code)
+        .all()
+    ), dtype=float).astype(float)
+
+    frame = pd.DataFrame({
+        "deposit_1402": dep_1402,
+        "deposit_1404_1405": dep_1404_5,
+        "deposit_total": dep_total,
+        "expense_total": expense,
+        "transfers_in": transfers_in,
+        "transfers_out": transfers_out,
+    }).fillna(0.0)
+    frame["gross_balance"] = frame["deposit_total"] - frame["expense_total"]
+    frame["combined_balance"] = frame["gross_balance"] + frame["transfers_in"] - frame["transfers_out"]
+    frame.index.name = "employer_code"
+    return frame

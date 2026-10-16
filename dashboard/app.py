@@ -17,7 +17,8 @@ from models.deposits import AnnualMandate, DepositReceipt
 from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
-from services.financial_engine import get_all_employers_financials
+from fund_balance_tab import render_fund_balance_tab
+from services.financial_engine import calculate_combined_pool_balance, get_all_employers_financials
 
 FINANCIAL_COLUMNS = [
     "mandated_amount",
@@ -432,6 +433,19 @@ def render_tab1(db: Session, employers):
 
     df = add_adjusted_columns(convert_financials_to_millions(df))
 
+    # Combined 1402+1404 pool balance (2026-09-16, at Payam's request):
+    # credit transfers are no longer netted into a single year's balance
+    # (see calculate_combined_pool_balance's docstring for why -- a data
+    # error in one year's figures could make a legitimate transfer look
+    # like it overdrew that year alone). Shown here alongside the existing
+    # per-year cards, which are unchanged.
+    combined_balance = calculate_combined_pool_balance(db, selected_code)
+    st.metric(
+        "💰 مانده تجمیعی ۱۴۰۲+۱۴۰۴ (پس از انتقال اعتبار)",
+        f"{combined_balance / 1_000_000:,.0f} میلیون ریال",
+        help="واریزی منهای هزینه هر دو سال، به‌علاوهٔ خالص انتقال اعتبار ورودی/خروجی این مشمول -- انتقال اعتبار از محل مجموع این دو سال کسر می‌شود، نه یک سال مشخص.",
+    )
+
     st.subheader("🔑 شاخص‌های کلیدی")
     million_rials_label()
     render_yearly_kpi_cards(df)
@@ -588,11 +602,17 @@ def render_dashboard():
             st.warning("هیچ مشمولی فعال در سیستم یافت نشد.")
             return
 
-        tab1, tab2 = st.tabs(["ترازنامه مشمولین", "نمای کلان - Executive Summary"])
+        tab1, tab2, tab3 = st.tabs([
+            "ترازنامه مشمولین",
+            "نمای کلان - Executive Summary",
+            "ترازنامه دبیرخانه و صندوق",
+        ])
         with tab1:
             render_tab1(db, employers)
         with tab2:
             render_tab2(db)
+        with tab3:
+            render_fund_balance_tab(db)
     finally:
         db.close()
 
@@ -643,6 +663,16 @@ def main():
         title="رتبه‌بندی پژوهشگران",
         icon="🧑‍🔬",
     )
+    demand_proposal_page = st.Page(
+        "views/demand_proposal_dashboard.py",
+        title="تقاضا و پیشنهاده",
+        icon="📮",
+    )
+    holding_group_page = st.Page(
+        "views/holding_group_dashboard.py",
+        title="عملکرد گروه‌های سازمانی",
+        icon="🏢",
+    )
     batch_payments_page = st.Page("views/batch_payments_page.py", title="ثبت دسته‌ای پرداخت", icon="📝")
     contract_entry_page = st.Page("views/contract_entry_page.py", title="ثبت قرارداد جدید", icon="📄")
     contract_edit_page = st.Page("views/contract_edit_page.py", title="جستجو و ویرایش قرارداد", icon="✏️")
@@ -660,7 +690,8 @@ def main():
     pg = st.navigation({
         "داشبوردهای مدیریتی": [
             dash_page, stagnant_contracts_page, employer_kpi_page,
-            university_ranking_page, researcher_ranking_page,
+            university_ranking_page, researcher_ranking_page, demand_proposal_page,
+            holding_group_page,
         ],
         "فرم‌های ورود اطلاعات": [
             batch_payments_page,

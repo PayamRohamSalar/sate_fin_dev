@@ -11,3 +11,6 @@ uvicorn
 matplotlib
 arabic-reshaper
 python-bidi
+requests
+python-multipart
+xlsxwriter

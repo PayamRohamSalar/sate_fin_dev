@@ -25,7 +25,22 @@ class Employer(SoftDeleteMixin, Base):
     parent_code : str or None
         Classification code of the parent (mother) employer. Self-referential
         foreign key to ``employers.classification_code``; ``None`` for mother
-        or independent employers.
+        or independent employers. Drives real financial roll-up everywhere
+        (``calculate_real_balance``, ``get_all_employers_financials``, etc.):
+        a Subsidiary may not hold its own contract, so its deposits/expenses
+        are merged into its parent for every balance calculation.
+    holding_company_code : str or None
+        Classification code of the organizational holding/parent company
+        this employer's reporting is grouped under (e.g. a fully independent
+        regional water company reported under its ministry-level holding).
+        Self-referential FK to ``employers.classification_code``; ``None``
+        if this employer isn't part of a reporting group. **Reporting-only
+        -- added 2026-09-27.** Unlike ``parent_code``, this never affects any
+        financial roll-up: an employer with a ``holding_company_code`` is
+        still fully financially independent (its own contracts, deposits,
+        balance). Only ``services.financial_engine.get_holding_group_financials``
+        reads this column; every other balance/roll-up function must ignore
+        it.
     province : str
         Province where the employer is located (max 50 chars).
     affairs_category : str or None
@@ -42,6 +57,11 @@ class Employer(SoftDeleteMixin, Base):
     name = Column(String(200), nullable=False)
     employer_type = Column(String(20), nullable=False)
     parent_code = Column(
+        String(20),
+        ForeignKey("employers.classification_code"),
+        nullable=True,
+    )
+    holding_company_code = Column(
         String(20),
         ForeignKey("employers.classification_code"),
         nullable=True,

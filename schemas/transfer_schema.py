@@ -69,6 +69,16 @@ class CreditTransferResponse(BaseModel):
     amount: int
     broker_name: Optional[str] = None
     documentation: Optional[str] = None
+    # Report-only enrichment, filled by the list endpoint (None on
+    # create/update responses): the destination contract's total amount, the
+    # sum of ALL active transfers funding that contract, and the source
+    # employer's combined 1402+1404 balance before / after every one of
+    # their transfers (see calculate_gross_pool_balance /
+    # calculate_combined_pool_balance).
+    contract_amount: Optional[int] = None
+    contract_funded_total: Optional[int] = None
+    source_balance_before_transfers: Optional[int] = None
+    source_balance_after_transfers: Optional[int] = None
 
     class Config:
         json_schema_extra = {

@@ -28,16 +28,52 @@ ADD_FORM_WIDGET_KEYS = (
 
 DEFAULT_DESTINATION_EMPLOYER_CODE = "128342"
 
+MILLION = 1_000_000
+
+# Same column structure as the funding-source report finalized with Payam
+# (scripts/report_institute_contract_funding.py, "تفصیلی" sheet), all money
+# columns in میلیون ریال -- plus the contract code and the few record fields
+# that are useful when working from this form (شناسه for editing, سال مالی,
+# کارگزار, توضیحات).
+COL_ID = "شناسه"
+COL_CONTRACT_CODE = "کد قرارداد"
+COL_CONTRACT_TITLE = "عنوان قرارداد"
+COL_CONTRACT_AMOUNT = "مبلغ قرارداد (میلیون ریال)"
+COL_SOURCE = "کارفرمای مبدأ"
+COL_SOURCE_CODE = "کد کارفرمای مبدأ"
+COL_TRANSFER = "مبلغ انتقالی بابت این قرارداد (میلیون ریال)"
+COL_BEFORE = "مانده تجمیعی کارفرمای مبدأ، بدون انتقال اعتبار (میلیون ریال)"
+COL_AFTER = "مانده کارفرمای مبدأ پس از همهٔ انتقالی‌هایش (میلیون ریال)"
+COL_DESTINATION = "کارفرمای مقصد"
+COL_FISCAL_YEAR = "سال مالی"
+COL_BROKER = "کارگزار"
+COL_DOCUMENTATION = "توضیحات"
+
 REPORT_TABLE_COLUMNS = [
-    "شناسه",
-    "کارفرمای مبدأ",
-    "کارفرمای مقصد",
-    "کد قرارداد",
-    "عنوان قرارداد",
-    "سال مالی",
-    "مبلغ (ریال)",
-    "کارگزار",
-    "توضیحات",
+    COL_CONTRACT_CODE,
+    COL_CONTRACT_TITLE,
+    COL_CONTRACT_AMOUNT,
+    COL_SOURCE,
+    COL_SOURCE_CODE,
+    COL_TRANSFER,
+    COL_BEFORE,
+    COL_AFTER,
+    COL_DESTINATION,
+    COL_FISCAL_YEAR,
+    COL_BROKER,
+    COL_DOCUMENTATION,
+    COL_ID,
+]
+MONEY_COLUMNS = [COL_CONTRACT_AMOUNT, COL_TRANSFER, COL_BEFORE, COL_AFTER]
+
+SUMMARY_COLUMNS = [
+    COL_CONTRACT_CODE,
+    COL_CONTRACT_TITLE,
+    COL_CONTRACT_AMOUNT,
+    "تعداد کارفرمای تأمین‌کننده",
+    "مجموع انتقالی دریافتی (میلیون ریال)",
+    "کسری تأمین (میلیون ریال)",
+    "وضعیت تأمین",
 ]
 
 SELECTED_TRANSFER_ID_KEY = "transfer_edit_selected_id"
@@ -152,6 +188,33 @@ def _index_of(options: list[str], current_value: str | None) -> int:
     return 0
 
 
+def _fetch_combined_balance(employer_code: str) -> float | None:
+    """Combined 1402+1404 balance for an employer -- what a credit transfer
+    is actually checked against (see ``calculate_combined_pool_balance`` in
+    ``services/financial_engine.py``: transfers no longer draw from a single
+    fiscal year's pool, since a data error in one year's figures could make
+    a perfectly legitimate transfer look like it exceeds that year alone).
+    Fetched as two single-year calls against the existing balance endpoint
+    and summed client-side, rather than adding a new backend route.
+    """
+    total = 0.0
+    for year in (1402, 1404):
+        try:
+            response = requests.get(
+                f"{API_URL}/employers/{employer_code}/balance",
+                params={"funding_year": year},
+                timeout=5,
+            )
+            if response.status_code != 200:
+                st.error(f"❌ خطا در دریافت موجودی کارفرما: {_response_detail(response)}")
+                return None
+            total += response.json()["total_balance"]
+        except Exception as exc:
+            _handle_request_error(exc, "در دریافت موجودی کارفرما")
+            return None
+    return total
+
+
 def _fetch_transfers(*, fiscal_year: int | None, employer_code: str | None) -> list[dict] | None:
     """Fetch the filtered credit-transfer report, handling errors gracefully."""
     params = {}
@@ -169,30 +232,111 @@ def _fetch_transfers(*, fiscal_year: int | None, employer_code: str | None) -> l
     return None
 
 
+def _to_million(value) -> int | None:
+    """Rials -> whole میلیون ریال (``None`` stays ``None``)."""
+    if value is None:
+        return None
+    return round(float(value) / MILLION)
+
+
 def _to_report_row(item: dict) -> dict:
     """Map one enriched transfer record onto the report's Persian headers."""
     return {
-        "شناسه": item["id"],
-        "کارفرمای مبدأ": item.get("source_employer_name") or item["source_employer_code"],
-        "کارفرمای مقصد": item.get("destination_employer_name") or item["destination_employer_code"],
-        "کد قرارداد": item["contract_tracking_code"],
-        "عنوان قرارداد": item.get("contract_title") or "-",
-        "سال مالی": item["fiscal_year"],
-        "مبلغ (ریال)": item["amount"],
-        "کارگزار": item.get("broker_name") or "-",
-        "توضیحات": item.get("documentation") or "-",
+        COL_CONTRACT_CODE: item["contract_tracking_code"],
+        COL_CONTRACT_TITLE: item.get("contract_title") or "-",
+        COL_CONTRACT_AMOUNT: _to_million(item.get("contract_amount")),
+        COL_SOURCE: item.get("source_employer_name") or item["source_employer_code"],
+        COL_SOURCE_CODE: item["source_employer_code"],
+        COL_TRANSFER: _to_million(item["amount"]),
+        COL_BEFORE: _to_million(item.get("source_balance_before_transfers")),
+        COL_AFTER: _to_million(item.get("source_balance_after_transfers")),
+        COL_DESTINATION: item.get("destination_employer_name") or item["destination_employer_code"],
+        COL_FISCAL_YEAR: item["fiscal_year"],
+        COL_BROKER: item.get("broker_name") or "-",
+        COL_DOCUMENTATION: item.get("documentation") or "-",
+        COL_ID: item["id"],
     }
 
 
 def _build_report_dataframe(items: list[dict]) -> pd.DataFrame:
+    # Items arrive newest-first; the report reads better grouped by contract.
     rows = [_to_report_row(item) for item in items]
-    return pd.DataFrame(rows, columns=REPORT_TABLE_COLUMNS)
+    df = pd.DataFrame(rows, columns=REPORT_TABLE_COLUMNS)
+    return df.sort_values([COL_CONTRACT_CODE, COL_ID], kind="stable").reset_index(drop=True)
 
 
-def _to_excel_bytes(df: pd.DataFrame) -> bytes:
+def _build_summary_dataframe(items: list[dict]) -> pd.DataFrame:
+    """One row per contract: how much of its amount the transfers cover.
+
+    The funded total comes from the API (all active transfers of the
+    contract), so it stays correct even when the filters hide some rows.
+    """
+    per_contract: dict[str, dict] = {}
+    for item in items:
+        entry = per_contract.setdefault(
+            item["contract_tracking_code"],
+            {"item": item, "sources": set()},
+        )
+        entry["sources"].add(item["source_employer_code"])
+
+    rows = []
+    for code in sorted(per_contract):
+        item = per_contract[code]["item"]
+        amount = item.get("contract_amount")
+        funded = item.get("contract_funded_total") or 0
+        shortfall = None if amount is None else amount - funded
+        if shortfall is None:
+            status = "-"
+        elif abs(shortfall) < 1:
+            status = "کامل"
+        elif shortfall < 0:
+            status = "بیش از نیاز"
+        else:
+            status = "ناقص"
+        rows.append({
+            COL_CONTRACT_CODE: code,
+            COL_CONTRACT_TITLE: item.get("contract_title") or "-",
+            COL_CONTRACT_AMOUNT: _to_million(amount),
+            "تعداد کارفرمای تأمین‌کننده": len(per_contract[code]["sources"]),
+            "مجموع انتقالی دریافتی (میلیون ریال)": _to_million(funded),
+            "کسری تأمین (میلیون ریال)": _to_million(shortfall),
+            "وضعیت تأمین": status,
+        })
+    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
+
+
+def _style_excel_sheet(ws, df: pd.DataFrame) -> None:
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    ws.sheet_view.rightToLeft = True
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        header = ws.cell(row=1, column=col_idx)
+        header.fill = header_fill
+        header.font = Font(bold=True, color="FFFFFF")
+        header.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        is_money = col_name in MONEY_COLUMNS or col_name.endswith("(میلیون ریال)")
+        for row_idx in range(2, len(df) + 2):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if is_money:
+                cell.number_format = "#,##0"
+        longest = max([len(str(col_name))] + [len(str(v)) for v in df[col_name]])
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(longest + 3, 12), 55)
+    ws.row_dimensions[1].height = 45
+    ws.freeze_panes = "A2"
+
+
+def _to_excel_bytes(detail_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Credit Transfers")
+        for df, sheet_name in (
+            (detail_df, "تفصیلی (قرارداد × کارفرما)"),
+            (summary_df, "خلاصهٔ تأمین"),
+        ):
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            _style_excel_sheet(writer.sheets[sheet_name], df)
     output.seek(0)
     return output.getvalue()
 
@@ -246,6 +390,11 @@ with col_e1:
         format_func=employer_options.get,
         key="transfer_add_source_employer",
     )
+    _source_balance = _fetch_combined_balance(source_choice)
+    if _source_balance is not None:
+        st.caption(
+            f"💰 مانده تجمیعی مبدأ (۱۴۰۲ + ۱۴۰۴ با هم): {_format_rials(_source_balance)} ریال"
+        )
 with col_e2:
     destination_default_index = _index_of(employer_keys, DEFAULT_DESTINATION_EMPLOYER_CODE)
     destination_choice = st.selectbox(
@@ -372,13 +521,33 @@ transfers = _fetch_transfers(
 
 if transfers:
     report_df = _build_report_dataframe(transfers)
+    summary_df = _build_summary_dataframe(transfers)
+
+    def _format_million(value) -> str:
+        return "-" if pd.isna(value) else f"{value:,.0f}"
+
     display_df = report_df.copy()
-    display_df["مبلغ (ریال)"] = display_df["مبلغ (ریال)"].apply(_format_rials)
-    st.table(display_df.reset_index(drop=True))
+    for money_col in MONEY_COLUMNS:
+        display_df[money_col] = display_df[money_col].apply(_format_million)
+    st.caption(
+        "مبالغ به میلیون ریال. «مانده بدون انتقال» = واریزی منهای هزینه‌کرد (۱۴۰۲+۱۴۰۴)؛ "
+        "«مانده پس از انتقال‌ها» شامل تمام انتقال‌های آن کارفرما (نه فقط همین قرارداد) است."
+    )
+    st.table(display_df)
+
+    st.subheader("خلاصهٔ تأمین هر قرارداد")
+    summary_display = summary_df.copy()
+    for money_col in (
+        COL_CONTRACT_AMOUNT,
+        "مجموع انتقالی دریافتی (میلیون ریال)",
+        "کسری تأمین (میلیون ریال)",
+    ):
+        summary_display[money_col] = summary_display[money_col].apply(_format_million)
+    st.table(summary_display)
 
     st.download_button(
         label="📥 دانلود گزارش به صورت اکسل",
-        data=_to_excel_bytes(report_df),
+        data=_to_excel_bytes(report_df, summary_df),
         file_name="credit_transfers_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )

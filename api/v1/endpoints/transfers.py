@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.exc import DataError, IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, aliased
 
@@ -23,6 +24,10 @@ from schemas.transfer_schema import (
     CreditTransferCreate,
     CreditTransferResponse,
     CreditTransferUpdate,
+)
+from services.financial_engine import (
+    calculate_combined_pool_balance,
+    calculate_gross_pool_balance,
 )
 
 router = APIRouter(prefix="/credit-transfers", tags=["Credit Transfers"])
@@ -60,6 +65,35 @@ def _get_active_employer(db: Session, employer_code: str, *, role: str) -> Emplo
             detail=f"کارفرمای {role} با کد '{employer_code}' یافت نشد یا حذف شده است.",
         )
     return employer
+
+
+def _check_combined_balance(
+    db: Session, source_employer_code: str, amount: int, *, exclude_transfer_id: int | None = None
+) -> None:
+    """Reject a transfer that would exceed the source employer's combined
+    1402+1404 balance (see ``calculate_combined_pool_balance`` for why this
+    checks the combined pool instead of a single fiscal year).
+
+    ``exclude_transfer_id`` lets an update re-validate without the transfer's
+    own prior amount counting against itself.
+    """
+    available = calculate_combined_pool_balance(db, source_employer_code, lock_employer=True)
+    if exclude_transfer_id is not None:
+        prior = (
+            db.query(CreditTransfer)
+            .filter(CreditTransfer.id == exclude_transfer_id, CreditTransfer.is_deleted == False)  # noqa: E712
+            .first()
+        )
+        if prior is not None and prior.source_employer_code == source_employer_code:
+            available += float(prior.amount)
+    if amount > available:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"مانده تجمیعی کارفرمای مبدأ (سال‌های ۱۴۰۲ و ۱۴۰۴ با هم) "
+                f"{available:,.0f} ریال است؛ مبلغ انتقالی {amount:,.0f} ریال از آن بیشتر است."
+            ),
+        )
 
 
 def _get_active_contract(db: Session, tracking_code: str) -> Contract:
@@ -123,6 +157,48 @@ def _to_response(
     )
 
 
+def _attach_report_balances(db: Session, responses: list[CreditTransferResponse]) -> None:
+    """Fill the report-only enrichment fields on the list response.
+
+    Computed once per distinct source employer / contract (not per row), and
+    always over ALL active transfers -- the fiscal-year / employer filters
+    narrow the rows shown, never the balances or the contract's funded total.
+    """
+    if not responses:
+        return
+
+    contract_codes = {r.contract_tracking_code for r in responses}
+    contract_amounts = {
+        code: float(amount)
+        for code, amount in db.query(Contract.tracking_code, Contract.total_amount)
+        .filter(Contract.tracking_code.in_(contract_codes))
+        .all()
+    }
+    funded_totals = {
+        code: float(total)
+        for code, total in db.query(
+            CreditTransfer.contract_tracking_code, func.sum(CreditTransfer.amount)
+        )
+        .filter(
+            CreditTransfer.contract_tracking_code.in_(contract_codes),
+            CreditTransfer.is_deleted == False,  # noqa: E712
+        )
+        .group_by(CreditTransfer.contract_tracking_code)
+        .all()
+    }
+
+    source_codes = {r.source_employer_code for r in responses}
+    gross = {code: calculate_gross_pool_balance(db, code) for code in source_codes}
+    net = {code: calculate_combined_pool_balance(db, code) for code in source_codes}
+
+    for r in responses:
+        if r.contract_tracking_code in contract_amounts:
+            r.contract_amount = int(contract_amounts[r.contract_tracking_code])
+        r.contract_funded_total = int(funded_totals.get(r.contract_tracking_code, 0))
+        r.source_balance_before_transfers = int(gross[r.source_employer_code])
+        r.source_balance_after_transfers = int(net[r.source_employer_code])
+
+
 @router.get("/", response_model=list[CreditTransferResponse])
 def list_credit_transfers(
     fiscal_year: Optional[int] = Query(None, description="Restrict results to a single fiscal year"),
@@ -150,10 +226,12 @@ def list_credit_transfers(
         )
 
     rows = query.order_by(CreditTransfer.id.desc()).all()
-    return [
+    responses = [
         _to_response(transfer, source_employer, destination_employer, contract)
         for transfer, source_employer, destination_employer, contract in rows
     ]
+    _attach_report_balances(db, responses)
+    return responses
 
 
 @router.post("/", response_model=CreditTransferResponse, status_code=201)
@@ -169,6 +247,7 @@ def create_credit_transfer(
         db, payload.destination_employer_code, role="مقصد"
     )
     contract = _get_active_contract(db, payload.contract_tracking_code)
+    _check_combined_balance(db, source_employer.classification_code, payload.amount)
 
     try:
         transfer = CreditTransfer(
@@ -237,6 +316,9 @@ def update_credit_transfer(
         db, payload.destination_employer_code, role="مقصد"
     )
     contract = _get_active_contract(db, payload.contract_tracking_code)
+    _check_combined_balance(
+        db, source_employer.classification_code, payload.amount, exclude_transfer_id=transfer_id
+    )
 
     try:
         transfer.source_employer_code = source_employer.classification_code

@@ -17,6 +17,7 @@ from services.financial_engine import (
     get_all_employers_financials,
     get_employer_contract_activity,
     get_employer_deposit_performance,
+    get_mandate_by_employer_raw,
 )
 
 DEFAULT_SINCE_JALALI_YEAR = 1402
@@ -62,6 +63,25 @@ EMPLOYER_TYPE_LABELS = {
     "Subsidiary": "زیرمجموعه",
     "Independent": "مستقل",
 }
+
+# Distinct from EMPLOYER_TYPE_LABELS above: that mapping describes the
+# rolled-up compliance view (a Mother row already includes its
+# Subsidiaries' figures), while the geographic/structural section below
+# uses services.get_mandate_by_employer_raw's *not*-rolled-up rows, where
+# "Mother" means only the parent's own mandate.
+STRUCTURE_TYPE_LABELS = {
+    "Mother": "شرکت مادر",
+    "Subsidiary": "شرکت زیرمجموعه",
+    "Independent": "شرکت/بانک/موسسه مستقل",
+}
+STRUCTURE_TYPE_ORDER = ["Mother", "Subsidiary", "Independent"]
+STRUCTURE_TYPE_COLORS = {
+    "Mother": "#3B82F6",
+    "Subsidiary": "#F59E0B",
+    "Independent": "#10B981",
+}
+UNKNOWN_PROVINCE_LABEL = "نامشخص"
+TOP_N_PROVINCES = 10
 
 ACTIVITY_COLUMNS = [
     "employer_name",
@@ -159,6 +179,22 @@ def _load_performance(fiscal_years_key, red_threshold, yellow_threshold):
             fiscal_years=list(fiscal_years_key) if fiscal_years_key else None,
             red_threshold=red_threshold,
             yellow_threshold=yellow_threshold,
+        )
+    finally:
+        db.close()
+    return df
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_mandate_structure(fiscal_years_key):
+    """Cached load of the not-rolled-up per-employer mandate/deposit rows
+    (geographic + structural breakdown -- see get_mandate_by_employer_raw's
+    docstring for why this is a separate query from the Mother roll-up used
+    by the rest of this dashboard)."""
+    db = SessionLocal()
+    try:
+        df = get_mandate_by_employer_raw(
+            db, fiscal_years=list(fiscal_years_key) if fiscal_years_key else None
         )
     finally:
         db.close()
@@ -320,6 +356,93 @@ else:
     )
     st.caption("۲۰ مشمول با کمترین درصد تحقق واریز (از میان مشمولینی که تکلیف تعریف‌شده دارند)")
     st.plotly_chart(fig, width="stretch", theme=None)
+
+st.markdown("---")
+st.subheader("🗺️ توزیع جغرافیایی و ساختاری اعتبار تکلیفی")
+st.caption(
+    "برخلاف بخش‌های بالا، این دو نمودار **بدون تجمیع مادر/زیرمجموعه** هستند — "
+    "هر شرکت/بانک/موسسه دقیقاً در جایگاه ساختاری و استان ثبتی واقعی خودش دیده "
+    "می‌شود، چون هدف اینجا دیدن سهم واقعی هر استان و هر رده ساختاری است، نه "
+    "مانده مالی هر هلدینگ."
+)
+
+with st.spinner("در حال بارگذاری داده‌های جغرافیایی و ساختاری..."):
+    df_structure = _load_mandate_structure(tuple(sorted(selected_years)))
+
+if df_structure.empty:
+    st.info("داده‌ای برای بازه انتخاب‌شده یافت نشد.")
+else:
+    df_structure["province"] = (
+        df_structure["province"].replace({"Unknown": UNKNOWN_PROVINCE_LABEL}).fillna(UNKNOWN_PROVINCE_LABEL)
+    )
+
+    geo_col, struct_col = st.columns(2)
+
+    with geo_col:
+        st.markdown("**توزیع استانی (بر اساس نشانی ثبتی مشمول)**")
+        by_province = (
+            df_structure.groupby("province", as_index=False)["mandated_amount"]
+            .sum()
+            .sort_values("mandated_amount", ascending=False)
+        )
+        top_provinces = by_province.head(TOP_N_PROVINCES)
+        rest_total = by_province["mandated_amount"].iloc[TOP_N_PROVINCES:].sum()
+        if rest_total > 0:
+            top_provinces = pd.concat(
+                [top_provinces, pd.DataFrame([{"province": "سایر استان‌ها", "mandated_amount": rest_total}])],
+                ignore_index=True,
+            )
+        fig_geo = go.Figure(
+            go.Bar(
+                x=top_provinces["mandated_amount"],
+                y=top_provinces["province"],
+                orientation="h",
+                marker_color="#3B82F6",
+                text=[_format_rials(v) for v in top_provinces["mandated_amount"]],
+                textposition="auto",
+            )
+        )
+        fig_geo.update_layout(
+            font=dict(family="Vazirmatn", size=13),
+            xaxis=dict(title="اعتبار تکلیفی (ریال)", tickfont=dict(family="Vazirmatn")),
+            yaxis=dict(title="", autorange="reversed", tickfont=dict(family="Vazirmatn", size=12)),
+            height=max(320, 34 * len(top_provinces)),
+            margin=dict(l=10, r=10, t=10, b=40),
+            plot_bgcolor="#f8f9fa",
+            paper_bgcolor="white",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_geo, width="stretch", theme=None)
+
+    with struct_col:
+        st.markdown("**سهم ساختاری (مادر / زیرمجموعه / مستقل)**")
+        by_type = (
+            df_structure.groupby("employer_type")["mandated_amount"]
+            .sum()
+            .reindex(STRUCTURE_TYPE_ORDER)
+            .fillna(0)
+        )
+        fig_struct = go.Figure(
+            go.Bar(
+                x=by_type.values,
+                y=[STRUCTURE_TYPE_LABELS[t] for t in STRUCTURE_TYPE_ORDER],
+                orientation="h",
+                marker_color=[STRUCTURE_TYPE_COLORS[t] for t in STRUCTURE_TYPE_ORDER],
+                text=[_format_rials(v) for v in by_type.values],
+                textposition="auto",
+            )
+        )
+        fig_struct.update_layout(
+            font=dict(family="Vazirmatn", size=13),
+            xaxis=dict(title="اعتبار تکلیفی (ریال)", tickfont=dict(family="Vazirmatn")),
+            yaxis=dict(title="", tickfont=dict(family="Vazirmatn", size=12)),
+            height=max(320, 34 * len(top_provinces)),
+            margin=dict(l=10, r=10, t=10, b=40),
+            plot_bgcolor="#f8f9fa",
+            paper_bgcolor="white",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_struct, width="stretch", theme=None)
 
 st.markdown("---")
 st.subheader("📋 فهرست تفصیلی مشمولین")

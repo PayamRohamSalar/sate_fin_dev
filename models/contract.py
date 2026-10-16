@@ -25,6 +25,18 @@ class Contract(SoftDeleteMixin, Base):
         ForeignKey("researchers.national_code"),
         nullable=False,
     )
+    # Link to the winning Proposal (models.proposal.Proposal.id), NOT a
+    # declared ForeignKey -- the proposals table postdates this column, so
+    # the link was validated empirically (2026-09) rather than enforced by
+    # the schema. Three shapes exist in the data:
+    #   - a real Proposal.id (~1168 contracts): the genuine link. Use
+    #     Proposal.contract (see models/proposal.py) rather than querying
+    #     this column directly.
+    #   - equal to this row's own tracking_code (~773 contracts): a
+    #     pre-existing placeholder from before the proposals table existed,
+    #     NOT a real link. Always exclude proposal_id == tracking_code
+    #     before treating this column as a proposal reference.
+    #   - some other non-numeric legacy value (~49 contracts): unresolved.
     proposal_id = Column(String(50), nullable=True)
     contract_number = Column(String(100), nullable=True)
     attachment_path = Column(String(255), nullable=True)

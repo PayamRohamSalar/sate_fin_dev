@@ -113,19 +113,22 @@ def safety_backup(hostname: str) -> Path:
 
 def recreate_database(maint_url: str, dbname: str) -> None:
     psql = find_pg_binary("psql")
-    sql = (
+    # Each statement needs its own -c: psql sends a multi-statement -c string as
+    # one implicit transaction, and DROP/CREATE DATABASE can't run inside one.
+    statements = [
         f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-        f"WHERE datname = '{dbname}' AND pid <> pg_backend_pid();\n"
-        f'DROP DATABASE IF EXISTS "{dbname}";\n'
-        f'CREATE DATABASE "{dbname}";'
-    )
-    result = subprocess.run(
-        [psql, "-d", maint_url, "-v", "ON_ERROR_STOP=1", "-c", sql],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to drop/recreate database:\n{result.stderr}")
+        f"WHERE datname = '{dbname}' AND pid <> pg_backend_pid();",
+        f'DROP DATABASE IF EXISTS "{dbname}";',
+        f'CREATE DATABASE "{dbname}";',
+    ]
+    for sql in statements:
+        result = subprocess.run(
+            [psql, "-d", maint_url, "-v", "ON_ERROR_STOP=1", "-c", sql],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to drop/recreate database:\n{result.stderr}")
 
 
 def restore_dump(dump_path: Path) -> None:
@@ -178,7 +181,8 @@ def main() -> int:
     print(f"   Saved: {safety_path.name}")
 
     dbname = make_url(DATABASE_URL).database
-    maint_url = str(make_url(DATABASE_URL).set(database="postgres"))
+    # str(url) masks the password as "***" in SQLAlchemy 2.x, which breaks psql auth.
+    maint_url = make_url(DATABASE_URL).set(database="postgres").render_as_string(hide_password=False)
 
     print(f"\n4. Dropping and recreating '{dbname}'...")
     try:

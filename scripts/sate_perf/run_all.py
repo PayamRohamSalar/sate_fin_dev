@@ -23,6 +23,9 @@ CHART_SCRIPTS = [
     "chart_university_contract_vs_payment.py",
     "chart_researcher_top_by_count.py",
     "chart_researcher_contract_vs_payment.py",
+    "chart_mandate_by_province.py",
+    "chart_mandate_by_employer_type.py",
+    "chart_contracts_by_province.py",
 ]
 
 HERE = Path(__file__).resolve().parent
