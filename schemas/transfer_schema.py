@@ -2,7 +2,9 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from services.financial_engine import TRANSFER_POOL_YEARS
 
 DEFAULT_DESTINATION_EMPLOYER_CODE = "128342"
 
@@ -22,7 +24,12 @@ class CreditTransferCreate(BaseModel):
         ..., max_length=50, description="Contract receiving the transferred funds"
     )
     fiscal_year: int = Field(
-        ..., ge=1300, le=1500, description="Fiscal year the transferred funds originated from"
+        ...,
+        description=(
+            "Fiscal year the transferred funds originated from. Only the prior "
+            "years' pool (1402 or 1404) is allowed -- current-year (1405) credit "
+            "cannot be transferred."
+        ),
     )
     amount: int = Field(..., gt=0, description="Transfer amount in whole Rials")
     broker_name: Optional[str] = Field(
@@ -31,6 +38,17 @@ class CreditTransferCreate(BaseModel):
     documentation: Optional[str] = Field(
         None, description="Supporting documentation or free-text notes"
     )
+
+    @field_validator("fiscal_year")
+    @classmethod
+    def _fiscal_year_in_transfer_pool(cls, value: int) -> int:
+        if value not in TRANSFER_POOL_YEARS:
+            years = " یا ".join(str(y) for y in TRANSFER_POOL_YEARS)
+            raise ValueError(
+                f"سال مالی انتقال اعتبار فقط می‌تواند {years} باشد "
+                "(انتقال از محل اعتبار سال جاری امکان‌پذیر نیست)."
+            )
+        return value
 
     class Config:
         json_schema_extra = {
@@ -53,6 +71,18 @@ class CreditTransferUpdate(CreditTransferCreate):
     primary key is supplied via the URL path and is never changed by an
     update.
     """
+
+
+class SourceBalanceResponse(BaseModel):
+    """What a source employer can transfer, and what it cannot (all in Rials)."""
+
+    employer_code: str
+    pool_balance_1402_1404: int = Field(
+        ..., description="Combined 1402+1404 balance after transfers -- the ceiling a transfer is checked against"
+    )
+    balance_1405: int = Field(
+        ..., description="Current-year (1405) balance -- not transferable"
+    )
 
 
 class CreditTransferResponse(BaseModel):

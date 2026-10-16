@@ -18,7 +18,11 @@ from models.employer import Employer
 from models.payment import Payment
 from models.transfer import CreditTransfer
 from fund_balance_tab import render_fund_balance_tab
-from services.financial_engine import calculate_combined_pool_balance, get_all_employers_financials
+from services.financial_engine import (
+    calculate_balance_1405,
+    calculate_combined_pool_balance,
+    get_all_employers_financials,
+)
 
 FINANCIAL_COLUMNS = [
     "mandated_amount",
@@ -439,11 +443,20 @@ def render_tab1(db: Session, employers):
     # error in one year's figures could make a legitimate transfer look
     # like it overdrew that year alone). Shown here alongside the existing
     # per-year cards, which are unchanged.
+    # 1405 credit is its own balance: by law it cannot be transferred, so it
+    # is shown beside (never inside) the transferable 1402+1404 pool.
     combined_balance = calculate_combined_pool_balance(db, selected_code)
-    st.metric(
+    balance_1405 = calculate_balance_1405(db, selected_code)
+    pool_col, current_col = st.columns(2)
+    pool_col.metric(
         "💰 مانده تجمیعی ۱۴۰۲+۱۴۰۴ (پس از انتقال اعتبار)",
         f"{combined_balance / 1_000_000:,.0f} میلیون ریال",
         help="واریزی منهای هزینه هر دو سال، به‌علاوهٔ خالص انتقال اعتبار ورودی/خروجی این مشمول -- انتقال اعتبار از محل مجموع این دو سال کسر می‌شود، نه یک سال مشخص.",
+    )
+    current_col.metric(
+        "🔒 مانده ۱۴۰۵ (غیرقابل انتقال)",
+        f"{balance_1405 / 1_000_000:,.0f} میلیون ریال",
+        help="واریزی ۱۴۰۵ منهای پرداخت‌هایی که سال مالی آن‌ها ۱۴۰۵ ثبت شده است. اعتبار سال جاری را نمی‌توان انتقال داد.",
     )
 
     st.subheader("🔑 شاخص‌های کلیدی")

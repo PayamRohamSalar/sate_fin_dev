@@ -28,7 +28,9 @@ TABLE_COLUMNS = {
     "fund_paid": "پرداختی - صندوق",
     "our_transfers_net": "خالص انتقال اعتبار - ما",
     "fund_credit_1402_1403": "اعتبار ۱۴۰۲-۱۴۰۳ - صندوق",
-    "our_combined_balance": "مانده تجمیعی پس از انتقال اعتبار - ما",
+    "our_pool_balance": "مانده تجمیعی ۱۴۰۲+۱۴۰۴ پس از انتقال اعتبار - ما",
+    "our_balance_1405": "مانده ۱۴۰۵ - ما (غیرقابل انتقال)",
+    "our_combined_balance": "مانده کل ۱۴۰۲ تا ۱۴۰۵ پس از انتقال - ما (قابل مقایسه با صندوق)",
     "our_unpaid_transfers": "انتقال اعتبار پرداخت‌نشده (تعهد) - ما",
     "our_balance_fund_basis": "مانده بر مبنای پرداخت - ما (قابل مقایسه با صندوق)",
     "fund_balance": "مانده - صندوق",
@@ -119,9 +121,12 @@ def render_fund_balance_tab(db) -> None:
                    delta=_fmt(total["diff_deposit_1404"]), delta_color="off")
     cols[2].metric("انتقال اعتبار پرداخت‌نشده (تعهد) - ما", _fmt(total["our_unpaid_transfers"]))
     cols = st.columns(3)
-    cols[0].metric("مانده تجمیعی پس از انتقال - ما", _fmt(total["our_combined_balance"]))
-    cols[1].metric("مانده بر مبنای پرداخت - ما", _fmt(total["our_balance_fund_basis"]))
-    cols[2].metric("مانده - صندوق", _fmt(total["fund_balance"]),
+    cols[0].metric("مانده تجمیعی ۱۴۰۲+۱۴۰۴ پس از انتقال - ما", _fmt(total["our_pool_balance"]))
+    cols[1].metric("مانده ۱۴۰۵ - ما (غیرقابل انتقال)", _fmt(total["our_balance_1405"]))
+    cols[2].metric("مانده کل ۱۴۰۲ تا ۱۴۰۵ پس از انتقال - ما", _fmt(total["our_combined_balance"]))
+    cols = st.columns(2)
+    cols[0].metric("مانده بر مبنای پرداخت - ما", _fmt(total["our_balance_fund_basis"]))
+    cols[1].metric("مانده - صندوق", _fmt(total["fund_balance"]),
                    delta=_fmt(total["diff_balance"]), delta_color="off")
     st.caption("عدد زیر «صندوق»، اختلاف صندوق منهای ما است (مانده: نسبت به مبنای پرداخت).")
 
@@ -141,7 +146,9 @@ def render_fund_balance_tab(db) -> None:
         st.metric("واریزی ۱۴۰۴ به بعد", _fmt(row["our_deposit_1404_1405"]))
         st.metric("هزینه‌کرد (همهٔ سال‌ها)", _fmt(row["our_expense_total"]))
         st.metric("خالص انتقال اعتبار", _fmt(row["our_transfers_net"]))
-        st.metric("💰 مانده تجمیعی (پس از انتقال)", _fmt(row["our_combined_balance"]))
+        st.metric("💰 مانده تجمیعی ۱۴۰۲+۱۴۰۴ (پس از انتقال)", _fmt(row["our_pool_balance"]))
+        st.metric("مانده ۱۴۰۵ (غیرقابل انتقال)", _fmt(row["our_balance_1405"]))
+        st.metric("مانده کل ۱۴۰۲ تا ۱۴۰۵ (قابل مقایسه با صندوق)", _fmt(row["our_combined_balance"]))
         st.metric("انتقال اعتبار پرداخت‌نشده (تعهد)", _fmt(row["our_unpaid_transfers"]))
         st.metric("مانده بر مبنای پرداخت (قابل مقایسه با صندوق)", _fmt(row["our_balance_fund_basis"]))
     with right:

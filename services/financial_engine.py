@@ -321,18 +321,34 @@ def calculate_real_balance(
     return float(real_balance)
 
 
-# Every fiscal year folded into the combined pool -- see
-# ``calculate_combined_pool_balance`` below. 1405 is grouped with 1404 (not
-# its own bucket) because the Fund's own ledger treats 1405 disbursements as
-# spending from the 1404 pool (see scripts/reconcile_atf_audit.py's
-# COLS_EXPENSE_1405_FROM_1404 for the verified identity behind this), and
-# the DB mirrors the same grouping for deposits, payments and transfers.
-TRANSFER_POOL_YEARS = (1402, 1404, 1405)
+# Fiscal years whose leftover credit can be moved by a credit transfer
+# (انتقال اعتبار) -- see ``calculate_combined_pool_balance`` below.
+#
+# Revised 2026-10-16 at Payam's direction: by law a transfer can only come
+# from PRIOR years' unspent credit, so the current year (1405) is never part
+# of the transferable pool. 1405 credit is its own balance
+# (:func:`calculate_balance_1405`) and can only be spent in 1405. Which pool
+# a payment draws on is a free choice recorded in ``Payment.funding_year``
+# (not the calendar year the payment is made in): a 1405 payment may well be
+# funded from 1404 money, and a company may pay from 1405 while still holding
+# a 1404 balance. Balances before 1402 are out of scope (the Fund did not
+# exist).
+TRANSFER_POOL_YEARS = (1402, 1404)
+
+# The current fiscal year: its own balance, never transferable.
+CURRENT_YEAR_POOL = 1405
+
+# Every fiscal year in the Fund's ledger. The Fund's own report does not
+# separate 1405 from the earlier pools (it folds 1405 deposits and spending
+# into the 1404 pool -- see scripts/reconcile_atf_audit.py), so the
+# Secretariat-vs-Fund comparison (``get_combined_pool_breakdown``,
+# services/fund_report.py) keeps working over this whole range.
+ALL_FUND_YEARS = (1402, 1404, 1405)
 
 
 def calculate_gross_pool_balance(db: Session, employer_code: str) -> float:
     """
-    Combined 1402+1404(+1405) balance **before any credit transfer is
+    Combined 1402+1404 balance **before any credit transfer is
     netted in** -- deposits minus expense only.
 
     Added 2026-10-12 for the موسسه تحقیقات سیاست علمی کشور (128342) funding
@@ -393,17 +409,16 @@ def calculate_combined_pool_balance(
     not change ``calculate_real_balance`` itself, which other views
     (per-year balance sheets, payment validation) still use as single-year.
 
-    Bug found and fixed 2026-10-04: this used to sum
-    ``calculate_real_balance(db, employer_code, 1402)`` +
-    ``calculate_real_balance(db, employer_code, 1404)``, but that function
-    filters each component on an *exact* ``fiscal_year``/``funding_year``
-    match -- so every deposit, payment, and credit transfer tagged 1405
-    (real money: ~88,017M deposits and ~1,000M payments system-wide as of
-    2026-10-04) was silently excluded from the combined balance, including
-    from the transfer-validation check this function backs. Rewritten to
-    query each component directly across all of :data:`TRANSFER_POOL_YEARS`
-    at once (same Mother/Subsidiary roll-up as ``calculate_real_balance``),
-    so 1405 activity is no longer dropped.
+    Revised 2026-10-16: the pool is 1402+1404 only. 1405 credit is not
+    transferable (a transfer must come from prior years' leftover), so
+    1405 deposits and 1405-funded payments are deliberately left out here
+    and reported separately by :func:`calculate_balance_1405`. (Between
+    2026-10-04 and 2026-10-16 the pool also folded 1405 in, after a bug fix
+    that stopped ``calculate_real_balance``-per-year sums from silently
+    dropping 1405 activity; that was the wrong fix for the rule above.)
+    Each component is queried across all of :data:`TRANSFER_POOL_YEARS` at
+    once, with the same Mother/Subsidiary roll-up as
+    ``calculate_real_balance``.
 
     Args:
         db: Active SQLAlchemy database session.
@@ -459,6 +474,18 @@ def calculate_combined_pool_balance(
     ).scalar() or Decimal("0.0")
 
     return float(total_deposits + transfers_in - transfers_out - total_payments)
+
+
+def calculate_balance_1405(db: Session, employer_code: str) -> float:
+    """
+    Current-year (1405) balance: 1405 deposits minus payments funded from
+    1405 (``Payment.funding_year == 1405``). Not transferable, and credit
+    transfers never touch it (transfers can only be tagged 1402/1404).
+
+    Thin wrapper over :func:`calculate_real_balance` so the Mother/Subsidiary
+    roll-up and Draft/Final handling stay defined in one place.
+    """
+    return calculate_real_balance(db, employer_code, CURRENT_YEAR_POOL)
 
 
 def get_holding_group_financials(
@@ -1849,12 +1876,22 @@ def get_combined_pool_breakdown(db: Session) -> pd.DataFrame:
     Index key ``employer_code`` is the *roll-up* employer: a Subsidiary's
     deposits and transfers-out are attributed to its ``parent_code``.
 
+    Scope note (2026-10-16): this is the *whole-ledger* view (1402 through
+    1405, :data:`ALL_FUND_YEARS`) because its consumer compares against the
+    Fund's report, which does not separate 1405 from the earlier pools. So
+    ``combined_balance`` here INCLUDES 1405 and differs from
+    :func:`calculate_combined_pool_balance` (1402+1404, the transferable
+    pool) by exactly ``balance_1405``; ``pool_balance`` is the figure that
+    matches that function, and ``balance_1405`` matches
+    :func:`calculate_balance_1405`.
+
     Columns (base Rials): ``deposit_1402``, ``deposit_1404_1405``,
-    ``deposit_total``, ``expense_total``, ``transfers_in``, ``transfers_out``,
-    ``gross_balance`` (deposits - expense), ``combined_balance`` (after
-    transfers).
+    ``deposit_1405``, ``deposit_total``, ``expense_total``, ``expense_1405``,
+    ``transfers_in``, ``transfers_out``, ``gross_balance`` (deposits -
+    expense), ``combined_balance`` (after transfers, all years),
+    ``pool_balance`` (1402+1404 after transfers), ``balance_1405``.
     """
-    years = list(TRANSFER_POOL_YEARS)
+    years = list(ALL_FUND_YEARS)
 
     employers = db.query(
         Employer.classification_code, Employer.parent_code
@@ -1879,32 +1916,39 @@ def get_combined_pool_breakdown(db: Session) -> pd.DataFrame:
             .all()
         )
 
+    def expense_for(year_filter) -> pd.Series:
+        return pd.Series(dict(
+            db.query(Contract.employer_code, func.sum(Payment.amount))
+            .join(Contract, Payment.contract_tracking_code == Contract.tracking_code)
+            .filter(
+                Payment.is_deleted == False,  # noqa: E712
+                Payment.status.in_(("Final", "Draft")),
+                Contract.is_deleted == False,  # noqa: E712
+                year_filter(Payment.funding_year),
+            )
+            .group_by(Contract.employer_code)
+            .all()
+        ), dtype=float).astype(float)
+
     dep_1402 = deposits_for(lambda col: col == 1402)
     dep_1404_5 = deposits_for(lambda col: col.in_((1404, 1405)))
+    dep_1405 = deposits_for(lambda col: col == CURRENT_YEAR_POOL)
     dep_total = deposits_for(lambda col: col.in_(years))
 
-    expense = pd.Series(dict(
-        db.query(Contract.employer_code, func.sum(Payment.amount))
-        .join(Contract, Payment.contract_tracking_code == Contract.tracking_code)
-        .filter(
-            Payment.is_deleted == False,  # noqa: E712
-            Payment.status.in_(("Final", "Draft")),
-            Contract.is_deleted == False,  # noqa: E712
-            Payment.funding_year.in_(years),
-        )
-        .group_by(Contract.employer_code)
-        .all()
-    ), dtype=float).astype(float)
+    expense = expense_for(lambda col: col.in_(years))
+    expense_1405 = expense_for(lambda col: col == CURRENT_YEAR_POOL)
 
+    # Transfers can only come from the pool years (enforced by the API).
+    pool_years = list(TRANSFER_POOL_YEARS)
     transfers_out = series(
         db.query(CreditTransfer.source_employer_code, func.sum(CreditTransfer.amount))
-        .filter(CreditTransfer.is_deleted == False, CreditTransfer.fiscal_year.in_(years))  # noqa: E712
+        .filter(CreditTransfer.is_deleted == False, CreditTransfer.fiscal_year.in_(pool_years))  # noqa: E712
         .group_by(CreditTransfer.source_employer_code)
         .all()
     )
     transfers_in = pd.Series(dict(
         db.query(CreditTransfer.destination_employer_code, func.sum(CreditTransfer.amount))
-        .filter(CreditTransfer.is_deleted == False, CreditTransfer.fiscal_year.in_(years))  # noqa: E712
+        .filter(CreditTransfer.is_deleted == False, CreditTransfer.fiscal_year.in_(pool_years))  # noqa: E712
         .group_by(CreditTransfer.destination_employer_code)
         .all()
     ), dtype=float).astype(float)
@@ -1912,12 +1956,16 @@ def get_combined_pool_breakdown(db: Session) -> pd.DataFrame:
     frame = pd.DataFrame({
         "deposit_1402": dep_1402,
         "deposit_1404_1405": dep_1404_5,
+        "deposit_1405": dep_1405,
         "deposit_total": dep_total,
         "expense_total": expense,
+        "expense_1405": expense_1405,
         "transfers_in": transfers_in,
         "transfers_out": transfers_out,
     }).fillna(0.0)
     frame["gross_balance"] = frame["deposit_total"] - frame["expense_total"]
     frame["combined_balance"] = frame["gross_balance"] + frame["transfers_in"] - frame["transfers_out"]
+    frame["balance_1405"] = frame["deposit_1405"] - frame["expense_1405"]
+    frame["pool_balance"] = frame["combined_balance"] - frame["balance_1405"]
     frame.index.name = "employer_code"
     return frame

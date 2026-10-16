@@ -12,21 +12,29 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from services.financial_engine import TRANSFER_POOL_YEARS
+
 API_URL = "http://127.0.0.1:8000/api/v1"
 
 ADD_FORM_KEY = "transfer_add_form"
 ADD_FORM_WIDGET_KEYS = (
     "transfer_add_source_employer",
-    "transfer_add_destination_employer",
     "transfer_add_search_query",
     "transfer_add_contract_choice",
-    "transfer_add_fiscal_year",
+    "transfer_add_pool_year",
     "transfer_add_amount",
     "transfer_add_broker_name",
     "transfer_add_documentation",
 )
+# The destination dropdown's key carries the selected contract's code (so its
+# default follows the contract's employer); reset every variant by prefix.
+ADD_DESTINATION_KEY_PREFIX = "transfer_add_destination_employer"
 
 DEFAULT_DESTINATION_EMPLOYER_CODE = "128342"
+
+# Transfers can only come from prior years' leftover credit (1402 / 1404);
+# current-year (1405) credit is not transferable.
+TRANSFER_FISCAL_YEARS = list(TRANSFER_POOL_YEARS)
 
 MILLION = 1_000_000
 
@@ -39,6 +47,13 @@ COL_ID = "شناسه"
 COL_CONTRACT_CODE = "کد قرارداد"
 COL_CONTRACT_TITLE = "عنوان قرارداد"
 COL_CONTRACT_AMOUNT = "مبلغ قرارداد (میلیون ریال)"
+# Contract-level: all active transfers of the contract minus its amount
+# (positive = مازاد, negative = کسر), so over/under-funding is visible at a glance.
+COL_SURPLUS = "مازاد/کسر واریزی قرارداد (میلیون ریال)"
+COL_FUNDING_STATUS = "وضعیت واریزی قرارداد"
+STATUS_COMPLETE = "تأمین کامل"
+STATUS_SURPLUS = "مازاد واریزی"
+STATUS_SHORTFALL = "کسر واریزی"
 COL_SOURCE = "کارفرمای مبدأ"
 COL_SOURCE_CODE = "کد کارفرمای مبدأ"
 COL_TRANSFER = "مبلغ انتقالی بابت این قرارداد (میلیون ریال)"
@@ -53,6 +68,8 @@ REPORT_TABLE_COLUMNS = [
     COL_CONTRACT_CODE,
     COL_CONTRACT_TITLE,
     COL_CONTRACT_AMOUNT,
+    COL_SURPLUS,
+    COL_FUNDING_STATUS,
     COL_SOURCE,
     COL_SOURCE_CODE,
     COL_TRANSFER,
@@ -64,7 +81,7 @@ REPORT_TABLE_COLUMNS = [
     COL_DOCUMENTATION,
     COL_ID,
 ]
-MONEY_COLUMNS = [COL_CONTRACT_AMOUNT, COL_TRANSFER, COL_BEFORE, COL_AFTER]
+MONEY_COLUMNS = [COL_CONTRACT_AMOUNT, COL_SURPLUS, COL_TRANSFER, COL_BEFORE, COL_AFTER]
 
 SUMMARY_COLUMNS = [
     COL_CONTRACT_CODE,
@@ -72,8 +89,8 @@ SUMMARY_COLUMNS = [
     COL_CONTRACT_AMOUNT,
     "تعداد کارفرمای تأمین‌کننده",
     "مجموع انتقالی دریافتی (میلیون ریال)",
-    "کسری تأمین (میلیون ریال)",
-    "وضعیت تأمین",
+    COL_SURPLUS,
+    COL_FUNDING_STATUS,
 ]
 
 SELECTED_TRANSFER_ID_KEY = "transfer_edit_selected_id"
@@ -130,7 +147,8 @@ def _response_detail(response: requests.Response) -> str:
             return detail
         if isinstance(detail, list):
             messages = [
-                item.get("msg", str(item)) if isinstance(item, dict) else str(item)
+                (item.get("msg", str(item)) if isinstance(item, dict) else str(item))
+                .removeprefix("Value error, ")
                 for item in detail
             ]
             return " ".join(messages)
@@ -188,31 +206,40 @@ def _index_of(options: list[str], current_value: str | None) -> int:
     return 0
 
 
-def _fetch_combined_balance(employer_code: str) -> float | None:
-    """Combined 1402+1404 balance for an employer -- what a credit transfer
-    is actually checked against (see ``calculate_combined_pool_balance`` in
-    ``services/financial_engine.py``: transfers no longer draw from a single
-    fiscal year's pool, since a data error in one year's figures could make
-    a perfectly legitimate transfer look like it exceeds that year alone).
-    Fetched as two single-year calls against the existing balance endpoint
-    and summed client-side, rather than adding a new backend route.
+def _fetch_source_balance(employer_code: str) -> dict | None:
+    """Combined 1402+1404 balance (what a credit transfer is actually checked
+    against) and the non-transferable 1405 balance for a source employer.
+
+    Served by ``GET /credit-transfers/source-balance/{code}``, which uses the
+    very same function as the server-side check, so the figure shown here is
+    never different from the ceiling the server enforces.
     """
-    total = 0.0
-    for year in (1402, 1404):
-        try:
-            response = requests.get(
-                f"{API_URL}/employers/{employer_code}/balance",
-                params={"funding_year": year},
-                timeout=5,
-            )
-            if response.status_code != 200:
-                st.error(f"❌ خطا در دریافت موجودی کارفرما: {_response_detail(response)}")
-                return None
-            total += response.json()["total_balance"]
-        except Exception as exc:
-            _handle_request_error(exc, "در دریافت موجودی کارفرما")
-            return None
-    return total
+    try:
+        response = requests.get(
+            f"{API_URL}/credit-transfers/source-balance/{employer_code}", timeout=5
+        )
+        if response.status_code == 200:
+            return response.json()
+        st.error(f"❌ خطا در دریافت موجودی کارفرما: {_response_detail(response)}")
+    except Exception as exc:
+        _handle_request_error(exc, "در دریافت موجودی کارفرما")
+    return None
+
+
+def _funding_position(item: dict) -> tuple[float | None, str]:
+    """Contract-level funding: (all active transfers - contract amount, status).
+
+    Positive = مازاد واریزی, negative = کسر واریزی. Computed over ALL active
+    transfers of the contract (``contract_funded_total``), so it does not
+    depend on the report filters.
+    """
+    amount = item.get("contract_amount")
+    if amount is None:
+        return None, "-"
+    diff = (item.get("contract_funded_total") or 0) - amount
+    if abs(diff) < 1:
+        return diff, STATUS_COMPLETE
+    return diff, STATUS_SURPLUS if diff > 0 else STATUS_SHORTFALL
 
 
 def _fetch_transfers(*, fiscal_year: int | None, employer_code: str | None) -> list[dict] | None:
@@ -241,10 +268,13 @@ def _to_million(value) -> int | None:
 
 def _to_report_row(item: dict) -> dict:
     """Map one enriched transfer record onto the report's Persian headers."""
+    surplus, funding_status = _funding_position(item)
     return {
         COL_CONTRACT_CODE: item["contract_tracking_code"],
         COL_CONTRACT_TITLE: item.get("contract_title") or "-",
         COL_CONTRACT_AMOUNT: _to_million(item.get("contract_amount")),
+        COL_SURPLUS: _to_million(surplus),
+        COL_FUNDING_STATUS: funding_status,
         COL_SOURCE: item.get("source_employer_name") or item["source_employer_code"],
         COL_SOURCE_CODE: item["source_employer_code"],
         COL_TRANSFER: _to_million(item["amount"]),
@@ -282,25 +312,15 @@ def _build_summary_dataframe(items: list[dict]) -> pd.DataFrame:
     rows = []
     for code in sorted(per_contract):
         item = per_contract[code]["item"]
-        amount = item.get("contract_amount")
-        funded = item.get("contract_funded_total") or 0
-        shortfall = None if amount is None else amount - funded
-        if shortfall is None:
-            status = "-"
-        elif abs(shortfall) < 1:
-            status = "کامل"
-        elif shortfall < 0:
-            status = "بیش از نیاز"
-        else:
-            status = "ناقص"
+        surplus, status = _funding_position(item)
         rows.append({
             COL_CONTRACT_CODE: code,
             COL_CONTRACT_TITLE: item.get("contract_title") or "-",
-            COL_CONTRACT_AMOUNT: _to_million(amount),
+            COL_CONTRACT_AMOUNT: _to_million(item.get("contract_amount")),
             "تعداد کارفرمای تأمین‌کننده": len(per_contract[code]["sources"]),
-            "مجموع انتقالی دریافتی (میلیون ریال)": _to_million(funded),
-            "کسری تأمین (میلیون ریال)": _to_million(shortfall),
-            "وضعیت تأمین": status,
+            "مجموع انتقالی دریافتی (میلیون ریال)": _to_million(item.get("contract_funded_total") or 0),
+            COL_SURPLUS: _to_million(surplus),
+            COL_FUNDING_STATUS: status,
         })
     return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
 
@@ -360,6 +380,8 @@ def _apply_pending_add_reset() -> None:
         return
     for widget_key in ADD_FORM_WIDGET_KEYS:
         st.session_state.pop(widget_key, None)
+    for widget_key in [k for k in st.session_state if k.startswith(ADD_DESTINATION_KEY_PREFIX)]:
+        st.session_state.pop(widget_key, None)
 
 
 def _schedule_add_reset() -> None:
@@ -382,65 +404,93 @@ if edit_success_message:
 # ─── 1. Add a new transfer ────────────────────────────────────────────────
 st.subheader("۱. ثبت انتقال اعتبار جدید")
 
-col_e1, col_e2 = st.columns(2)
-with col_e1:
-    source_choice = st.selectbox(
-        "🏢 کارفرمای مبدأ:",
-        options=employer_keys,
-        format_func=employer_options.get,
-        key="transfer_add_source_employer",
-    )
-    _source_balance = _fetch_combined_balance(source_choice)
-    if _source_balance is not None:
-        st.caption(
-            f"💰 مانده تجمیعی مبدأ (۱۴۰۲ + ۱۴۰۴ با هم): {_format_rials(_source_balance)} ریال"
-        )
-with col_e2:
-    destination_default_index = _index_of(employer_keys, DEFAULT_DESTINATION_EMPLOYER_CODE)
-    destination_choice = st.selectbox(
-        "🏛️ کارفرمای مقصد:",
-        options=employer_keys,
-        format_func=employer_options.get,
-        index=destination_default_index,
-        key="transfer_add_destination_employer",
-    )
+# Containers fix the on-screen order (employers first, then the contract
+# search) while the code below fills the search first: the destination
+# dropdown's default depends on which contract was picked.
+employers_row = st.container()
+contract_search_row = st.container()
 
-search_query = st.text_input(
-    "🔍 جستجوی قرارداد مقصد انتقال (کد رهگیری یا بخشی از عنوان):",
-    key="transfer_add_search_query",
-)
-selected_contract = None
-if search_query:
-    try:
-        response = requests.get(
-            f"{API_URL}/contracts/search", params={"q": search_query}, timeout=5
-        )
-        if response.status_code == 200 and response.json():
-            contracts_found = response.json()
-            options = {
-                f"{c['contract_tracking_code']} - {c['title'][:40]}": c
-                for c in contracts_found
-            }
-            choice = st.selectbox(
-                "قرارداد مورد نظر را انتخاب کنید:",
-                list(options.keys()),
-                key="transfer_add_contract_choice",
+with contract_search_row:
+    search_query = st.text_input(
+        "🔍 جستجوی قرارداد مقصد انتقال (کد رهگیری یا بخشی از عنوان):",
+        key="transfer_add_search_query",
+    )
+    selected_contract = None
+    if search_query:
+        try:
+            response = requests.get(
+                f"{API_URL}/contracts/search", params={"q": search_query}, timeout=5
             )
-            selected_contract = options[choice]
-        else:
-            st.warning("هیچ قراردادی با این مشخصات یافت نشد.")
-    except Exception as exc:
-        _handle_request_error(exc, "در جستجوی قرارداد")
+            if response.status_code == 200 and response.json():
+                contracts_found = response.json()
+                options = {
+                    f"{c['contract_tracking_code']} - {c['title'][:40]}": c
+                    for c in contracts_found
+                }
+                choice = st.selectbox(
+                    "قرارداد مورد نظر را انتخاب کنید:",
+                    list(options.keys()),
+                    key="transfer_add_contract_choice",
+                )
+                selected_contract = options[choice]
+            else:
+                st.warning("هیچ قراردادی با این مشخصات یافت نشد.")
+        except Exception as exc:
+            _handle_request_error(exc, "در جستجوی قرارداد")
+
+contract_employer_code = (
+    selected_contract.get("employer_classification_code") if selected_contract else None
+)
+
+with employers_row:
+    col_e1, col_e2 = st.columns(2)
+    with col_e1:
+        source_choice = st.selectbox(
+            "🏢 کارفرمای مبدأ:",
+            options=employer_keys,
+            format_func=employer_options.get,
+            key="transfer_add_source_employer",
+        )
+        _source_balance = _fetch_source_balance(source_choice)
+        if _source_balance is not None:
+            st.caption(
+                "💰 مانده تجمیعی ۱۴۰۲+۱۴۰۴ (سقف انتقال): "
+                f"{_format_rials(_source_balance['pool_balance_1402_1404'])}"
+            )
+            st.caption(
+                f"🔒 مانده ۱۴۰۵ (غیرقابل انتقال): {_format_rials(_source_balance['balance_1405'])}"
+            )
+    with col_e2:
+        # The destination normally is the contract's own employer (e.g. the
+        # institute or the Oil Ministry, which can only fund contracts through
+        # transfers), so default to it once a contract is picked.
+        default_destination = (
+            contract_employer_code
+            if contract_employer_code in employer_keys
+            else DEFAULT_DESTINATION_EMPLOYER_CODE
+        )
+        destination_choice = st.selectbox(
+            "🏛️ کارفرمای مقصد:",
+            options=employer_keys,
+            format_func=employer_options.get,
+            index=_index_of(employer_keys, default_destination),
+            key=f"{ADD_DESTINATION_KEY_PREFIX}_{selected_contract['contract_tracking_code'] if selected_contract else ''}",
+        )
+        if contract_employer_code and destination_choice != contract_employer_code:
+            st.warning(
+                f"⚠️ کارفرمای این قرارداد «{selected_contract.get('employer_name')}» است، "
+                "ولی مقصد انتقال کارفرمای دیگری انتخاب شده است."
+            )
 
 col_r1, col_r2 = st.columns(2)
 with col_r1:
-    add_fiscal_year = st.number_input(
+    add_fiscal_year = st.selectbox(
         "📅 سال مالی مبدأ اعتبار (شمسی):",
-        min_value=1398,
-        max_value=1410,
-        value=1405,
-        step=1,
-        key="transfer_add_fiscal_year",
+        options=TRANSFER_FISCAL_YEARS,
+        index=len(TRANSFER_FISCAL_YEARS) - 1,
+        key="transfer_add_pool_year",
+        help="انتقال اعتبار فقط از محل مانده سال‌های گذشته (۱۴۰۲ و ۱۴۰۴) ممکن است؛ "
+        "اعتبار سال ۱۴۰۵ قابل انتقال نیست. معمولاً ابتدا از ۱۴۰۲ و سپس ۱۴۰۴ استفاده می‌شود.",
     )
 with col_r2:
     add_amount = st.number_input(
@@ -501,7 +551,7 @@ col_f1, col_f2 = st.columns(2)
 with col_f1:
     filter_fiscal_year = st.selectbox(
         "فیلتر بر اساس سال مالی:",
-        options=[None, 1402, 1403, 1404, 1405, 1406],
+        options=[None, *TRANSFER_FISCAL_YEARS],
         format_func=lambda y: "همه سال‌ها" if y is None else str(y),
         key="transfer_report_fiscal_year",
     )
@@ -531,7 +581,9 @@ if transfers:
         display_df[money_col] = display_df[money_col].apply(_format_million)
     st.caption(
         "مبالغ به میلیون ریال. «مانده بدون انتقال» = واریزی منهای هزینه‌کرد (۱۴۰۲+۱۴۰۴)؛ "
-        "«مانده پس از انتقال‌ها» شامل تمام انتقال‌های آن کارفرما (نه فقط همین قرارداد) است."
+        "«مانده پس از انتقال‌ها» شامل تمام انتقال‌های آن کارفرما (نه فقط همین قرارداد) است. "
+        "«مازاد/کسر واریزی قرارداد» = مجموع همهٔ انتقال‌های فعال آن قرارداد منهای مبلغ قرارداد "
+        "(مثبت = مازاد، منفی = کسر)."
     )
     st.table(display_df)
 
@@ -540,7 +592,7 @@ if transfers:
     for money_col in (
         COL_CONTRACT_AMOUNT,
         "مجموع انتقالی دریافتی (میلیون ریال)",
-        "کسری تأمین (میلیون ریال)",
+        COL_SURPLUS,
     ):
         summary_display[money_col] = summary_display[money_col].apply(_format_million)
     st.table(summary_display)
@@ -614,13 +666,15 @@ if transfers:
 
         col_er1, col_er2 = st.columns(2)
         with col_er1:
-            edit_fiscal_year = st.number_input(
+            # A legacy row outside the pool years stays selectable so the form
+            # can still load it; the server rejects saving it unchanged.
+            edit_year_options = sorted({*TRANSFER_FISCAL_YEARS, int(selected_transfer["fiscal_year"])})
+            edit_fiscal_year = st.selectbox(
                 "📅 سال مالی مبدأ اعتبار (شمسی):",
-                min_value=1398,
-                max_value=1410,
-                value=int(selected_transfer["fiscal_year"]),
-                step=1,
+                options=edit_year_options,
+                index=edit_year_options.index(int(selected_transfer["fiscal_year"])),
                 key=f"edit_fiscal_year_{form_instance_key}",
+                help="انتقال اعتبار فقط از محل مانده سال‌های ۱۴۰۲ و ۱۴۰۴ ممکن است.",
             )
         with col_er2:
             edit_amount = st.number_input(

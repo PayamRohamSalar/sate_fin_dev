@@ -29,7 +29,7 @@ Column-by-column:
     fiscal-year-scoped figure.
 
 Caveat (documented in the notes sheet, not hidden): "مانده شرکت" nets
-against ALL funding_year=1402/1404(+1405) payments system-wide, while
+against ALL funding_year=1402/1404 payments system-wide, while
 "مانده تعهدات" only counts payments against contracts signed since 1402.
 If an employer has an older contract (signed before 1402) still being paid
 from the 1402/1404 pool, "مانده آزاد" is money already spoken for by that
@@ -52,7 +52,11 @@ from core.date_helper import to_jalali_date
 from models.contract import Contract
 from models.employer import Employer
 from models.payment import Payment
-from services.financial_engine import calculate_combined_pool_balance
+from services.financial_engine import (
+    TRANSFER_POOL_YEARS,
+    calculate_balance_1405,
+    calculate_combined_pool_balance,
+)
 from sqlalchemy import func
 
 SINCE_YEAR = 1402
@@ -137,7 +141,7 @@ def build_report() -> dict[str, pd.DataFrame]:
                 .join(Payment, Payment.contract_tracking_code == Contract.tracking_code)
                 .filter(
                     Contract.tracking_code.in_(pre_1402_tracking_codes),
-                    Payment.funding_year.in_((1402, 1404, 1405)),
+                    Payment.funding_year.in_(TRANSFER_POOL_YEARS),
                     Payment.is_deleted == False, Contract.is_deleted == False,  # noqa: E712
                 )
                 .group_by(Contract.employer_code)
@@ -166,11 +170,16 @@ def build_report() -> dict[str, pd.DataFrame]:
             # component only, computed directly for transparency.
             deposit_total = _combined_deposit_only(db, code)
 
+            # 1405 credit is its own, non-transferable balance (2026-10-16):
+            # shown beside the pool figure, never folded into it.
+            balance_1405 = calculate_balance_1405(db, code)
+
             records.append({
                 "شماره طبقه‌بندی": code,
                 "نام شرکت": employer.name,
                 "مجموع واریزی (۱۴۰۲ و ۱۴۰۴)": round(deposit_total / MILLION),
                 "مانده کل شرکت (۱۴۰۲+۱۴۰۴)": round(deposit_and_balance / MILLION),
+                "مانده ۱۴۰۵ (غیرقابل انتقال)": round(balance_1405 / MILLION),
                 "مجموع مبالغ قراردادهای منعقدشده (از ۱۴۰۲)": round(contracts_amount / MILLION),
                 "مجموع مبالغ پرداخت‌شده به قراردادها": round(paid_amount / MILLION),
                 "مانده تعهدات شرکت": round(committed_balance / MILLION),
@@ -190,6 +199,8 @@ def build_report() -> dict[str, pd.DataFrame]:
             "مانده تعهدات = مجموع مبلغ قراردادهای منعقدشده از ۱۴۰۲ منهای مجموع پرداختی به همان قراردادها "
             "(صرف‌نظر از سال مالی پرداخت).",
             "مانده آزاد = مانده کل شرکت منهای مانده تعهدات.",
+            "مانده ۱۴۰۵ = واریزی ۱۴۰۵ منهای پرداخت‌هایی که سال مالی آن‌ها ۱۴۰۵ ثبت شده؛ اعتبار سال جاری قابل "
+            "انتقال نیست و در «مانده کل شرکت» و «مانده آزاد» لحاظ نمی‌شود.",
             "یک نکتهٔ مهم: اگر شرکتی قرارداد قدیمی‌تر از ۱۴۰۲ دارد که هنوز از محل استخر ۱۴۰۲/۱۴۰۴ هزینه آن "
             "پرداخت می‌شود، آن هزینه در «مانده کل شرکت» کم شده ولی در «مانده تعهدات» (که فقط قراردادهای از "
             "۱۴۰۲ را می‌بیند) دیده نمی‌شود -- یعنی بخشی از «مانده آزاد» در واقع صرف همان قرارداد قدیمی شده و "
@@ -205,7 +216,7 @@ def build_report() -> dict[str, pd.DataFrame]:
 
 
 def _combined_deposit_only(db, employer_code: str) -> float:
-    """Deposit component alone (1402+1404+1405), rolled up Mother+Subsidiary
+    """Deposit component alone (1402+1404 pool), rolled up Mother+Subsidiary
     the same way ``calculate_real_balance`` does -- used only to show the
     gross deposit figure next to the net balance, per Payam's column list."""
     from models.deposits import DepositReceipt
@@ -215,7 +226,7 @@ def _combined_deposit_only(db, employer_code: str) -> float:
         .join(Employer, DepositReceipt.employer_code == Employer.classification_code)
         .filter(
             (Employer.classification_code == employer_code) | (Employer.parent_code == employer_code),
-            DepositReceipt.fiscal_year.in_((1402, 1404, 1405)),
+            DepositReceipt.fiscal_year.in_(TRANSFER_POOL_YEARS),
             DepositReceipt.is_deleted == False, Employer.is_deleted == False,  # noqa: E712
         )
         .scalar() or 0
@@ -226,7 +237,7 @@ def main() -> None:
     sheets = build_report()
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     money_cols = [
-        "مجموع واریزی (۱۴۰۲ و ۱۴۰۴)", "مانده کل شرکت (۱۴۰۲+۱۴۰۴)",
+        "مجموع واریزی (۱۴۰۲ و ۱۴۰۴)", "مانده کل شرکت (۱۴۰۲+۱۴۰۴)", "مانده ۱۴۰۵ (غیرقابل انتقال)",
         "مجموع مبالغ قراردادهای منعقدشده (از ۱۴۰۲)", "مجموع مبالغ پرداخت‌شده به قراردادها",
         "مانده تعهدات شرکت", "مانده آزاد شرکت",
         "هزینه‌کرد قراردادهای پیش از ۱۴۰۲ از محل استخر ۱۴۰۲/۱۴۰۴ (هشدار)",

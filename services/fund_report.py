@@ -78,15 +78,17 @@ def _transfer_attribution(db: Session, rollup: dict[str, str]):
       * ``credited``: {contract owner rollup code: payments attributed away}
     A contract's attributed amount is capped at what was transferred for it.
     """
-    from services.financial_engine import TRANSFER_POOL_YEARS
+    from services.financial_engine import ALL_FUND_YEARS, TRANSFER_POOL_YEARS
 
-    years = list(TRANSFER_POOL_YEARS)
+    # Transfers only exist in the pool years; payments are compared with the
+    # Fund's whole ledger, which does not separate 1405 from earlier pools.
+    years = list(ALL_FUND_YEARS)
     transfer_rows = db.execute(text("""
         select t.contract_tracking_code, t.source_employer_code, sum(t.amount)
         from credit_transfers t
         where t.is_deleted = false and t.fiscal_year = any(:years)
         group by 1, 2
-    """), {"years": years}).fetchall()
+    """), {"years": list(TRANSFER_POOL_YEARS)}).fetchall()
     per_contract: dict[str, dict[str, float]] = {}
     for contract, source, amount in transfer_rows:
         root = rollup.get(source, source)
@@ -234,7 +236,9 @@ def get_secretariat_fund_balance_sheet(db: Session, snapshot: FundReportSnapshot
     df["our_gross_balance"] = zero("gross_balance")
     df["our_paid_via_transfers"] = pd.Series(charged).reindex(codes).fillna(0.0)
     df["our_paid_for_others"] = pd.Series(credited).reindex(codes).fillna(0.0)
-    df["our_combined_balance"] = zero("combined_balance")
+    df["our_combined_balance"] = zero("combined_balance")  # whole ledger 1402-1405, comparable to the Fund
+    df["our_pool_balance"] = zero("pool_balance")  # 1402+1404 after transfers (the transferable pool)
+    df["our_balance_1405"] = zero("balance_1405")  # 1405 own balance, not transferable
     # payments-basis balance: what the Fund can see (see module docstring)
     df["our_balance_fund_basis"] = (
         df["our_gross_balance"] - df["our_paid_via_transfers"] + df["our_paid_for_others"]

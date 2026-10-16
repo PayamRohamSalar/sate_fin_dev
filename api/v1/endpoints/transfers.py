@@ -24,8 +24,10 @@ from schemas.transfer_schema import (
     CreditTransferCreate,
     CreditTransferResponse,
     CreditTransferUpdate,
+    SourceBalanceResponse,
 )
 from services.financial_engine import (
+    calculate_balance_1405,
     calculate_combined_pool_balance,
     calculate_gross_pool_balance,
 )
@@ -72,7 +74,8 @@ def _check_combined_balance(
 ) -> None:
     """Reject a transfer that would exceed the source employer's combined
     1402+1404 balance (see ``calculate_combined_pool_balance`` for why this
-    checks the combined pool instead of a single fiscal year).
+    checks the combined pool instead of a single fiscal year; 1405 credit is
+    not transferable and is not part of it).
 
     ``exclude_transfer_id`` lets an update re-validate without the transfer's
     own prior amount counting against itself.
@@ -197,6 +200,23 @@ def _attach_report_balances(db: Session, responses: list[CreditTransferResponse]
         r.contract_funded_total = int(funded_totals.get(r.contract_tracking_code, 0))
         r.source_balance_before_transfers = int(gross[r.source_employer_code])
         r.source_balance_after_transfers = int(net[r.source_employer_code])
+
+
+@router.get("/source-balance/{employer_code}", response_model=SourceBalanceResponse)
+def get_source_balance(employer_code: str, db: Session = Depends(get_db)):
+    """Balances shown next to the source employer on the transfer form.
+
+    ``pool_balance_1402_1404`` is exactly the figure ``_check_combined_balance``
+    enforces on create/update, so the form never displays a different ceiling
+    than the server applies. ``balance_1405`` is shown for information only:
+    current-year credit cannot be transferred.
+    """
+    employer = _get_active_employer(db, employer_code, role="مبدأ")
+    return SourceBalanceResponse(
+        employer_code=employer.classification_code,
+        pool_balance_1402_1404=int(calculate_combined_pool_balance(db, employer.classification_code)),
+        balance_1405=int(calculate_balance_1405(db, employer.classification_code)),
+    )
 
 
 @router.get("/", response_model=list[CreditTransferResponse])
