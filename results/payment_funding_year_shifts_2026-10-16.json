@@ -1,0 +1,58 @@
+[
+ {
+  "payment_tracking_code": "101774",
+  "employer": "200505",
+  "contract": "100879",
+  "amount": 1300000000,
+  "from": 1402,
+  "to": 1404
+ },
+ {
+  "payment_tracking_code": "103532",
+  "employer": "225500",
+  "contract": "82",
+  "amount": 327731100,
+  "from": 1402,
+  "to": 1404
+ },
+ {
+  "payment_tracking_code": "105039",
+  "employer": "281000",
+  "contract": "101775",
+  "amount": 1000000000,
+  "from": 1402,
+  "to": 1404
+ },
+ {
+  "payment_tracking_code": "103481",
+  "employer": "292710",
+  "contract": "101375",
+  "amount": 1401080793,
+  "from": 1402,
+  "to": 1404
+ },
+ {
+  "payment_tracking_code": "103997",
+  "employer": "292770",
+  "contract": "101393",
+  "amount": 1455937800,
+  "from": 1402,
+  "to": 1404
+ },
+ {
+  "payment_tracking_code": "103891",
+  "employer": "294000",
+  "contract": "101559",
+  "amount": 495600000,
+  "from": 1402,
+  "to": 1404
+ },
+ {
+  "payment_tracking_code": "104103",
+  "employer": "295030",
+  "contract": "101490",
+  "amount": 150000000,
+  "from": 1402,
+  "to": 1404
+ }
+]

@@ -1,0 +1,64 @@
+[
+ {
+  "kind": "contract_employer",
+  "contract": "104024",
+  "from": "280100",
+  "to": "200500"
+ },
+ {
+  "kind": "funding_year",
+  "payment": "115721",
+  "employer": "293960",
+  "amount": 8636000000,
+  "from": 1404,
+  "to": 1405
+ },
+ {
+  "kind": "funding_year",
+  "payment": "115720",
+  "employer": "214500",
+  "amount": 3700000000,
+  "from": 1404,
+  "to": 1405
+ },
+ {
+  "kind": "funding_year",
+  "payment": "115640",
+  "employer": "214500",
+  "amount": 2289000000,
+  "from": 1404,
+  "to": 1405
+ },
+ {
+  "kind": "funding_year",
+  "payment": "114614",
+  "employer": "214500",
+  "amount": 3700000000,
+  "from": 1404,
+  "to": 1405
+ },
+ {
+  "kind": "funding_year",
+  "payment": "115872",
+  "employer": "292890",
+  "amount": 1748957635,
+  "from": 1404,
+  "to": 1405
+ },
+ {
+  "kind": "funding_year",
+  "payment": "115871",
+  "employer": "292890",
+  "amount": 2190639376,
+  "from": 1404,
+  "to": 1405
+ },
+ {
+  "kind": "funding_year",
+  "payment": "115683",
+  "employer": "290710",
+  "amount": 740000000,
+  "from": 1404,
+  "to": 1405
+ }
+]

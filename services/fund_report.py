@@ -10,7 +10,9 @@ To keep it moving in parallel with our data entry, what we entered AFTER the
 snapshot is added on top of it:
 
 * deposits : ``deposit_receipts.id > snapshot.baseline_deposit_receipt_id``
-             with fiscal_year 1404/1405 (the Fund's «واریزی 1404 به بعد»)
+             with fiscal_year 1404/1405 (the Fund's «واریزی 1404 به بعد»),
+             minus whatever part of those receipts the Fund report already
+             contained (``fund_report_deposit_overlaps``)
 * payments : payments whose series is after ``baseline_payment_series``
              (e.g. 05-26, 05-27 ...), any funding year.
 
@@ -55,7 +57,7 @@ from sqlalchemy.orm import Session
 
 from models.deposits import DepositReceipt
 from models.employer import Employer
-from models.fund_report import FundReportLine, FundReportSnapshot
+from models.fund_report import FundReportDepositOverlap, FundReportLine, FundReportSnapshot
 from services.financial_engine import get_combined_pool_breakdown
 
 MILLION = 1_000_000
@@ -191,6 +193,23 @@ def get_secretariat_fund_balance_sheet(db: Session, snapshot: FundReportSnapshot
     ):
         root = rollup.get(code, code)
         new_dep[root] = new_dep.get(root, 0.0) + float(amount or 0)
+    # ... minus the part of those receipts the Fund report already contained
+    # (otherwise the Fund side counts them twice -- see FundReportDepositOverlap)
+    for code, amount in (
+        db.query(DepositReceipt.employer_code, func.sum(FundReportDepositOverlap.amount))
+        .join(DepositReceipt, DepositReceipt.id == FundReportDepositOverlap.deposit_receipt_id)
+        .filter(
+            FundReportDepositOverlap.snapshot_id == snapshot.id,
+            FundReportDepositOverlap.is_deleted == False,  # noqa: E712
+            DepositReceipt.is_deleted == False,  # noqa: E712
+            DepositReceipt.id > snapshot.baseline_deposit_receipt_id,
+            DepositReceipt.fiscal_year.in_(FUND_DEPOSIT_YEARS),
+        )
+        .group_by(DepositReceipt.employer_code)
+        .all()
+    ):
+        root = rollup.get(code, code)
+        new_dep[root] = new_dep.get(root, 0.0) - float(amount or 0)
 
     shares, charged, credited = _transfer_attribution(db, rollup)
 
